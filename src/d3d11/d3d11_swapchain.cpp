@@ -107,7 +107,16 @@ namespace dxvk {
     m_device    (pDevice->GetDXVKDevice()),
     m_context   (m_device->createContext()),
     m_frameLatencyCap(pDevice->GetOptions()->maxFrameLatency) {
+    // NV-DXVK: very early entry trace -- proves the member-init list
+    // finished.  If any later step throws/crashes we still know the ctor
+    // was reached.
+    Logger::info(str::format(
+      "[D3D11SwapChain] ctor entry this=0x", std::hex, (uintptr_t)this,
+      " hWnd=0x", (uintptr_t)hWnd,
+      " pDesc=0x", (uintptr_t)pDesc, std::dec));
+
     CreateFrameLatencyEvent();
+    Logger::info("[D3D11SwapChain] CreateFrameLatencyEvent done");
 
     // Hook the game's WndProc so ImGui receives WM_KEYDOWN/WM_KEYUP for hotkeys.
     // Must use SetWindowLongPtrW (GWLP_WNDPROC) — the correct x64 API.
@@ -120,6 +129,7 @@ namespace dxvk {
         g_d3d11WndProcMap[hWnd] = this;
       }
     }
+    Logger::info("[D3D11SwapChain] WndProc hook installed");
 
     Logger::info(str::format("[D3D11SwapChain] Created: HWND=", (uintptr_t)hWnd,
       " ", pDesc->Width, "x", pDesc->Height,
@@ -127,12 +137,25 @@ namespace dxvk {
       " buffers=", pDesc->BufferCount,
       " this=", (uintptr_t)this));
 
-    if (!pDevice->GetOptions()->deferSurfaceCreation)
+    if (!pDevice->GetOptions()->deferSurfaceCreation) {
+      Logger::info("[D3D11SwapChain] CreatePresenter()...");
       CreatePresenter();
-    
+      Logger::info("[D3D11SwapChain] CreatePresenter() done");
+    } else {
+      Logger::info("[D3D11SwapChain] deferSurfaceCreation set, skipping CreatePresenter");
+    }
+
+    Logger::info("[D3D11SwapChain] CreateBackBuffer()...");
     CreateBackBuffer();
+    Logger::info("[D3D11SwapChain] CreateBackBuffer() done");
+
+    Logger::info("[D3D11SwapChain] CreateBlitter()...");
     CreateBlitter();
+    Logger::info("[D3D11SwapChain] CreateBlitter() done");
+
+    Logger::info("[D3D11SwapChain] CreateHud()...");
     CreateHud();
+    Logger::info("[D3D11SwapChain] CreateHud() done; ctor complete");
   }
 
 

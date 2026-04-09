@@ -3025,22 +3025,40 @@ namespace dxvk {
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
           IDXGIOutput*            pRestrictToOutput,
           IDXGISwapChain1**       ppSwapChain) {
+    // NV-DXVK: trace every step of swap chain creation so we can see
+    // exactly where the Titanfall 2 init path dies.
+    Logger::info(str::format(
+      "[WineFactory] CreateSwapChainForHwnd entry"
+      " hWnd=0x", std::hex, (uintptr_t)hWnd,
+      " pDesc=0x", (uintptr_t)pDesc, std::dec));
+
     InitReturnPtr(ppSwapChain);
-    
-    if (!ppSwapChain || !pDesc || !hWnd)
+
+    if (!ppSwapChain || !pDesc || !hWnd) {
+      Logger::err("[WineFactory] CreateSwapChainForHwnd: null arg -> DXGI_ERROR_INVALID_CALL");
       return DXGI_ERROR_INVALID_CALL;
-    
+    }
+
     // Make sure the back buffer size is not zero
     DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
-    
+
     GetWindowClientSize(hWnd,
       desc.Width  ? nullptr : &desc.Width,
       desc.Height ? nullptr : &desc.Height);
-    
+
+    Logger::info(str::format(
+      "[WineFactory]   resolved size ", desc.Width, "x", desc.Height,
+      " fmt=", desc.Format,
+      " usage=0x", std::hex, desc.BufferUsage, std::dec,
+      " bufcount=", desc.BufferCount,
+      " scaling=", desc.Scaling,
+      " effect=", desc.SwapEffect,
+      " flags=0x", std::hex, desc.Flags, std::dec));
+
     // If necessary, set up a default set of
     // fullscreen parameters for the swap chain
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc;
-    
+
     if (pFullscreenDesc) {
       fsDesc = *pFullscreenDesc;
     } else {
@@ -3049,19 +3067,44 @@ namespace dxvk {
       fsDesc.Scaling          = DXGI_MODE_SCALING_UNSPECIFIED;
       fsDesc.Windowed         = TRUE;
     }
-    
+
     try {
+      Logger::info("[WineFactory]   constructing D3D11SwapChain");
       // Create presenter for the device
       Com<D3D11SwapChain> presenter = new D3D11SwapChain(
         m_container, m_device, hWnd, &desc);
-      
+      Logger::info(str::format(
+        "[WineFactory]   D3D11SwapChain constructed ptr=0x",
+        std::hex, (uintptr_t)presenter.ptr(), std::dec));
+
+      Logger::info("[WineFactory]   constructing DxgiSwapChain wrapper");
       // Create the actual swap chain
       *ppSwapChain = ref(new DxgiSwapChain(
         pFactory, presenter.ptr(), hWnd, &desc, &fsDesc));
+      Logger::info(str::format(
+        "[WineFactory]   DxgiSwapChain wrapper ptr=0x",
+        std::hex, (uintptr_t)*ppSwapChain, std::dec,
+        " -> returning S_OK"));
       return S_OK;
     } catch (const DxvkError& e) {
-      Logger::err(e.message());
+      // NV-DXVK: previous behaviour returned E_INVALIDARG without identifying
+      // which step threw.  Log and preserve the original behaviour.
+      Logger::err(str::format(
+        "[WineFactory] CreateSwapChainForHwnd: DxvkError thrown: ",
+        e.message()));
       return E_INVALIDARG;
+    } catch (const std::exception& e) {
+      // NV-DXVK: catch std:: exceptions that would otherwise unwind across
+      // the COM boundary and kill the calling process with no diagnostics.
+      Logger::err(str::format(
+        "[WineFactory] CreateSwapChainForHwnd: std::exception thrown: ",
+        e.what()));
+      return E_FAIL;
+    } catch (...) {
+      // NV-DXVK: absolute last-ditch catch so any non-std exception can't
+      // silently propagate into materialsystem_dx11.dll.
+      Logger::err("[WineFactory] CreateSwapChainForHwnd: unknown exception thrown (catch(...))");
+      return E_FAIL;
     }
   }
   

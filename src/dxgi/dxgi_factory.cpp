@@ -81,9 +81,35 @@ namespace dxvk {
           IUnknown*             pDevice,
           DXGI_SWAP_CHAIN_DESC* pDesc,
           IDXGISwapChain**      ppSwapChain) {
-    if (ppSwapChain == nullptr || pDesc == nullptr || pDevice == nullptr)
+    // NV-DXVK: aggressive tracing for Titanfall 2 crash investigation.
+    // The swap chain creation path is the last thing running before the
+    // game null-derefs qword_1814EE258, so we trace every branch/argument.
+    Logger::info(str::format(
+      "[DXGI] DxgiFactory::CreateSwapChain entry"
+      " pDevice=0x", std::hex, (uintptr_t)pDevice,
+      " pDesc=0x", (uintptr_t)pDesc,
+      " ppSwapChain=0x", (uintptr_t)ppSwapChain, std::dec));
+    if (pDesc) {
+      Logger::info(str::format(
+        "[DXGI]   BufferDesc ", pDesc->BufferDesc.Width, "x", pDesc->BufferDesc.Height,
+        " fmt=", pDesc->BufferDesc.Format,
+        " refresh=", pDesc->BufferDesc.RefreshRate.Numerator, "/", pDesc->BufferDesc.RefreshRate.Denominator,
+        " scanline=", pDesc->BufferDesc.ScanlineOrdering,
+        " scaling=", pDesc->BufferDesc.Scaling));
+      Logger::info(str::format(
+        "[DXGI]   Sample {", pDesc->SampleDesc.Count, ",", pDesc->SampleDesc.Quality, "}",
+        " usage=0x", std::hex, pDesc->BufferUsage, std::dec,
+        " bufcount=", pDesc->BufferCount,
+        " hwnd=0x", std::hex, (uintptr_t)pDesc->OutputWindow, std::dec,
+        " windowed=", pDesc->Windowed,
+        " effect=", pDesc->SwapEffect,
+        " flags=0x", std::hex, pDesc->Flags, std::dec));
+    }
+    if (ppSwapChain == nullptr || pDesc == nullptr || pDevice == nullptr) {
+      Logger::err("[DXGI] DxgiFactory::CreateSwapChain: null arg -> DXGI_ERROR_INVALID_CALL");
       return DXGI_ERROR_INVALID_CALL;
-    
+    }
+
     DXGI_SWAP_CHAIN_DESC1 desc;
     desc.Width              = pDesc->BufferDesc.Width;
     desc.Height             = pDesc->BufferDesc.Height;
@@ -108,12 +134,18 @@ namespace dxvk {
       pDevice, pDesc->OutputWindow,
       &desc, &descFs, nullptr,
       &swapChain);
-    
+
+    // NV-DXVK: trace the outcome of the forwarded call
+    Logger::info(str::format(
+      "[DXGI] DxgiFactory::CreateSwapChain -> CreateSwapChainForHwnd returned hr=0x",
+      std::hex, (uint32_t)hr, std::dec,
+      " swapChain=0x", std::hex, (uintptr_t)swapChain, std::dec));
+
     *ppSwapChain = swapChain;
     return hr;
   }
-  
-  
+
+
   HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChainForHwnd(
           IUnknown*             pDevice,
           HWND                  hWnd,
@@ -121,21 +153,45 @@ namespace dxvk {
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
           IDXGIOutput*          pRestrictToOutput,
           IDXGISwapChain1**     ppSwapChain) {
+    // NV-DXVK: entry trace
+    Logger::info(str::format(
+      "[DXGI] DxgiFactory::CreateSwapChainForHwnd entry"
+      " pDevice=0x", std::hex, (uintptr_t)pDevice,
+      " hWnd=0x", (uintptr_t)hWnd,
+      " pDesc=0x", (uintptr_t)pDesc, std::dec));
     InitReturnPtr(ppSwapChain);
-    
-    if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
-      return DXGI_ERROR_INVALID_CALL;
-    
-    Com<IWineDXGISwapChainFactory> wineDevice;
-    
-    if (SUCCEEDED(pDevice->QueryInterface(
-          __uuidof(IWineDXGISwapChainFactory),
-          reinterpret_cast<void**>(&wineDevice)))) {
-      IDXGISwapChain4* frontendSwapChain;
 
+    if (!ppSwapChain || !pDesc || !hWnd || !pDevice) {
+      Logger::err(str::format(
+        "[DXGI] CreateSwapChainForHwnd: null arg -> DXGI_ERROR_INVALID_CALL",
+        " ppSwapChain=", (ppSwapChain != nullptr),
+        " pDesc=", (pDesc != nullptr),
+        " hWnd=", (hWnd != nullptr),
+        " pDevice=", (pDevice != nullptr)));
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
+    Com<IWineDXGISwapChainFactory> wineDevice;
+
+    HRESULT qiHr = pDevice->QueryInterface(
+      __uuidof(IWineDXGISwapChainFactory),
+      reinterpret_cast<void**>(&wineDevice));
+    Logger::info(str::format(
+      "[DXGI] CreateSwapChainForHwnd: QI(IWineDXGISwapChainFactory) hr=0x",
+      std::hex, (uint32_t)qiHr, std::dec,
+      " wineDevice=0x", std::hex, (uintptr_t)wineDevice.ptr(), std::dec));
+
+    if (SUCCEEDED(qiHr)) {
+      IDXGISwapChain4* frontendSwapChain = nullptr;
+
+      Logger::info("[DXGI] CreateSwapChainForHwnd: calling wineDevice->CreateSwapChainForHwnd");
       HRESULT hr = wineDevice->CreateSwapChainForHwnd(
         this, hWnd, pDesc, pFullscreenDesc,
         pRestrictToOutput, reinterpret_cast<IDXGISwapChain1**>(&frontendSwapChain));
+      Logger::info(str::format(
+        "[DXGI] CreateSwapChainForHwnd: wineDevice returned hr=0x",
+        std::hex, (uint32_t)hr, std::dec,
+        " frontend=0x", std::hex, (uintptr_t)frontendSwapChain, std::dec));
 
       // No ref as that's handled by the object we're wrapping
       // which was ref'ed on creation.
@@ -144,7 +200,7 @@ namespace dxvk {
 
       return hr;
     }
-    
+
     Logger::err("DXGI: CreateSwapChainForHwnd: Unsupported device type");
     return DXGI_ERROR_UNSUPPORTED;
   }
