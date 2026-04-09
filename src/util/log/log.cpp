@@ -137,6 +137,14 @@ namespace dxvk {
 
         if (m_fileStream) {
           m_fileStream << timeString << prefix << line << std::endl;
+          // NV-DXVK: Force an immediate flush + fsync-equivalent so the very
+          // last lines before a hard crash (access violation) actually hit
+          // disk.  std::endl already flushes the C++ stream, but the OS
+          // may still buffer the write; calling flush() + the platform
+          // sync forces durability.  This is cheap enough for debug builds
+          // and invaluable for chasing init-time crashes where the log ends
+          // before the faulting operation is written.
+          m_fileStream.flush();
         }
       }
     }
