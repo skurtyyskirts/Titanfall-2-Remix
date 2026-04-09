@@ -72,7 +72,16 @@ private:
 public:
   static void init(const std::string rootPath);
   static inline const fspath path(const Id id) {
-    assert(s_bInit && "[RtxFileSys] Not yet init.");
+    // NV-DXVK: Do not assert here.  Static initializers in this DLL (notably
+    // Logger::s_instance) call into this function before D3D11CoreCreateDevice
+    // has had a chance to invoke RtxFileSys::init(), which would trip the
+    // assert during DLL_PROCESS_ATTACH and abort the host process.  Callers
+    // (e.g. Logger::getFilePath) already handle an empty path by falling back
+    // to the current working directory, so returning an empty fspath here is
+    // the correct pre-init behaviour.
+    if (!s_bInit) {
+      return fspath{};
+    }
     return s_paths[id];
   }
   static void print();
