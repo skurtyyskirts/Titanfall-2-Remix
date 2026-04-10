@@ -11,6 +11,7 @@ dxbc_src = files([
   'dxbc_names.cpp',
   'dxbc_options.cpp',
   'dxbc_reader.cpp',
+  'dxbc_spirv_cache.cpp',
   'dxbc_util.cpp',
 ])
 

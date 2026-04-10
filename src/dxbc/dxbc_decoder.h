@@ -434,12 +434,22 @@ namespace dxvk {
     bool atEnd() const {
       return m_ptr == m_end;
     }
-    
+
+    // NV-DXVK: Raw data accessors used by DxbcSpirvCache to hash the
+    // bytecode without consuming the slice.  Needed so DxbcModule::compile()
+    // can compute a stable disk-cache key from the DXBC bytes before
+    // running the translator.
+    const uint32_t* ptr() const { return m_ptr; }
+    const uint32_t* end() const { return m_end; }
+    size_t sizeInBytes() const {
+      return static_cast<size_t>(m_end - m_ptr) * sizeof(uint32_t);
+    }
+
   private:
-    
+
     const uint32_t* m_ptr = nullptr;
     const uint32_t* m_end = nullptr;
-    
+
   };
   
   

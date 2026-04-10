@@ -1,6 +1,7 @@
 #include "dxbc_analysis.h"
 #include "dxbc_compiler.h"
 #include "dxbc_module.h"
+#include "dxbc_spirv_cache.h"
 
 namespace dxvk {
 
@@ -75,24 +76,151 @@ namespace dxvk {
     // NV-DXVK: bump HUD counters for the duration of this translation.
     DxbcTranslationGuard translationGuard;
 
+    // NV-DXVK: Try the on-disk SPIR-V cache first.  This is the primary
+    // mechanism that makes subsequent launches much faster -- if a shader
+    // with identical DXBC bytecode + identical compile options has been
+    // translated before, we can skip the entire DxbcAnalyzer + DxbcCompiler
+    // path and reconstruct a ready-to-use DxvkShader from the cached
+    // SPIR-V + metadata.
+    //
+    // The cache key is a hash that combines:
+    //   1. The raw SHEX chunk bytes (the DXBC bytecode itself, which is
+    //      byte-stable for the same HLSL source + fxc flags), XORed with
+    //   2. A hash of DxbcModuleInfo::options as raw bytes (DxbcOptions is
+    //      a POD-ish struct of bools + one VkDeviceSize that captures the
+    //      compile-time flags affecting codegen, e.g. demote-to-helper,
+    //      depth clip workaround, NaN fixup, etc), XORed with
+    //   3. Hashes of optional tess/xfb info if present.
+    //
+    // Folding compile options into the key means a Vulkan driver upgrade
+    // that flips a feature flag automatically invalidates the cache, and
+    // the next launch transparently re-translates and overwrites the
+    // affected entries.  No manual cache wipe needed.
+    //
+    // On a cache miss we fall through to the real compile path and feed
+    // the result back to the cache for next time.
+    auto& shaderCache = DxbcSpirvCache::get();
+    XXH64_hash_t cacheKey = 0;
+    bool cacheKeyValid = false;
+    if (shaderCache.isEnabled()) {
+      // NV-DXVK: All cache I/O is wrapped in try/catch so a corrupt or
+      // version-mismatched entry can NEVER take down the game.  Any
+      // exception thrown by the cache (file system error, malformed
+      // file, DxvkShader constructor blowing up on garbage SPIR-V, etc.)
+      // is logged once and we fall through to the real DxbcCompiler path.
+      // The cache is purely an optimization; correctness must never
+      // depend on it.
+      try {
+        const auto slice = m_shexChunk->slice();
+        cacheKey = DxbcSpirvCache::hashBytecode(slice.ptr(), slice.sizeInBytes());
+        // Fold the compile options into the key.  XOR-combine via XXH64's
+        // seed parameter so different option combinations produce
+        // independent keys without ever colliding with the bytecode hash
+        // alone.
+        cacheKey ^= XXH64(&moduleInfo.options, sizeof(moduleInfo.options),
+                          0x9a8c7b6c5d4e3f2cULL);
+        if (moduleInfo.tess != nullptr) {
+          cacheKey ^= XXH64(moduleInfo.tess, sizeof(*moduleInfo.tess),
+                            0x1122334455667788ULL);
+        }
+        if (moduleInfo.xfb != nullptr) {
+          cacheKey ^= XXH64(moduleInfo.xfb, sizeof(*moduleInfo.xfb),
+                            0xaabbccddeeff0011ULL);
+        }
+        cacheKeyValid = true;
+        Rc<DxvkShader> cached = shaderCache.lookup(cacheKey);
+        if (cached != nullptr)
+          return cached;
+      } catch (const std::exception& e) {
+        static std::atomic<bool> s_loggedLookupFail{ false };
+        if (!s_loggedLookupFail.exchange(true)) {
+          Logger::warn(str::format(
+              "DxbcSpirvCache: lookup threw '", e.what(),
+              "' -- falling back to slow path. Set DXVK_DISABLE_SPIRV_CACHE=1 ",
+              "to disable the cache entirely if this keeps happening."));
+        }
+        cacheKeyValid = false;
+      } catch (...) {
+        static std::atomic<bool> s_loggedLookupFail{ false };
+        if (!s_loggedLookupFail.exchange(true)) {
+          Logger::warn(
+              "DxbcSpirvCache: lookup threw an unknown exception -- "
+              "falling back to slow path.");
+        }
+        cacheKeyValid = false;
+      }
+    }
+
     DxbcAnalysisInfo analysisInfo;
-    
+
     DxbcAnalyzer analyzer(moduleInfo,
       m_shexChunk->programInfo(),
       m_isgnChunk, m_osgnChunk,
       m_psgnChunk, analysisInfo);
-    
+
     this->runAnalyzer(analyzer, m_shexChunk->slice());
-    
+
     DxbcCompiler compiler(
       fileName, moduleInfo,
       m_shexChunk->programInfo(),
       m_isgnChunk, m_osgnChunk,
       m_psgnChunk, analysisInfo);
-    
+
     this->runCompiler(compiler, m_shexChunk->slice());
-    
-    return compiler.finalize();
+
+    Rc<DxvkShader> result = compiler.finalize();
+
+    // NV-DXVK: Periodically log cache hit/miss totals so we can verify
+    // from the log alone that the cache is actually working (or NOT
+    // working) over the course of a session.  Logged every 256 fresh
+    // translations as a power-of-two cadence: cheap to compute, cheap to
+    // emit, and frequent enough to spot a sudden cliff in hit rate.
+    {
+      const uint64_t completed = s_translationsCompleted.load(std::memory_order_relaxed) + 1;
+      if (shaderCache.isEnabled() && (completed & 0xFF) == 0) {
+        const uint64_t attempts = shaderCache.getLookupAttempts();
+        const uint64_t hits     = shaderCache.getLookupHits();
+        const uint64_t noFile   = shaderCache.getLookupMissesNoFile();
+        const uint64_t corrupt  = shaderCache.getLookupMissesCorrupt();
+        Logger::info(str::format(
+            "DxbcSpirvCache: progress -- ",
+            completed, " shaders translated, ",
+            attempts, " cache lookups (",
+            hits, " hits, ",
+            noFile, " no-file misses, ",
+            corrupt, " corrupt-file misses)"));
+      }
+    }
+
+    // NV-DXVK: Write the freshly-translated shader to the disk cache so
+    // the next launch can skip this entire function via the lookup above.
+    // store() is tolerant of failures and silently skips any I/O error.
+    // cacheKeyValid guards against the (rare) case where the lookup-time
+    // hash computation threw an exception, in which case the key in
+    // 'cacheKey' is uninitialized garbage and we must NOT write a file
+    // under it.  Wrapped in try/catch for the same fail-safe reasons as
+    // the lookup path above.
+    if (shaderCache.isEnabled() && result != nullptr && cacheKeyValid) {
+      try {
+        shaderCache.store(cacheKey, result);
+      } catch (const std::exception& e) {
+        static std::atomic<bool> s_loggedStoreFail{ false };
+        if (!s_loggedStoreFail.exchange(true)) {
+          Logger::warn(str::format(
+              "DxbcSpirvCache: store threw '", e.what(),
+              "' -- cache writes will be skipped this session."));
+        }
+      } catch (...) {
+        static std::atomic<bool> s_loggedStoreFail{ false };
+        if (!s_loggedStoreFail.exchange(true)) {
+          Logger::warn(
+              "DxbcSpirvCache: store threw an unknown exception -- "
+              "cache writes will be skipped this session.");
+        }
+      }
+    }
+
+    return result;
   }
   
   

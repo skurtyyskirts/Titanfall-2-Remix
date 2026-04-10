@@ -66,101 +66,36 @@ timeout /t 1 /nobreak >nul 2>&1
 
 echo.
 echo #############################################################
-echo # Checking for shader changes...                            #
-echo #############################################################
-echo.
-
-rem Check if any cluster builder shaders have changed
-rem Source shaders are in src/dxvk/shaders/rtx/pass/rtx_megageo/cluster_builder/*.slang
-rem Compiled headers are in _Comp64Debug/src/dxvk/rtx_shaders/*.h
-
-set "SHADER_SRC_DIR=%PROJECT_DIR%\src\dxvk\shaders\rtx\pass\rtx_megageo\cluster_builder"
-set "SHADER_OUT_DIR=%PROJECT_DIR%\_Comp64Debug\src\dxvk\rtx_shaders"
-set "FORCE_SHADER_REBUILD=0"
-
-rem Check each cluster builder shader
-for %%S in (compute_cluster_tiling fill_clusters copy_cluster_offset fill_blas_from_clas_args fill_instantiate_template_args patch_cluster_blas_addresses) do (
-    if exist "%SHADER_SRC_DIR%\%%S.comp.slang" (
-        if exist "%SHADER_OUT_DIR%\%%S.h" (
-            rem Compare timestamps - if source is newer than output, force rebuild
-            for %%F in ("%SHADER_SRC_DIR%\%%S.comp.slang") do set "SRC_TIME=%%~tF"
-            for %%F in ("%SHADER_OUT_DIR%\%%S.h") do set "OUT_TIME=%%~tF"
-            rem Note: This comparison is approximate but works for detecting recent changes
-            echo Checking %%S: src=!SRC_TIME! out=!OUT_TIME!
-        ) else (
-            echo Shader output not found for %%S - will be built
-        )
-    )
-)
-
-rem Also check HIZ shaders
-set "HIZ_SRC_DIR=%PROJECT_DIR%\src\dxvk\shaders\rtx\pass\rtx_megageo\hiz"
-for %%S in (hiz_pass1 hiz_pass2 hiz_display zbuffer_minmax zbuffer_display) do (
-    if exist "%HIZ_SRC_DIR%\%%S.comp.slang" (
-        if exist "%SHADER_OUT_DIR%\%%S.h" (
-            for %%F in ("%HIZ_SRC_DIR%\%%S.comp.slang") do set "SRC_TIME=%%~tF"
-            for %%F in ("%SHADER_OUT_DIR%\%%S.h") do set "OUT_TIME=%%~tF"
-            echo Checking %%S: src=!SRC_TIME! out=!OUT_TIME!
-        ) else (
-            echo Shader output not found for %%S - will be built
-        )
-    )
-)
-
-rem Check ALL shader include files - if any header is newer than compiled output, force rebuild
-rem This catches changes to subdivision_plan_hlsl.h, subdivision_eval.hlsli, params, etc.
-set "FORCE_SHADER_REBUILD=0"
-
-rem Get the newest fill_clusters output timestamp as reference
-set "REF_SPV="
-if exist "%SHADER_OUT_DIR%\fill_clusters.h" (
-    for %%F in ("%SHADER_OUT_DIR%\fill_clusters.h") do set "REF_SPV=%%~tF"
-)
-if not defined REF_SPV (
-    echo No compiled shader output found - will be built fresh
-    set "FORCE_SHADER_REBUILD=1"
-)
-
-if "!FORCE_SHADER_REBUILD!"=="0" (
-    rem Scan all shader include directories for files newer than compiled output
-    for %%D in (
-        "%PROJECT_DIR%\src\dxvk\shaders\rtxmg\subdivision"
-        "%PROJECT_DIR%\src\dxvk\shaders\rtxmg\cluster_builder"
-        "%PROJECT_DIR%\src\dxvk\shaders\rtxmg\utils"
-        "%PROJECT_DIR%\src\dxvk\shaders\rtx\pass\rtx_megageo\cluster_builder"
-        "%PROJECT_DIR%\src\dxvk\shaders\rtx\pass\rtx_megageo\utils"
-        "%PROJECT_DIR%\src\dxvk\shaders\rtxmg\subdivision\osd_ports\tmr"
-    ) do (
-        if exist %%D (
-            for %%F in (%%~D\*.h %%~D\*.hlsli %%~D\*.slangh) do (
-                set "INC_TIME=%%~tF"
-                if "!INC_TIME!" GTR "!REF_SPV!" (
-                    echo Include file newer than output: %%~nxF [!INC_TIME! ^> !REF_SPV!]
-                    set "FORCE_SHADER_REBUILD=1"
-                )
-            )
-        )
-    )
-)
-
-if "!FORCE_SHADER_REBUILD!"=="1" (
-    echo Shader includes changed - touching .slang files to force recompilation...
-    rem Touch the main slang files so meson/ninja sees them as dirty
-    copy /b "%SHADER_SRC_DIR%\fill_clusters.comp.slang"+,, "%SHADER_SRC_DIR%\fill_clusters.comp.slang" >nul 2>&1
-    copy /b "%SHADER_SRC_DIR%\compute_cluster_tiling.comp.slang"+,, "%SHADER_SRC_DIR%\compute_cluster_tiling.comp.slang" >nul 2>&1
-    copy /b "%SHADER_SRC_DIR%\fill_clusters_texcoords.comp.slang"+,, "%SHADER_SRC_DIR%\fill_clusters_texcoords.comp.slang" >nul 2>&1
-)
-
-echo.
-echo #############################################################
 echo # Starting/Updating the Remix Runtime build...              #
 echo #############################################################
 echo.
 
-rem Force clean rebuild of rtx_shaders if output directory doesn't exist
-if not exist "%SHADER_OUT_DIR%" (
-    echo First build - shaders will be compiled
-)
+rem Kept for compatibility with references below — no longer used for any
+rem timestamp logic, ninja handles shader dependency tracking on its own.
+set "SHADER_OUT_DIR=%PROJECT_DIR%\_Comp64Debug\src\dxvk\rtx_shaders"
+
+rem NV-DXVK: The previous block in this file manually time-compared every
+rem *.h / *.hlsli / *.slangh include under src\dxvk\shaders\rtxmg and
+rem rtx_megageo against the mtime of one compiled output (fill_clusters.h),
+rem and on any mismatch it `copy /b`-touched the main .slang sources to
+rem force a rebuild.  That comparison was done as a Windows batch STRING
+rem compare of `%%~tF` output — which is locale-formatted ("MM/DD/YYYY
+rem HH:MM AM/PM") — so it lied in at least three ways:
+rem   * 12:XX PM lexically > 01:XX..11:XX PM (because "12" > "01"),
+rem     making any file modified near noon permanently "newer"
+rem   * MM/DD sort breaks across month/year boundaries
+rem   * git checkouts land every file on the same timestamp, tripping it
+rem     for different reasons the first time it ran
+rem The combined effect: every single invocation of this script would
+rem falsely detect "changed includes", then touch the .slang source files,
+rem which made them genuinely newer next run, which made the next run
+rem also falsely trigger -- a self-perpetuating full rebuild of every
+rem Remix RTX shader on every build, adding ~5 minutes per iteration.
+rem Meson/ninja already track .slang dependencies via the generated
+rem build.ninja + .ninja_deps file, so the entire block was redundant
+rem as well as buggy.  Removed.  If a .slangh include really changes and
+rem ninja somehow misses the dependency, delete _Comp64Debug/src/dxvk/
+rem rtx_shaders/ (or run `build-remixDx11.bat clean`) to force a reset.
 
 rem enable_dxgi=true is REQUIRED for Titanfall 2: materialsystem_dx11 calls
 rem IDXGIFactory::CreateSwapChain directly, which only works if Remix ships its

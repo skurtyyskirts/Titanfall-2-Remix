@@ -96,6 +96,15 @@ namespace dxvk {
     // correctly treats a never-invoked extract as "no real projection".
     bool                                 m_lastExtractUsedFallback = true;
 
+    // NV-DXVK: One-shot latch for the "dump VS cbuffers on first gameplay
+    // frame" diagnostic.  classifyPerspective() isn't recognizing Source's
+    // projection matrix layout, so every Titanfall 2 gameplay draw gets
+    // rejected as UIFallback.  Dumping the raw first 128 bytes of every
+    // bound VS constant buffer once on the first gameplay-sized draw gives
+    // us actual evidence of what Source's cbuffer layout looks like so we
+    // can extend classifyPerspective to match it.
+    bool                                 m_gameplayCBuffersDumped = false;
+
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.
     uint32_t                             m_projSlot   = UINT32_MAX;

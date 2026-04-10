@@ -185,6 +185,33 @@ namespace dxvk {
     }
 
     /**
+     * \brief Read-only access to the resource slot array
+     *
+     * NV-DXVK: Needed by the on-disk DXBC->SPIR-V translation cache
+     * (DxbcSpirvCache) so a cached shader can be serialized with its
+     * full descriptor layout and re-constructed identically on the
+     * next launch.  Without this getter a cached shader would be
+     * reconstructed with slotCount=0 and its Vulkan pipeline would
+     * mismatch the game's expected resource bindings.
+     */
+    const std::vector<DxvkResourceSlot>& resourceSlots() const {
+      return m_slots;
+    }
+
+    /**
+     * \brief Decompress SPIR-V code for serialization
+     *
+     * NV-DXVK: Returns a decompressed copy of the internal SPIR-V code
+     * buffer.  Used by DxbcSpirvCache::store() to serialize the shader's
+     * bytecode to disk without going through the dump(ostream) path which
+     * relies on stringstream (which has subtle MSVC issues with binary
+     * data round-tripping through str()).
+     */
+    SpirvCodeBuffer decompressCode() const {
+      return m_code.decompress();
+    }
+
+    /**
      * \brief Creates a shader module
      * 
      * Maps the binding slot numbers 

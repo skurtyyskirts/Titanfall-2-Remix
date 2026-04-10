@@ -1285,6 +1285,83 @@ namespace dxvk {
       m_pGeometryWorkers = std::make_unique<GeometryProcessor>(workers, "d3d11-geometry-def");
     }
 
+    // NV-DXVK: One-shot cbuffer dump to identify Source's projection matrix
+    // layout.  Titanfall 2 gameplay frames show raw=500+ draws but every
+    // single one is being rejected as UIFallback because
+    // classifyPerspective() never matches any matrix in Source's cbuffers.
+    //
+    // Gating: trigger only once per session, on a draw that comes *late*
+    // in a frame that has already seen many draws.  m_rawDrawCount is the
+    // frame-level counter incremented at the top of OnDraw*/OnDrawIndexed*
+    // BEFORE SubmitDraw is invoked, so by the time we reach here for the
+    // Nth draw of the frame it's already >= N.  "> 300" safely clears the
+    // UI frames (which top out around raw=27) and guarantees we're inside
+    // a bona-fide 3D gameplay frame.  We also scan all 15 VS cbuffer slots
+    // and dump 256 bytes each (enough for 2x 4x4 matrices + padding), and
+    // cover the first 4 PS slots because deferred-renderer passes often
+    // put the active camera in a PS cbuffer for lighting reconstruction.
+    if (!m_gameplayCBuffersDumped && m_rawDrawCount > 300) {
+      m_gameplayCBuffersDumped = true;
+      const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+      Logger::info(str::format(
+          "[D3D11Rtx] First late-gameplay draw (count=", count,
+          ", frameRawDraws=", m_rawDrawCount,
+          ") -- dumping cbuffers to find Source's projection matrix layout:"));
+      for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
+        const auto& cb = vsCbs[slot];
+        if (cb.buffer == nullptr) continue;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!ptr) {
+          Logger::info(str::format(
+              "[D3D11Rtx]   VS cb slot=", slot,
+              " size=", cb.buffer->Desc()->ByteWidth,
+              " mapPtr=NULL"));
+          continue;
+        }
+        const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+        const size_t base    = static_cast<size_t>(cb.constantOffset) * 16;
+        const size_t dumpBytes = std::min<size_t>(256, bufSize > base ? bufSize - base : 0);
+        Logger::info(str::format(
+            "[D3D11Rtx]   VS cb slot=", slot,
+            " size=", bufSize,
+            " constOff=", base,
+            " dumping=", dumpBytes, " bytes"));
+        const float* f = reinterpret_cast<const float*>(ptr + base);
+        for (size_t row = 0; row < dumpBytes / 16; ++row) {
+          Logger::info(str::format(
+              "[D3D11Rtx]     +", row * 16, ": ",
+              f[row*4+0], ", ", f[row*4+1], ", ",
+              f[row*4+2], ", ", f[row*4+3]));
+        }
+      }
+      // Also dump the first 4 PS cbuffers — Source's deferred lighting
+      // passes commonly stash the active scene camera in a PS cbuffer for
+      // view-space reconstruction.
+      const auto& psCbs = m_context->m_state.ps.constantBuffers;
+      for (uint32_t slot = 0; slot < 4; ++slot) {
+        const auto& cb = psCbs[slot];
+        if (cb.buffer == nullptr) continue;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!ptr) continue;
+        const size_t bufSize = cb.buffer->Desc()->ByteWidth;
+        const size_t base    = static_cast<size_t>(cb.constantOffset) * 16;
+        const size_t dumpBytes = std::min<size_t>(256, bufSize > base ? bufSize - base : 0);
+        Logger::info(str::format(
+            "[D3D11Rtx]   PS cb slot=", slot,
+            " size=", bufSize,
+            " dumping=", dumpBytes, " bytes"));
+        const float* f = reinterpret_cast<const float*>(ptr + base);
+        for (size_t row = 0; row < dumpBytes / 16; ++row) {
+          Logger::info(str::format(
+              "[D3D11Rtx]     +", row * 16, ": ",
+              f[row*4+0], ", ", f[row*4+1], ", ",
+              f[row*4+2], ", ", f[row*4+3]));
+        }
+      }
+    }
+
     // Throttle: don't exceed the worker ring buffer capacity.
     // Beyond this point new futures would overwrite in-flight ones → corrupt hashes.
     if (m_drawCallID >= kMaxConcurrentDraws) {
