@@ -275,6 +275,11 @@ struct RasterGeometry {
   RasterBuffer blendWeightBuffer;
   RasterBuffer blendIndicesBuffer;
 
+  // NV-DXVK: Source Engine 2 bone matrix buffer (VS SRV t30, stride=48)
+  // and per-instance bone index buffer (slot 1, R16G16B16A16_UINT)
+  RasterBuffer boneMatrixBuffer;
+  RasterBuffer boneIndexBuffer;
+
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;
 

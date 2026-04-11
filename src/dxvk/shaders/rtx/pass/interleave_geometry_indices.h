@@ -45,6 +45,10 @@ struct InterleaveGeometryArgs {
   uint32_t outputStride;
   uint32_t vertexCount;
   uint32_t forceNormals; // When set, reserve normal space in output even if hasNormals is false (writes zeros)
+
+  // NV-DXVK: Source Engine 2 bone matrix transform
+  uint32_t hasBoneTransform;  // When set, fetch bone matrix from t30 and apply to position
+  uint32_t boneIndex;         // Index into the bone matrix buffer (from per-instance data)
 };
 
 #define INTERLEAVE_GEOMETRY_BINDING_OUTPUT           0
@@ -52,3 +56,5 @@ struct InterleaveGeometryArgs {
 #define INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT     2
 #define INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT   3
 #define INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT     4
+#define INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX      5
+#define INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX       6

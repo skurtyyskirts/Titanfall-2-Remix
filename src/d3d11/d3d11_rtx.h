@@ -130,6 +130,12 @@ namespace dxvk {
     // reused for draws that would otherwise hit the UIFallback.
     DrawCallTransforms                   m_lastGoodTransforms;
 
+    // NV-DXVK: Cached bone matrix data from t30 (g_boneMatrix).
+    // Copied from GPU at end of frame for use on next frame's early draws.
+    std::vector<float>                   m_boneMatrixCache;
+    bool                                 m_hasBoneMatrixCache = false;
+    DxvkBufferSlice                      m_lastBoneSrvSlice;
+
     // NV-DXVK: One-shot latch for the "dump VS cbuffers on first gameplay
     // frame" diagnostic.  classifyPerspective() isn't recognizing Source's
     // projection matrix layout, so every Titanfall 2 gameplay draw gets

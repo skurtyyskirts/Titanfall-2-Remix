@@ -25,14 +25,20 @@
 layout(binding = INTERLEAVE_GEOMETRY_BINDING_OUTPUT)
 RWStructuredBuffer<float> dst;
 
-layout(binding = INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT) 
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT)
 StructuredBuffer<float> srcPosition;
-layout(binding = INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT) 
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT)
 StructuredBuffer<float> srcNormal;
-layout(binding = INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT) 
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT)
 StructuredBuffer<float> srcTexcoord;
-layout(binding = INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT) 
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT)
 StructuredBuffer<uint32_t> srcColor0;
+
+// NV-DXVK: Source Engine 2 bone matrix and bone index buffers
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX)
+StructuredBuffer<float> srcBoneMatrix;
+layout(binding = INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX)
+StructuredBuffer<uint32_t> srcBoneIndex;
 
 layout(push_constant)
 ConstantBuffer<InterleaveGeometryArgs> cb;
@@ -45,6 +51,6 @@ void main(uint idx : SV_DispatchThreadID)
   {
     return;
   }
-  
-  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, cb);
+
+  interleaver::interleave(idx, dst, srcPosition, srcNormal, srcTexcoord, srcColor0, srcBoneMatrix, srcBoneIndex, cb);
 }

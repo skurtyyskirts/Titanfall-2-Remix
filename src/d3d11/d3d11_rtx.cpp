@@ -205,16 +205,109 @@ namespace dxvk {
     }
 
     if (instRows.size() < 3) {
-      // No instance transform found — submit once without instance data.
-      // This handles instancing used for non-transform data (colors, etc.)
-      static uint32_t sNoInstXformLog = 0;
-      if (sNoInstXformLog < 3) {
-        ++sNoInstXformLog;
-        Logger::info(str::format("[D3D11Rtx] Instanced draw (", instanceCount,
-                                 " instances) has no per-instance transform (", instRows.size(),
-                                 " float4 rows). Submitting single draw."));
+      // NV-DXVK: Source Engine 2 bone-index instancing.
+      // Per-instance data is R16G16B16A16_UINT containing bone indices,
+      // NOT float4 transform rows.  The actual transforms are in VS SRV t30
+      // (g_boneMatrix, StructuredBuffer<float3x4>, stride=48).
+      // Read the bone index for each instance, fetch the float3x4 from t30,
+      // and use it as the instance world transform.
+      bool handledAsBoneInstancing = false;
+      {
+        // Find per-instance UINT semantic (bone indices)
+        const D3D11RtxSemantic* boneIdxSem = nullptr;
+        for (const auto& s : semantics) {
+          if (!s.perInstance) continue;
+          if (s.format == VK_FORMAT_R16G16B16A16_UINT) {
+            boneIdxSem = &s;
+            break;
+          }
+        }
+        // Check if VS SRV t30 is bound (g_boneMatrix)
+        const uint32_t kBoneSrvSlot = 30;
+        ID3D11ShaderResourceView* boneSrv = nullptr;
+        if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+          boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+
+        if (boneIdxSem && boneSrv) {
+          // Get the bone matrix buffer
+          Com<ID3D11Resource> boneRes;
+          boneSrv->GetResource(&boneRes);
+          auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+          DxvkBufferSlice boneBufSlice = boneBuf ? boneBuf->GetBufferSlice() : DxvkBufferSlice();
+          const uint8_t* bonePtr = boneBufSlice.defined() ?
+            reinterpret_cast<const uint8_t*>(boneBufSlice.mapPtr(0)) : nullptr;
+          const size_t boneBufLen = boneBufSlice.defined() ? boneBufSlice.length() : 0;
+
+          // Get the per-instance index buffer (slot 1)
+          const auto& instVb = m_context->m_state.ia.vertexBuffers[boneIdxSem->inputSlot];
+          if (instVb.buffer != nullptr && bonePtr != nullptr) {
+            DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
+            const uint8_t* instPtr = reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0));
+            const size_t instLen = instSlice.length();
+            const uint32_t instStride = instVb.stride;
+
+            // Also read the per-instance base bone offset from a second per-instance semantic
+            // (v5.y in the shader = base offset added to bone indices)
+            // For now, assume base offset = 0 and use the first bone index directly.
+
+            if (instPtr && instStride >= 4) {
+              const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
+
+              static uint32_t sBoneInstLog = 0;
+              if (sBoneInstLog < 5) {
+                ++sBoneInstLog;
+                Logger::info(str::format(
+                  "[D3D11Rtx] Source bone instancing: ", instanceCount, " instances",
+                  " boneSlot=", boneIdxSem->inputSlot,
+                  " instStride=", instStride,
+                  " boneBufLen=", boneBufLen));
+              }
+
+              for (UINT i = 0; i < maxInstances; ++i) {
+                UINT instIdx = startInstance + i;
+                size_t instOff = static_cast<size_t>(instIdx) * instStride + boneIdxSem->byteOffset;
+                if (instOff + 6 > instLen) continue;  // need 3 uint16
+
+                const uint16_t* boneIndices = reinterpret_cast<const uint16_t*>(instPtr + instOff);
+                // Use the first bone index (primary bone for this instance)
+                uint32_t boneIdx = boneIndices[0];
+                size_t boneOff = static_cast<size_t>(boneIdx) * 48;  // stride=48 for float3x4
+                if (boneOff + 48 > boneBufLen) continue;
+
+                // Read the float3x4 bone matrix (3 rows × 4 floats)
+                const float* m = reinterpret_cast<const float*>(bonePtr + boneOff);
+                // float3x4 row-major: row0=[m[0..3]], row1=[m[4..7]], row2=[m[8..11]]
+                // Translation in column 3: (m[3], m[7], m[11])
+                bool valid = true;
+                for (int j = 0; j < 12; ++j) {
+                  if (!std::isfinite(m[j])) { valid = false; break; }
+                }
+                if (!valid) continue;
+
+                Matrix4 instMatrix(
+                  Vector4(m[0], m[1], m[2],  0.0f),
+                  Vector4(m[4], m[5], m[6],  0.0f),
+                  Vector4(m[8], m[9], m[10], 0.0f),
+                  Vector4(m[3], m[7], m[11], 1.0f));
+
+                SubmitDraw(indexed, count, start, base, &instMatrix);
+              }
+              handledAsBoneInstancing = true;
+            }
+          }
+        }
       }
-      SubmitDraw(indexed, count, start, base);
+
+      if (!handledAsBoneInstancing) {
+        static uint32_t sNoInstXformLog = 0;
+        if (sNoInstXformLog < 3) {
+          ++sNoInstXformLog;
+          Logger::info(str::format("[D3D11Rtx] Instanced draw (", instanceCount,
+                                   " instances) has no per-instance transform (", instRows.size(),
+                                   " float4 rows). Submitting single draw."));
+        }
+        SubmitDraw(indexed, count, start, base);
+      }
       return;
     }
 
@@ -1052,13 +1145,133 @@ namespace dxvk {
       }
       if (isUintPosLayout) {
         transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
-        transforms.worldToView      = m_lastGoodTransforms.worldToView;
-        // cb3 contains objectToCameraRelative (fused object*view).
-        // transforms.objectToWorld currently = cb3 = obj * view.
-        // To avoid double-applying the view, extract the real objectToWorld:
-        //   objectToWorld_real = inverse(worldToView) * objectToCameraRelative
-        Matrix4 invView = inverse(transforms.worldToView);
-        transforms.objectToWorld = invView * transforms.objectToWorld;
+        // Read c_cameraOrigin directly from cb2 offset 4 (float3).
+        // This is the ground truth camera position — more reliable than
+        // the VP decomposition which reads from offset 80 (c_frameNum garbage).
+        const auto& vsCbs2 = m_context->m_state.vs.constantBuffers;
+        const auto& camCb2 = vsCbs2[2];
+        float camX = 0, camY = 0, camZ = 0;
+        if (camCb2.buffer != nullptr) {
+          const auto mapped2 = camCb2.buffer->GetMappedSlice();
+          const uint8_t* p2 = reinterpret_cast<const uint8_t*>(mapped2.mapPtr);
+          if (p2 && camCb2.buffer->Desc()->ByteWidth >= 16) {
+            const float* camOrigin = reinterpret_cast<const float*>(p2 + 4);
+            camX = camOrigin[0]; camY = camOrigin[1]; camZ = camOrigin[2];
+          }
+        }
+        // Source Engine 2 camera-relative rendering:
+        // Decoded positions are camera-relative. cb3 is the view rotation.
+        // Just use cb3 directly as objectToView. Positions go from
+        // camera-relative world-aligned → view-aligned.
+        // objectToWorld = cb3 (already extracted)
+        // worldToView = identity (FusedWorldViewMode::View handles this)
+        transforms.worldToView = Matrix4();  // identity
+        // objectToWorld stays as cb3 (already set by ExtractTransforms)
+        // The FusedWorldViewMode::View setting tells Remix that
+        // objectToView IS the full transform (object → view).
+
+        // Source Engine 2: gameplay shaders use bone matrices from SRV t30,
+        // NOT cb3.  cb3 is identity for these draws.  Read the bone index
+        // from per-instance slot 1 (instance 0 for non-instanced draws)
+        // and fetch the float3x4 bone matrix from t30 as objectToWorld.
+        bool gotBoneTransform = false;
+        {
+          const uint32_t kBoneSrvSlot = 30;
+          ID3D11ShaderResourceView* boneSrv = nullptr;
+          if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+            boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+          if (boneSrv) {
+            // Get bone matrix buffer
+            Com<ID3D11Resource> boneRes;
+            boneSrv->GetResource(&boneRes);
+            auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+            DxvkBufferSlice boneBufSlice = boneBuf ? boneBuf->GetBufferSlice() : DxvkBufferSlice();
+            const uint8_t* bonePtr = boneBufSlice.defined() ?
+              reinterpret_cast<const uint8_t*>(boneBufSlice.mapPtr(0)) : nullptr;
+            const size_t boneBufLen = boneBufSlice.defined() ? boneBufSlice.length() : 0;
+
+            // Find the per-instance bone index from slot 1
+            // (R16G16B16A16_UINT, perInstance=1, instance 0 for non-instanced draws)
+            uint32_t boneIdx = 0;
+            bool hasBoneIdx = false;
+            for (const auto& s : il->GetRtxSemantics()) {
+              if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+                const auto& instVb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+                if (instVb.buffer != nullptr) {
+                  DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
+                  const uint8_t* instPtr = reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0));
+                  if (instPtr && instSlice.length() >= s.byteOffset + 2) {
+                    boneIdx = *reinterpret_cast<const uint16_t*>(instPtr + s.byteOffset);
+                    hasBoneIdx = true;
+                  }
+                }
+                break;
+              }
+            }
+
+            if (hasBoneIdx && bonePtr) {
+              size_t boneOff = static_cast<size_t>(boneIdx) * 48;
+              if (boneOff + 48 <= boneBufLen) {
+                const float* m = reinterpret_cast<const float*>(bonePtr + boneOff);
+                bool valid = true;
+                for (int j = 0; j < 12; ++j) {
+                  if (!std::isfinite(m[j])) { valid = false; break; }
+                }
+                if (valid) {
+                  // Bone matrix is objectToCameraRelative (float3x4, row-major)
+                  // Row 0: [r00 r01 r02 tx], Row 1: [r10 r11 r12 ty], Row 2: [r20 r21 r22 tz]
+                  // The translation (tx,ty,tz) is camera-relative object position.
+                  // Use the bone matrix as objectToWorld and set worldToView=identity.
+                  // FusedWorldViewMode::View tells Remix objectToView IS the full transform.
+                  transforms.objectToWorld = Matrix4(
+                    Vector4(m[0], m[1], m[2],  0.0f),
+                    Vector4(m[4], m[5], m[6],  0.0f),
+                    Vector4(m[8], m[9], m[10], 0.0f),
+                    Vector4(m[3], m[7], m[11], 1.0f));
+                  transforms.worldToView = Matrix4();  // identity
+                  gotBoneTransform = true;
+
+                  static uint32_t sBoneDiag = 0;
+                  if (sBoneDiag < 10) {
+                    ++sBoneDiag;
+                    Logger::info(str::format(
+                      "[D3D11Rtx] Bone transform: raw=", m_rawDrawCount,
+                      " boneIdx=", boneIdx,
+                      " T=(", m[3], ",", m[7], ",", m[11], ")",
+                      " R0=(", m[0], ",", m[1], ",", m[2], ")"));
+                  }
+                }
+              }
+            } else if (!bonePtr && boneSrv) {
+              // t30 is GPU-only. Pass the bone buffer + instance buffer
+              // through to the interleaver compute shader via DrawCallState.
+              // The interleaver will do the bone lookup + transform GPU-side.
+              // Store the buffer slices for the interleaver to bind.
+              // For now, use identity transform — the interleaver will apply bones.
+              transforms.objectToWorld = Matrix4();  // identity placeholder
+              transforms.worldToView = Matrix4();    // identity
+              gotBoneTransform = true;  // let it through, interleaver handles it
+
+              // Store bone SRV slice and instance buffer slice on the draw call
+              // so the interleaver can bind them.
+              // TODO: pass boneBufSlice and instBufSlice through DrawCallState
+              // For now, mark the draw with hasBoneTransform=true and boneIndex=0xFFFFFFFF
+              // to signal the interleaver to read from bound buffers.
+
+              static uint32_t sGpuBoneDiag = 0;
+              if (sGpuBoneDiag < 5) {
+                ++sGpuBoneDiag;
+                Logger::info(str::format(
+                  "[D3D11Rtx] Bone GPU-side: t30 len=", boneBufLen,
+                  " will use interleaver bone transform"));
+              }
+            }
+          }
+        }
+        if (!gotBoneTransform) {
+          // No bone matrix available — can't position this geometry
+          m_lastExtractUsedFallback = true;
+        }
         // NOTE: do NOT set m_foundRealProjThisFrame here — that would let
         // fmt=106 shadow draws bypass the uiFallback check in SubmitDraw.
       } else {
@@ -2350,6 +2563,36 @@ namespace dxvk {
     geo.color0Buffer   = colBuffer;
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
+
+    // NV-DXVK: Populate bone matrix buffer from VS SRV t30 and
+    // per-instance bone index buffer from slot 1.
+    {
+      const uint32_t kBoneSrvSlot = 30;
+      if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+        auto boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+        if (boneSrv) {
+          Com<ID3D11Resource> boneRes;
+          boneSrv->GetResource(&boneRes);
+          auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+          if (boneBuf) {
+            // stride=48 (float3x4), format irrelevant for StructuredBuffer access
+            geo.boneMatrixBuffer = RasterBuffer(boneBuf->GetBufferSlice(), 0, 48, VK_FORMAT_UNDEFINED);
+          }
+        }
+      }
+      // Per-instance bone index from slot 1
+      for (const auto& s : semantics) {
+        if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+          const auto& instVb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+          if (instVb.buffer != nullptr) {
+            geo.boneIndexBuffer = RasterBuffer(
+              instVb.buffer->GetBufferSlice(instVb.offset),
+              s.byteOffset, instVb.stride, s.format);
+          }
+          break;
+        }
+      }
+    }
 
     // Read cull mode from the immutable ID3D11RasterizerState object.
     // Default: no culling (safe fallback when no state is bound).

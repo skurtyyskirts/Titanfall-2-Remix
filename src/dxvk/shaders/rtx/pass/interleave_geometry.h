@@ -189,7 +189,30 @@ namespace interleaver {
     return float3(x, y, z);
   }
 
-  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, const InterleaveGeometryArgs cb) {
+  // NV-DXVK: Apply bone matrix (float3x4, 12 floats per matrix) to position.
+  // boneMatrix layout: [r00 r01 r02 tx | r10 r11 r12 ty | r20 r21 r22 tz]
+  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, float3 pos) {
+    uint32_t base = boneIndex * 12;  // 12 floats per float3x4
+    float3 row0 = float3(boneBuffer[base+0], boneBuffer[base+1], boneBuffer[base+2]);
+    float  tx   = boneBuffer[base+3];
+    float3 row1 = float3(boneBuffer[base+4], boneBuffer[base+5], boneBuffer[base+6]);
+    float  ty   = boneBuffer[base+7];
+    float3 row2 = float3(boneBuffer[base+8], boneBuffer[base+9], boneBuffer[base+10]);
+    float  tz   = boneBuffer[base+11];
+    float3 result;
+#ifdef __cplusplus
+    result.x = row0.x*pos.x + row0.y*pos.y + row0.z*pos.z + tx;
+    result.y = row1.x*pos.x + row1.y*pos.y + row1.z*pos.z + ty;
+    result.z = row2.x*pos.x + row2.y*pos.y + row2.z*pos.z + tz;
+#else
+    result.x = dot(row0, pos) + tx;
+    result.y = dot(row1, pos) + ty;
+    result.z = dot(row2, pos) + tz;
+#endif
+    return result;
+  }
+
+  void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, const InterleaveGeometryArgs cb) {
     const uint32_t srcVertexIndex = idx + cb.minVertexIndex;
 
     uint32_t writeOffset = 0;
@@ -201,6 +224,18 @@ namespace interleaver {
       position = convertPositionUint(srcColor0, srcVertexIndex * cb.color0Stride + cb.color0Offset);
     else
       position = convert(cb.positionFormat, srcPosition, srcVertexIndex * cb.positionStride + cb.positionOffset);
+    // NV-DXVK: Apply bone matrix if available (Source Engine 2 skinning/instancing).
+    // The bone matrix transforms decoded object-space positions to camera-relative space.
+    if (cb.hasBoneTransform) {
+      // Read bone index from per-instance buffer (instance 0 for non-instanced draws).
+      // The bone index buffer contains uint16 values packed as uint32.
+      uint32_t boneIdx = cb.boneIndex;
+      if (boneIdx == 0xFFFFFFFFu) {
+        // Read from the bone index buffer (slot 6) — first uint16
+        boneIdx = srcBoneIndex[0] & 0xFFFFu;
+      }
+      position = applyBoneMatrix(srcBoneMatrix, boneIdx, position);
+    }
     dst[idx * cb.outputStride + writeOffset++] = position.x;
     dst[idx * cb.outputStride + writeOffset++] = position.y;
     dst[idx * cb.outputStride + writeOffset++] = position.z;

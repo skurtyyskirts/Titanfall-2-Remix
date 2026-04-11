@@ -136,6 +136,8 @@ namespace dxvk {
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT)
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT)
       STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT)
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX)
+      STRUCTURED_BUFFER(INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX)
       END_PARAMETER()
     };
 
@@ -928,6 +930,8 @@ namespace dxvk {
     args.outputStride = output.stride / 4;
     args.vertexCount = input.vertexCount;
     args.forceNormals = (forceNormals && !input.normalBuffer.defined()) ? 1 : 0;
+    args.hasBoneTransform = (input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined()) ? 1 : 0;
+    args.boneIndex = 0xFFFFFFFFu;  // signal shader to read from bone index buffer
 
     const uint32_t kNumVerticesToProcessOnCPU = 1024;
     const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
@@ -949,6 +953,16 @@ namespace dxvk {
           ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT, input.color0Buffer);
       }
 
+      // NV-DXVK: Always bind bone slots (Vulkan requires all declared bindings bound).
+      // For non-bone draws, bind the position buffer as a dummy placeholder.
+      if (args.hasBoneTransform) {
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX, input.boneMatrixBuffer);
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX, input.boneIndexBuffer);
+      } else {
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX, input.positionBuffer);
+        ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX, DxvkBufferSlice(input.positionBuffer.buffer(), input.positionBuffer.offset(), std::min<VkDeviceSize>(input.positionBuffer.length(), 16)));
+      }
+
       ctx->setPushConstantBank(DxvkPushConstantBank::RTX);
 
       ctx->pushConstants(0, sizeof(InterleaveGeometryArgs), &args);
@@ -968,8 +982,12 @@ namespace dxvk {
       args.texcoordOffset = 0;
       args.color0Offset = 0;
 
+      // CPU path doesn't support bone transforms (GPU-only buffers).
+      // Pass nullptr for bone buffers.
+      const float* nullBoneMatrix = nullptr;
+      const uint32_t* nullBoneIndex = nullptr;
       for (uint32_t i = 0; i < input.vertexCount; i++) {
-        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, args);
+        interleaver::interleave(i, dst, inputData.positionData, inputData.normalData, inputData.texcoordData, inputData.vertexColorData, nullBoneMatrix, nullBoneIndex, args);
       }
 
       ctx->writeToBuffer(output.buffer, 0, input.vertexCount * output.stride, dst);
