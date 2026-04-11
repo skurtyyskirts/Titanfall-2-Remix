@@ -1052,11 +1052,13 @@ namespace dxvk {
       }
       if (isUintPosLayout) {
         transforms.viewToProjection = m_lastGoodTransforms.viewToProjection;
-        // cb3 already contains objectToCameraRelative (fused object+view).
-        // Setting worldToView from the VP decomposition would double-apply
-        // the view transform → extreme positions → TDR.
-        // Use identity so objectToView = objectToWorld = cb3 (the fused matrix).
-        transforms.worldToView = Matrix4();  // identity
+        transforms.worldToView      = m_lastGoodTransforms.worldToView;
+        // cb3 contains objectToCameraRelative (fused object*view).
+        // transforms.objectToWorld currently = cb3 = obj * view.
+        // To avoid double-applying the view, extract the real objectToWorld:
+        //   objectToWorld_real = inverse(worldToView) * objectToCameraRelative
+        Matrix4 invView = inverse(transforms.worldToView);
+        transforms.objectToWorld = invView * transforms.objectToWorld;
         // NOTE: do NOT set m_foundRealProjThisFrame here — that would let
         // fmt=106 shadow draws bypass the uiFallback check in SubmitDraw.
       } else {
