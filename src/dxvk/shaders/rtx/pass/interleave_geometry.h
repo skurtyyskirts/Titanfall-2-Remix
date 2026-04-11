@@ -227,13 +227,14 @@ namespace interleaver {
     // NV-DXVK: Apply bone matrix if available (Source Engine 2 skinning/instancing).
     // The bone matrix transforms decoded object-space positions to camera-relative space.
     if (cb.hasBoneTransform) {
-      // Read bone index from per-instance buffer (instance 0 for non-instanced draws).
-      // The bone index buffer contains uint16 values packed as uint32.
-      uint32_t boneIdx = cb.boneIndex;
-      if (boneIdx == 0xFFFFFFFFu) {
-        // Read from the bone index buffer (slot 6) — first uint16
-        boneIdx = srcBoneIndex[0] & 0xFFFFu;
-      }
+      // Read bone index from per-instance buffer.
+      // cb.boneIndex = instance index (0, 1, 2, ...).
+      // Instance buffer is R16G16B16A16_UINT, stride=8 bytes = 2 uint32s.
+      // COLOR1.y (the bone index) is in the high 16 bits of the first uint32.
+      // For instance i: offset = i * 2 (in uint32 units).
+      uint32_t instIdx = cb.boneIndex;
+      uint32_t packed = srcBoneIndex[instIdx * 2];  // first uint32 of instance entry
+      uint32_t boneIdx = (packed >> 16u) & 0xFFFFu; // COLOR1.y = high 16 bits
       position = applyBoneMatrix(srcBoneMatrix, boneIdx, position);
     }
     dst[idx * cb.outputStride + writeOffset++] = position.x;

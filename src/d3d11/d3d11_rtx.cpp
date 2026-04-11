@@ -212,9 +212,10 @@ namespace dxvk {
       // Read the bone index for each instance, fetch the float3x4 from t30,
       // and use it as the instance world transform.
       bool handledAsBoneInstancing = false;
+      const D3D11RtxSemantic* boneIdxSem = nullptr;
+      ID3D11ShaderResourceView* boneSrv = nullptr;
       {
         // Find per-instance UINT semantic (bone indices)
-        const D3D11RtxSemantic* boneIdxSem = nullptr;
         for (const auto& s : semantics) {
           if (!s.perInstance) continue;
           if (s.format == VK_FORMAT_R16G16B16A16_UINT) {
@@ -224,7 +225,6 @@ namespace dxvk {
         }
         // Check if VS SRV t30 is bound (g_boneMatrix)
         const uint32_t kBoneSrvSlot = 30;
-        ID3D11ShaderResourceView* boneSrv = nullptr;
         if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
           boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
 
@@ -240,7 +240,8 @@ namespace dxvk {
 
           // Get the per-instance index buffer (slot 1)
           const auto& instVb = m_context->m_state.ia.vertexBuffers[boneIdxSem->inputSlot];
-          if (instVb.buffer != nullptr && bonePtr != nullptr) {
+          if (instVb.buffer != nullptr && bonePtr != nullptr && false) {
+            // CPU bone readback path — disabled, both buffers are GPU-only
             DxvkBufferSlice instSlice = instVb.buffer->GetBufferSlice(instVb.offset);
             const uint8_t* instPtr = reinterpret_cast<const uint8_t*>(instSlice.mapPtr(0));
             const size_t instLen = instSlice.length();
@@ -296,6 +297,28 @@ namespace dxvk {
             }
           }
         }
+      }
+
+      if (!handledAsBoneInstancing && boneIdxSem && boneSrv) {
+        // GPU bone path: both buffers are GPU-only. Submit each instance
+        // separately with instanceIndex as boneIndex. The interleaver will
+        // read the bone index from the GPU instance buffer and fetch the
+        // bone matrix from t30 on the GPU.
+        const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
+        static uint32_t sGpuInstLog = 0;
+        if (sGpuInstLog < 3) {
+          ++sGpuInstLog;
+          Logger::info(str::format(
+            "[D3D11Rtx] GPU bone instancing: ", instanceCount, " instances",
+            " (max ", maxInstances, ")"));
+        }
+        // Store instance index in a thread-local so ExtractTransforms can use it
+        for (UINT i = 0; i < maxInstances; ++i) {
+          m_currentInstanceIndex = startInstance + i;
+          SubmitDraw(indexed, count, start, base);
+        }
+        m_currentInstanceIndex = 0;
+        handledAsBoneInstancing = true;
       }
 
       if (!handledAsBoneInstancing) {
@@ -1243,27 +1266,36 @@ namespace dxvk {
                 }
               }
             } else if (!bonePtr && boneSrv) {
-              // t30 is GPU-only. Pass the bone buffer + instance buffer
-              // through to the interleaver compute shader via DrawCallState.
-              // The interleaver will do the bone lookup + transform GPU-side.
-              // Store the buffer slices for the interleaver to bind.
-              // For now, use identity transform — the interleaver will apply bones.
-              transforms.objectToWorld = Matrix4();  // identity placeholder
-              transforms.worldToView = Matrix4();    // identity
-              gotBoneTransform = true;  // let it through, interleaver handles it
+              // t30 is GPU-only. The interleaver applies bone transforms GPU-side.
+              // Bone output is WORLD-space.
+              transforms.objectToWorld = Matrix4();  // identity
+              transforms.worldToView = m_lastGoodTransforms.worldToView;  // from VP decomposition
+              gotBoneTransform = true;
 
-              // Store bone SRV slice and instance buffer slice on the draw call
-              // so the interleaver can bind them.
-              // TODO: pass boneBufSlice and instBufSlice through DrawCallState
-              // For now, mark the draw with hasBoneTransform=true and boneIndex=0xFFFFFFFF
-              // to signal the interleaver to read from bound buffers.
-
+              // Log per-draw bone info: buffer address + offset to see if it changes
               static uint32_t sGpuBoneDiag = 0;
-              if (sGpuBoneDiag < 5) {
+              if (sGpuBoneDiag < 30) {
                 ++sGpuBoneDiag;
+                // Check the instance buffer (slot 1) pointer and offset per draw
+                uintptr_t instBufAddr = 0;
+                uint32_t instBufOff = 0;
+                for (const auto& s3 : il->GetRtxSemantics()) {
+                  if (s3.perInstance && s3.format == VK_FORMAT_R16G16B16A16_UINT) {
+                    const auto& ivb3 = m_context->m_state.ia.vertexBuffers[s3.inputSlot];
+                    if (ivb3.buffer != nullptr) {
+                      instBufAddr = reinterpret_cast<uintptr_t>(ivb3.buffer.ptr());
+                      instBufOff = ivb3.offset;
+                    }
+                    break;
+                  }
+                }
+                // Also check if t30 buffer changes between draws
+                uintptr_t boneBufAddr = reinterpret_cast<uintptr_t>(boneBuf);
                 Logger::info(str::format(
-                  "[D3D11Rtx] Bone GPU-side: t30 len=", boneBufLen,
-                  " will use interleaver bone transform"));
+                  "[D3D11Rtx] BoneDraw raw=", m_rawDrawCount,
+                  " t30buf=", boneBufAddr,
+                  " instBuf=", instBufAddr, "+", instBufOff,
+                  " t30len=", boneBufLen));
               }
             }
           }
@@ -1804,7 +1836,12 @@ namespace dxvk {
 
     const uint32_t posOffset = geo.positionBuffer.offsetFromSlice();
 
-    const XXH64_hash_t descHash   = hashGeometryDescriptor(geo.indexCount, vertexCount, indexType, topology);
+    XXH64_hash_t descHash   = hashGeometryDescriptor(geo.indexCount, vertexCount, indexType, topology);
+    // NV-DXVK: Mix bone instance index into hash so each instance gets a unique BLAS
+    if (geo.boneInstanceIndex != 0) {
+      const uint32_t bi = geo.boneInstanceIndex;
+      descHash = XXH3_64bits_withSeed(&bi, sizeof(bi), descHash);
+    }
     const XXH64_hash_t layoutHash = hashVertexLayout(geo);
 
     // Compute the safe byte range available for position and texcoord data.
@@ -2592,6 +2629,7 @@ namespace dxvk {
           break;
         }
       }
+      geo.boneInstanceIndex = m_currentInstanceIndex;
     }
 
     // Read cull mode from the immutable ID3D11RasterizerState object.

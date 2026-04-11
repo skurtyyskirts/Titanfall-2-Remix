@@ -931,7 +931,7 @@ namespace dxvk {
     args.vertexCount = input.vertexCount;
     args.forceNormals = (forceNormals && !input.normalBuffer.defined()) ? 1 : 0;
     args.hasBoneTransform = (input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined()) ? 1 : 0;
-    args.boneIndex = 0xFFFFFFFFu;  // signal shader to read from bone index buffer
+    args.boneIndex = input.boneInstanceIndex;  // instance index for bone lookup
 
     const uint32_t kNumVerticesToProcessOnCPU = 1024;
     const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
@@ -971,6 +971,26 @@ namespace dxvk {
 
       const VkExtent3D workgroups = util::computeBlockCount(VkExtent3D { input.vertexCount, 1, 1 }, VkExtent3D { 128, 1, 1 });
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
+
+      // NV-DXVK: Debug — try to read back first vertex position after interleaving
+      if (args.hasBoneTransform) {
+        static uint32_t sReadbackLog = 0;
+        if (sReadbackLog < 20) {
+          ++sReadbackLog;
+          const float* outPtr = reinterpret_cast<const float*>(output.buffer->mapPtr(0));
+          if (outPtr) {
+            Logger::info(str::format(
+              "[interleaver] Bone output v0=(", outPtr[0], ",", outPtr[1], ",", outPtr[2], ")",
+              " boneIdx=", args.boneIndex,
+              " fmt=", args.positionFormat,
+              " verts=", input.vertexCount));
+          } else {
+            Logger::info(str::format(
+              "[interleaver] Bone output: not mappable, boneIdx=", args.boneIndex,
+              " fmt=", args.positionFormat, " verts=", input.vertexCount));
+          }
+        }
+      }
     } else {
       float dst[kNumVerticesToProcessOnCPU * kMaxInterleavedComponents];
 

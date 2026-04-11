@@ -279,6 +279,7 @@ struct RasterGeometry {
   // and per-instance bone index buffer (slot 1, R16G16B16A16_UINT)
   RasterBuffer boneMatrixBuffer;
   RasterBuffer boneIndexBuffer;
+  uint32_t boneInstanceIndex = 0;  // instance index for bone lookup
 
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;
