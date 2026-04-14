@@ -44,6 +44,22 @@ namespace dxvk {
     // NV-DXVK start: Implement memory profiler
     m_tracker(name, GpuMemoryTracker::Buffer, category, { 1, 1, 1 }, VK_FORMAT_UNDEFINED) {
     // NV-DXVK end
+    // NV-DXVK start: keep m_info.usage in sync with the usage flags allocBuffer()
+    // actually attaches to the VkBuffer. Without this, computeSliceAlignment() sees
+    // the original (smaller) usage and picks sub-slice stride too small, producing
+    // dynamic UBO offsets that violate minUniformBufferOffsetAlignment -> GPU hang.
+    {
+      const bool isAccelerationStructure =
+        (m_info.usage & VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) != 0;
+      if (!isAccelerationStructure) {
+        if (m_device->features().vulkan12Features.bufferDeviceAddress)
+          m_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        m_info.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+      }
+      if (m_info.usage & (VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT))
+        m_info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+    }
+    // NV-DXVK end
     // Align slices so that we don't violate any alignment
     // requirements imposed by the Vulkan device/driver
     VkDeviceSize sliceAlignment = computeSliceAlignment();

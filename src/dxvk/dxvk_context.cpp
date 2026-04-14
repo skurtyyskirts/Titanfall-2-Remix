@@ -224,6 +224,16 @@ namespace dxvk {
         DxvkContextFlag::RpDirtyDescriptorBinding);
     }
 
+    // DEBUG: catch any misaligned slice at bind time, log caller
+    if (buffer.defined() && (buffer.offset() & 63u) != 0) {
+      const auto& ubuf = buffer.buffer();
+      void* ret0 = _ReturnAddress();
+      Logger::err(str::format("[BIND-MISALIGNED] slot=", slot,
+        " sliceOff=", buffer.offset(), " mod64=", buffer.offset() & 63u,
+        " usage=0x", std::hex, (ubuf != nullptr ? ubuf->info().usage : 0u), std::dec,
+        " bufSize=", (ubuf != nullptr ? ubuf->info().size : 0u),
+        " caller=", ret0));
+    }
     m_rc[slot].bufferSlice = buffer;
   }
 
@@ -238,6 +248,16 @@ namespace dxvk {
     m_rc[slot].bufferSlice = bufferView != nullptr
       ? bufferView->slice()
       : DxvkBufferSlice();
+    // DEBUG: SRV/UAV path — log misaligned slices, any usage, with caller
+    if (m_rc[slot].bufferSlice.defined() && (m_rc[slot].bufferSlice.offset() & 63u) != 0) {
+      const auto& ubuf = m_rc[slot].bufferSlice.buffer();
+      void* ret0 = _ReturnAddress();
+      Logger::err(str::format("[VIEW-MISALIGNED] slot=", slot,
+        " sliceOff=", m_rc[slot].bufferSlice.offset(),
+        " mod64=", m_rc[slot].bufferSlice.offset() & 63u,
+        " usage=0x", std::hex, (ubuf != nullptr ? ubuf->info().usage : 0u), std::dec,
+        " caller=", ret0));
+    }
     m_rcTracked.clr(slot);
 
     m_flags.set(
@@ -5011,6 +5031,17 @@ namespace dxvk {
         offsets[i] = res.bufferSlice.defined()
           ? res.bufferSlice.getDynamicOffset()
           : 0;
+
+        // DEBUG: log misaligned dynamic offsets that reach vkCmdBindDescriptorSets
+        if (res.bufferSlice.defined() && (offsets[i] & 63u) != 0) {
+          const auto& buf = res.bufferSlice.buffer();
+          Logger::err(str::format("[DYN-OFF] i=", i, " layoutSlot=", binding.slot,
+            " dynOff=", offsets[i], " mod64=", offsets[i] & 63u,
+            " sliceLocal=", res.bufferSlice.offset(),
+            " usage=0x", std::hex, (buf != nullptr ? buf->info().usage : 0u), std::dec,
+            " bufSize=", (buf != nullptr ? buf->info().size : 0u),
+            " bufPtr=", (buf != nullptr ? (void*)buf.ptr() : nullptr)));
+        }
       }
 
       m_cmd->cmdBindDescriptorSet(BindPoint,

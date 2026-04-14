@@ -3196,9 +3196,24 @@ namespace dxvk {
           D3D11Buffer*                      pBuffer,
           UINT                              Offset,
           UINT                              Length) {
+    // Align down to minUniformBufferOffsetAlignment (64B = 4 float4 on this GPU).
+    // D3D11 spec requires pFirstConstant to be 16-aligned (256B) so rounding is
+    // a no-op for well-formed input; defends against misaligned offsets reaching
+    // Vulkan and tripping VUID-01971 -> GPU hang.
+    constexpr UINT kAlignFloat4 = 4;
+    UINT alignedOffset = Offset & ~(kAlignFloat4 - 1);
+    UINT alignedLength = Length + (Offset - alignedOffset);
+
+    // DEBUG: prove this path ran for problematic CB slots
+    if (Slot >= 1 && Slot <= 6) {
+      Logger::err(str::format("[CB-PATH] D3D11 BindConstantBuffer slot=", Slot,
+        " rawOff=", Offset, " alnOff=", alignedOffset,
+        " byteOff=", 16u * alignedOffset));
+    }
+
     EmitCs([
       cSlotId      = Slot,
-      cBufferSlice = Length ? pBuffer->GetBufferSlice(16 * Offset, 16 * Length) : DxvkBufferSlice()
+      cBufferSlice = alignedLength ? pBuffer->GetBufferSlice(16 * alignedOffset, 16 * alignedLength) : DxvkBufferSlice()
     ] (DxvkContext* ctx) {
       ctx->bindResourceBuffer(cSlotId, cBufferSlice);
     });

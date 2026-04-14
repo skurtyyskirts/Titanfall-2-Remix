@@ -345,10 +345,18 @@ namespace dxvk {
       }
 
       // Configure network
+      // NRC's Configure() performs internal vkQueueSubmit calls (weights upload, network init)
+      // AND frees/recreates Vulkan resources (buffers, command pools). It races both on the
+      // queue (threading violation) and on pending GPU work (VUID-vkFreeCommandBuffers-00047).
+      // Use lockSubmission() (synchronized) so pending DXVK submissions drain BEFORE NRC
+      // reconfigures — otherwise a camera cut triggering reconfigure while RT work is in
+      // flight frees command buffers still in use -> VK_ERROR_DEVICE_LOST on NVIDIA.
+      m_device->lockSubmission();
       nrc::Status status = m_nrcContext->Configure(m_nrcContextSettings, &m_nrcBuffers,
         NrcCtxOptions::enableCustomNetworkConfig()
         ? "CustomNetworkConfig.json"
         : nullptr);
+      m_device->unlockSubmission();
 
       if (status != nrc::Status::OK) {
         Logger::err(str::format("[RTX Neural Radiance Cache] Configure call failed. Reason: ", getNrcStatusErrorMessage(status)));

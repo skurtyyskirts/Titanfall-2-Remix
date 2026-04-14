@@ -23,13 +23,17 @@
 
 #include "rtx/utility/shader_types.h"
 
-#define BINDING_SKINNING_CONSTANTS    0
-#define BINDING_POSITION_OUTPUT       1
-#define BINDING_POSITION_INPUT        2
-#define BINDING_BLEND_WEIGHT_INPUT    3
-#define BINDING_BLEND_INDICES_INPUT   4
-#define BINDING_NORMAL_OUTPUT         5
-#define BINDING_NORMAL_INPUT          6
+// NV-DXVK (DX11 port): shift bindings past the D3D11 slot range (0..1151) so the
+// skinning compute shader does not share m_rc[] slots with D3D11 graphics PS CBs.
+// Collision previously left game vertex-buffer slices in slots read as dynamic
+// UBOs on subsequent graphics draws -> VUID-01971 -> GPU hang.
+#define BINDING_SKINNING_CONSTANTS    1160
+#define BINDING_POSITION_OUTPUT       1161
+#define BINDING_POSITION_INPUT        1162
+#define BINDING_BLEND_WEIGHT_INPUT    1163
+#define BINDING_BLEND_INDICES_INPUT   1164
+#define BINDING_NORMAL_OUTPUT         1165
+#define BINDING_NORMAL_INPUT          1166
 
 /**
 * \brief Args required to perform skinning

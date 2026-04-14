@@ -51,10 +51,13 @@ struct InterleaveGeometryArgs {
   uint32_t boneIndex;         // Index into the bone matrix buffer (from per-instance data)
 };
 
-#define INTERLEAVE_GEOMETRY_BINDING_OUTPUT           0
-#define INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT   1
-#define INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT     2
-#define INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT   3
-#define INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT     4
-#define INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX      5
-#define INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX       6
+// NV-DXVK (DX11 port): shift past the D3D11 graphics slot range (0..1151) so
+// m_rc[] slots don't collide with PS CB slots. See gpu_skinning_binding_indices.h
+// for the full rationale.
+#define INTERLEAVE_GEOMETRY_BINDING_OUTPUT           1170
+#define INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT   1171
+#define INTERLEAVE_GEOMETRY_BINDING_NORMAL_INPUT     1172
+#define INTERLEAVE_GEOMETRY_BINDING_TEXCOORD_INPUT   1173
+#define INTERLEAVE_GEOMETRY_BINDING_COLOR0_INPUT     1174
+#define INTERLEAVE_GEOMETRY_BINDING_BONE_MATRIX      1175
+#define INTERLEAVE_GEOMETRY_BINDING_BONE_INDEX       1176
