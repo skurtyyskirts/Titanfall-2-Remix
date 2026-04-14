@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d11_include.h"
+#include <unordered_set>
 
 #include "../dxvk/rtx_render/rtx_types.h"
 #include "../dxvk/rtx_render/rtx_hashing.h"
@@ -64,8 +65,9 @@ namespace dxvk {
     uint32_t                             m_boneInstTotal = 0;
     uint32_t                             m_boneInstSkipped = 0;
     uint32_t                             m_boneInstNoCache = 0;
-    uint32_t                             m_boneInstCacheHits = 0;   // entry already existed with matching hash
-    uint32_t                             m_boneInstCacheMisses = 0; // new entry or rebuild
+    uint32_t                             m_boneInstCacheHits = 0;
+    uint32_t                             m_boneInstCacheMisses = 0;
+    std::unordered_set<uintptr_t>        m_boneInstVbPtrs;  // unique VB ptrs this frame
 
   public:
     // Per-filter rejection reasons tracked for one frame at a time.  Kept
@@ -152,15 +154,11 @@ namespace dxvk {
     // Frame N: compute shader extracts transforms to host-visible buffer.
     // Frame N+1: CPU reads buffer, sets instancesToObject on the draw.
     // Keyed per instanced draw batch (startInstance + instanceCount).
-    struct BoneExtractEntry {
-      uint32_t instanceCount = 0;
-      std::vector<Matrix4> transforms;
-      bool hasTransforms = false;
-      uint64_t boneDataHash = 0;
-      uint32_t lastUsedFrame = 0;  // For LRU eviction
-    };
+    // Per-draw allocated transforms. Kept alive in a ring buffer by frame
+    // so scene manager's instancesToObject pointers stay valid.
+    // We keep the last N frames of allocations.
+    std::vector<std::vector<std::shared_ptr<std::vector<Matrix4>>>> m_boneTransformRing;
     uint32_t                             m_boneInstFrameId = 0;
-    std::unordered_map<uint64_t, std::unique_ptr<BoneExtractEntry>> m_boneExtracts;
     const std::vector<Matrix4>*          m_currentInstancesToObject = nullptr;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
