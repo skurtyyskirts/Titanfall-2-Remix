@@ -231,10 +231,29 @@ namespace dxvk {
             break;
           }
         }
-        // Check if VS SRV t30 is bound (g_boneMatrix)
+        // Check VS SRV slots 30 (t30 = skinning bones) and 31 (t31 = per-instance transforms).
+        // The instanced shader we decompiled uses t31 with 208-byte stride per instance.
+        const uint32_t kInstTransformSlot = 31;
         const uint32_t kBoneSrvSlot = 30;
-        if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+        uint32_t usedSlot = 0;
+        if (kInstTransformSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+          boneSrv = m_context->m_state.vs.shaderResources.views[kInstTransformSlot].ptr();
+          if (boneSrv) usedSlot = kInstTransformSlot;
+        }
+        if (!boneSrv && kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
           boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+          if (boneSrv) usedSlot = kBoneSrvSlot;
+        }
+        static bool sLoggedSlot = false;
+        if (!sLoggedSlot && boneSrv) {
+          sLoggedSlot = true;
+          Com<ID3D11Resource> r; boneSrv->GetResource(&r);
+          auto* b = static_cast<D3D11Buffer*>(r.ptr());
+          Logger::info(str::format("[D3D11Rtx] Using SRV slot ", usedSlot,
+            " bufSize=", (b ? b->Desc()->ByteWidth : 0),
+            " usage=", (b ? b->Desc()->Usage : 0),
+            " hasImmData=", (b ? b->GetImmutableData().size() : 0)));
+        }
 
         if (boneIdxSem && boneSrv) {
           // Get the bone matrix buffer
@@ -276,9 +295,69 @@ namespace dxvk {
             }
           }
 
+          // Log VS hash on first bone-instanced draw (to find the shader)
+          static bool sLoggedVsHash = false;
+          if (!sLoggedVsHash) {
+            sLoggedVsHash = true;
+            auto vsShader = m_context->m_state.vs.shader;
+            if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
+              auto& shader = vsShader->GetCommonShader()->GetShader();
+              if (shader != nullptr) {
+                Logger::info(str::format(
+                  "[D3D11Rtx] Bone-instanced VS hash: ",
+                  shader->getShaderKey().toString()));
+              }
+            }
+          }
+
           // 1 BLAS + N TLAS instances via instancesToObject.
-          // Transforms from CPU-cached instance buffer + bone cache.
-          if (!m_instBufCache.empty() && m_hasFullBoneCache) {
+          // Per-instance transforms are in the DYNAMIC t31 buffer (208 bytes/instance).
+          m_boneInstBatches++;
+
+          // Read the t31 buffer (per-instance world transforms) directly.
+          // It's DYNAMIC (MAP_WRITE_DISCARD) so we use GetMappedSlice().
+          const uint8_t* t31Data = nullptr;
+          size_t t31Len = 0;
+          {
+            Com<ID3D11Resource> res;
+            boneSrv->GetResource(&res);
+            auto* t31Buf = static_cast<D3D11Buffer*>(res.ptr());
+            if (t31Buf) {
+              auto mapped = t31Buf->GetMappedSlice();
+              if (mapped.mapPtr && mapped.length > 0) {
+                t31Data = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                t31Len = mapped.length;
+              } else {
+                // Fallback: try the underlying DxvkBuffer's slice
+                void* p = t31Buf->GetBuffer()->mapPtr(0);
+                if (p) {
+                  t31Data = reinterpret_cast<const uint8_t*>(p);
+                  t31Len = t31Buf->GetBuffer()->info().size;
+                }
+              }
+            }
+          }
+
+          // Log t31 status every N batches
+          static uint32_t sT31Log = 0;
+          if (sT31Log < 20) {
+            ++sT31Log;
+            std::string matDump;
+            if (t31Data && t31Len >= 208) {
+              for (uint32_t k = 0; k < 4u && k * 208 + 48 <= t31Len; ++k) {
+                const float* m = reinterpret_cast<const float*>(t31Data + k * 208);
+                matDump += str::format(" m", k, "T=(", m[3], ",", m[7], ",", m[11], ")");
+              }
+            }
+            Logger::info(str::format(
+              "[D3D11Rtx] t31: ptr=", (t31Data != nullptr ? 1 : 0),
+              " len=", t31Len,
+              " instCount=", instanceCount,
+              " maxInst=", std::min(instanceCount, RtxOptions::maxInstanceSubmissions()),
+              matDump));
+          }
+
+          if (!m_instBufCache.empty() && t31Data) {
             const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
             const uint64_t batchKey = (static_cast<uint64_t>(startInstance) << 32) | maxInstances;
 
@@ -287,47 +366,181 @@ namespace dxvk {
             if (!entryPtr) entryPtr = std::make_unique<BoneExtractEntry>();
             auto& entry = *entryPtr;
 
-            // Build transforms on first encounter
-            if (!entry.hasTransforms) {
+            // Auto-detect bones-per-character stride from the bone buffer.
+            // Each character has N bones. Within one character, all bone
+            // translations are near the character's world position. Find the
+            // stride by searching for the next bone whose translation differs
+            // significantly from bone[0]'s translation.
+            // Shader decompilation shows stride of 52 floats = 208 bytes per instance.
+            // Matrix is 3×float4 (48 bytes) at offset 0 of each 208-byte block.
+            constexpr uint32_t BYTES_PER_INSTANCE = 208;
+
+            // Compute hash of transform data used by this batch.
+            uint64_t curHash = 0;
+            {
               const uint8_t* instData = m_instBufCache.data();
-              const uint8_t* boneCache = m_fullBoneCache.data();
-              const size_t boneCacheLen = m_fullBoneCache.size();
+              const uint32_t stride = instVb.stride;
+              const uint32_t boneOff = boneIdxSem->byteOffset;
+              for (uint32_t i = 0; i < maxInstances; ++i) {
+                size_t instOff = static_cast<size_t>(startInstance + i) * stride + boneOff;
+                uint16_t charIdx = 0;
+                if (instOff + 2 <= m_instBufCache.size())
+                  charIdx = *reinterpret_cast<const uint16_t*>(instData + instOff);
+                size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
+                if (t31Off + 48 <= t31Len) {
+                  const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
+                  uint64_t bits;
+                  std::memcpy(&bits, m + 3, 4); curHash = curHash * 31 + bits;
+                  std::memcpy(&bits, m + 7, 4); curHash = curHash * 31 + bits;
+                  std::memcpy(&bits, m + 11, 4); curHash = curHash * 31 + bits;
+                }
+              }
+            }
+
+            const bool needRebuild = !entry.hasTransforms || entry.boneDataHash != curHash;
+            const bool sizeWouldChange = entry.hasTransforms && entry.transforms.size() != maxInstances;
+
+            if (needRebuild && !sizeWouldChange) {
+              const uint8_t* instData = m_instBufCache.data();
               const uint32_t stride = instVb.stride;
               const uint32_t boneOff = boneIdxSem->byteOffset;
 
-              entry.transforms.clear();
-              entry.transforms.reserve(maxInstances);
+              // Pre-size to maxInstances (stable address, size never changes after first build)
+              entry.transforms.resize(maxInstances);
+
+              // Log t30 status and translation (what the interleaver actually uses)
+              Matrix4 bone0Inv;
+              Matrix4 bone0dbg;
+              bool t30Valid = false;
+              {
+                const float* b0 = nullptr;
+                auto t30Srv = m_context->m_state.vs.shaderResources.views[30].ptr();
+                if (t30Srv) {
+                  Com<ID3D11Resource> t30Res;
+                  t30Srv->GetResource(&t30Res);
+                  auto* t30Buf = static_cast<D3D11Buffer*>(t30Res.ptr());
+                  if (t30Buf) {
+                    auto mapped = t30Buf->GetMappedSlice();
+                    if (mapped.mapPtr) b0 = reinterpret_cast<const float*>(mapped.mapPtr);
+                    else {
+                      void* p = t30Buf->GetBuffer()->mapPtr(0);
+                      if (p) b0 = reinterpret_cast<const float*>(p);
+                    }
+                    if (!b0) {
+                      // Try immutable data cache
+                      const auto& imm = t30Buf->GetImmutableData();
+                      if (!imm.empty()) b0 = reinterpret_cast<const float*>(imm.data());
+                    }
+                  }
+                }
+                if (b0) {
+                  bone0dbg = Matrix4(
+                    Vector4(b0[0], b0[1], b0[2],  0.0f),
+                    Vector4(b0[4], b0[5], b0[6],  0.0f),
+                    Vector4(b0[8], b0[9], b0[10], 0.0f),
+                    Vector4(b0[3], b0[7], b0[11], 1.0f));
+                  bone0Inv = inverse(bone0dbg);
+                  t30Valid = true;
+                }
+              }
+              static uint32_t sT30Log = 0;
+              if (sT30Log < 10) {
+                ++sT30Log;
+                Logger::info(str::format("[D3D11Rtx] t30 bone[0]: valid=", t30Valid,
+                  " T=(", bone0dbg[3][0], ",", bone0dbg[3][1], ",", bone0dbg[3][2], ")",
+                  " diag=(", bone0dbg[0][0], ",", bone0dbg[1][1], ",", bone0dbg[2][2], ")"));
+              }
+
+              // Assign in-place (no reallocation)
               for (uint32_t i = 0; i < maxInstances; ++i) {
                 size_t instOff = static_cast<size_t>(startInstance + i) * stride + boneOff;
-                uint16_t boneIdx = 0;
+                uint16_t charIdx = 0;
                 if (instOff + 2 <= m_instBufCache.size())
-                  boneIdx = *reinterpret_cast<const uint16_t*>(instData + instOff);
+                  charIdx = *reinterpret_cast<const uint16_t*>(instData + instOff);
 
-                size_t boneByteOff = static_cast<size_t>(boneIdx) * 48;
-                if (boneByteOff + 48 > boneCacheLen) continue;
-
-                const float* m = reinterpret_cast<const float*>(boneCache + boneByteOff);
-                if (!std::isfinite(m[0]) || !std::isfinite(m[3])) continue;
-                if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) continue;
-
-                entry.transforms.push_back(Matrix4(
-                  Vector4(m[0], m[1], m[2],  0.0f),
-                  Vector4(m[4], m[5], m[6],  0.0f),
-                  Vector4(m[8], m[9], m[10], 0.0f),
-                  Vector4(m[3], m[7], m[11], 1.0f)));
+                size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
+                bool valid = false;
+                Matrix4 matI;
+                if (t31Off + 48 <= t31Len) {
+                  const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
+                  if (std::isfinite(m[0]) && std::isfinite(m[3]) &&
+                      !(m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f)) {
+                    matI = Matrix4(
+                      Vector4(m[0], m[1], m[2],  0.0f),
+                      Vector4(m[4], m[5], m[6],  0.0f),
+                      Vector4(m[8], m[9], m[10], 0.0f),
+                      Vector4(m[3], m[7], m[11], 1.0f));
+                    valid = true;
+                  }
+                }
+                // instancesToObject[i] = mat_t31[i] * inv(bone_t30[0])
+                entry.transforms[i] = valid ? (matI * bone0Inv) : Matrix4();
               }
+              entry.boneDataHash = curHash;
               entry.instanceCount = static_cast<uint32_t>(entry.transforms.size());
               entry.hasTransforms = true;
+
+              // Log first few i2o transforms + camera/worldToView for comparison
+              static uint32_t sBuildLog = 0;
+              if (sBuildLog < 20) {
+                ++sBuildLog;
+                std::string info;
+                for (uint32_t k = 0; k < std::min(maxInstances, 3u); ++k) {
+                  const auto& i2o = entry.transforms[k];
+                  info += str::format(" i2o[", k, "]T=(", i2o[3][0], ",", i2o[3][1], ",", i2o[3][2], ")");
+                }
+                // (dcs not in scope here — will log from SubmitDraw)
+                Logger::info(str::format(
+                  "[D3D11Rtx] Built ", maxInstances, " key=", batchKey, info));
+              }
             }
 
             // Submit single draw with instancesToObject (1 BLAS + N TLAS instances)
             if (!entry.transforms.empty()) {
+              // Debug: sample bones at offsets 0, 53, 106, 53*10, 53*50
+              static uint32_t sDbg = 0;
+              if (sDbg < 1) {
+                ++sDbg;
+                const uint8_t* bc = m_fullBoneCache.data();
+                const size_t bcLen = m_fullBoneCache.size();
+                std::string info = str::format(" cacheSize=", bcLen);
+                // Sample at 208-byte instance strides
+                uint32_t instSamples[] = {0, 1, 2, 3, 5, 10, 20, 50, 100, 150};
+                for (uint32_t si : instSamples) {
+                  size_t off = si * 208;
+                  if (off + 48 > bcLen) { info += str::format(" inst[", si, "]=OOB"); continue; }
+                  const float* bk = reinterpret_cast<const float*>(bc + off);
+                  info += str::format(" inst[", si, "]T=(", bk[3], ",", bk[7], ",", bk[11], ")");
+                }
+                Logger::info(str::format("[D3D11Rtx] InstSample:", info));
+
+                // Old 48-byte bone stride for comparison
+                info.clear();
+                uint32_t samples[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 53, 106};
+                for (uint32_t si : samples) {
+                  size_t off = si * 48;
+                  if (off + 48 > bcLen) {
+                    info += str::format(" bone[", si, "]=OOB");
+                    continue;
+                  }
+                  const float* bk = reinterpret_cast<const float*>(bc + off);
+                  // Just translation (3, 7, 11) for row-major 3x4
+                  info += str::format(" bone[", si, "]T=(", bk[3], ",", bk[7], ",", bk[11], ")");
+                }
+                Logger::info(str::format("[D3D11Rtx] BoneSample:", info));
+              }
               m_currentInstancesToObject = &entry.transforms;
               m_boneInstanceCount = entry.instanceCount;
+              m_boneInstTotal += entry.instanceCount;
               SubmitDraw(indexed, count, start, base);
               m_boneInstanceCount = 0;
               m_currentInstancesToObject = nullptr;
+            } else {
+              m_boneInstSkipped++;
             }
+            handledAsBoneInstancing = true;
+          } else {
+            m_boneInstNoCache++;
             handledAsBoneInstancing = true;
           }
         }
@@ -3143,12 +3356,31 @@ namespace dxvk {
         dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
     }
 
-    // NV-DXVK: For bone-instanced draws with instancesToObject, set identity
-    // objectToWorld — the bone matrices ARE the world transforms.
+    // NV-DXVK: For bone-instanced draws with instancesToObject.
+    // t31 matrix IS the world transform (from shader decompilation).
+    // BLAS = localPos (bone buffers stripped), objectToWorld = identity,
+    // instancesToObject[i] = t31_mat[i] places in world directly.
     if (m_boneInstanceCount > 0 && m_currentInstancesToObject) {
-      dcs.transformData.objectToWorld = Matrix4();  // identity
-      dcs.transformData.objectToView = dcs.transformData.worldToView;
+      static uint32_t sSubmitLog = 0;
+      if (sSubmitLog < 10) {
+        ++sSubmitLog;
+        const auto& w2v = dcs.transformData.worldToView;
+        const auto& o2w = dcs.transformData.objectToWorld;
+        const auto& i2o0 = (*m_currentInstancesToObject)[0];
+        Logger::info(str::format(
+          "[D3D11Rtx] SubmitBone: camPos(w2v.T)=(", -w2v[3][0], ",", -w2v[3][1], ",", -w2v[3][2], ")",
+          " origO2W.T=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " i2o0.T=(", i2o0[3][0], ",", i2o0[3][1], ",", i2o0[3][2], ")",
+          " finalInst0=(", o2w[3][0] + i2o0[3][0], ",",
+          o2w[3][1] + i2o0[3][1], ",", o2w[3][2] + i2o0[3][2], ")"));
+      }
       dcs.transformData.instancesToObject = m_currentInstancesToObject;
+      // Keep objectToWorld from cb3 — t31 matrices are local to it.
+      // Final per-instance = cb3_objectToWorld * t31[i] * localPos
+      dcs.geometryData.boneMatrixBuffer = RasterBuffer();
+      dcs.geometryData.boneIndexBuffer = RasterBuffer();
+      geo.boneMatrixBuffer = RasterBuffer();
+      geo.boneIndexBuffer = RasterBuffer();
     }
     // NV-DXVK: For bone-instanced draws with attached bone buffers (N-draw path),
     // the interleaver applies the bone transform. Set objectToWorld to identity.
@@ -3388,15 +3620,20 @@ namespace dxvk {
     // Cache bone matrix buffer (t30 = 393216 bytes = 8192 bones × 48 bytes)
     // Intercept the FULL buffer on the CPU before it's uploaded to GPU.
     // This allows per-instance bone lookup without GPU readback.
-    if (BufSize == 393216 && DstOffset == 0 && SrcDataSize >= 48) {
-      std::memcpy(m_cachedBone0, pSrcData, 48);
-      m_hasCachedBone0 = true;
+    if (BufSize == 393216 && SrcDataSize >= 48) {
       m_lastBoneBuffer = static_cast<ID3D11Buffer*>(pDstResource);
-      // Cache full buffer for multi-instance bone lookup
-      const size_t copySize = std::min(static_cast<size_t>(SrcDataSize), static_cast<size_t>(BufSize));
-      m_fullBoneCache.resize(copySize);
-      std::memcpy(m_fullBoneCache.data(), pSrcData, copySize);
+      // Keep buffer at full size; write each update at DstOffset.
+      if (m_fullBoneCache.size() != BufSize)
+        m_fullBoneCache.resize(BufSize, 0);
+      const size_t maxCopy = std::min(
+        static_cast<size_t>(SrcDataSize),
+        static_cast<size_t>(BufSize) - static_cast<size_t>(DstOffset));
+      std::memcpy(m_fullBoneCache.data() + DstOffset, pSrcData, maxCopy);
       m_hasFullBoneCache = true;
+      if (DstOffset == 0) {
+        std::memcpy(m_cachedBone0, pSrcData, 48);
+        m_hasCachedBone0 = true;
+      }
     }
     // Log ALL buffer update sizes to find cb3
     static uint32_t sAllUpdateLog = 0;
@@ -3456,8 +3693,21 @@ namespace dxvk {
     for (uint32_t i = 0; i < static_cast<uint32_t>(FilterReason::Count); ++i)
       m_filterCounts[i] = 0;
 
-    // NV-DXVK: Instance buffer data is now cached via D3D11 staging copy
-    // (IMMUTABLE buffers only need one copy). No per-frame GPU copies needed.
+    // NV-DXVK: Per-frame bone instancing summary
+    if (m_boneInstBatches > 0) {
+      Logger::info(str::format(
+        "[D3D11Rtx] BoneInst: batches=", m_boneInstBatches,
+        " totalInstances=", m_boneInstTotal,
+        " skipped=", m_boneInstSkipped,
+        " noCache=", m_boneInstNoCache,
+        " instBufCache=", m_instBufCache.size(),
+        " boneCache=", m_fullBoneCache.size(),
+        " extractEntries=", m_boneExtracts.size()));
+    }
+    m_boneInstBatches = 0;
+    m_boneInstTotal = 0;
+    m_boneInstSkipped = 0;
+    m_boneInstNoCache = 0;
 
     // Safety net: if no draw set the camera this frame (all filtered, empty
     // present, geometry-hash failures, etc.), push a viewport-derived camera

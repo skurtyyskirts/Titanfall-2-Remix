@@ -59,6 +59,12 @@ namespace dxvk {
     // of them were rejected by SubmitDraw's pre-filters".
     uint32_t                             m_rawDrawCount = 0;
 
+    // NV-DXVK: Per-frame bone instancing stats
+    uint32_t                             m_boneInstBatches = 0;
+    uint32_t                             m_boneInstTotal = 0;
+    uint32_t                             m_boneInstSkipped = 0;
+    uint32_t                             m_boneInstNoCache = 0;
+
   public:
     // Per-filter rejection reasons tracked for one frame at a time.  Kept
     // public so SubmitDraw can bump them without a friend declaration. The
@@ -148,6 +154,7 @@ namespace dxvk {
       uint32_t instanceCount = 0;
       std::vector<Matrix4> transforms;
       bool hasTransforms = false;
+      uint64_t boneDataHash = 0;  // Hash of bone data used to build transforms
     };
     std::unordered_map<uint64_t, std::unique_ptr<BoneExtractEntry>> m_boneExtracts;
     const std::vector<Matrix4>*          m_currentInstancesToObject = nullptr;
@@ -162,6 +169,8 @@ namespace dxvk {
     // NV-DXVK: Full bone matrix cache from t30 — intercepted in OnUpdateSubresource
     std::vector<uint8_t>                 m_fullBoneCache;
     bool                                 m_hasFullBoneCache = false;
+    bool                                 m_boneCacheFullNoted = false;
+    uint32_t                             m_bonesPerChar = 0; // auto-detected stride
 
     // NV-DXVK: Cached IMMUTABLE instance buffer data (bone indices).
     // Read once via D3D11 staging copy, reused every frame.
