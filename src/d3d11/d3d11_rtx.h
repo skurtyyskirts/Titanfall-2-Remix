@@ -136,6 +136,9 @@ namespace dxvk {
 
     // NV-DXVK: Current instance index for GPU bone instancing
     uint32_t                             m_currentInstanceIndex = 0;
+    // NV-DXVK: Set by SubmitInstancedDraw to tell SubmitDraw to attach bone buffers
+    bool                                 m_attachBoneBuffers = false;
+    uint32_t                             m_boneInstanceCount = 0;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan

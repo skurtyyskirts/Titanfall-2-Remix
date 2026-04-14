@@ -309,10 +309,14 @@ namespace dxvk {
   }
 
   void DrawCallState::finalizeSkinningData(const RtCamera* pLastCamera) {
+    // NV-DXVK start: Support both async (futureSkinningData) and pre-populated skinningData paths.
+    // The D3D11 layer populates skinningData directly when capturing per-vertex bone data.
     if (futureSkinningData.valid()) {
       skinningData = futureSkinningData.get();
+    }
 
-      assert(geometryData.blendWeightBuffer.defined());
+    // Process skinning if we have bone data (from either path)
+    if (skinningData.numBones > 0 && geometryData.blendWeightBuffer.defined()) {
       assert(skinningData.numBonesPerVertex <= 4);
 
       if (pLastCamera != nullptr) {
@@ -343,6 +347,7 @@ namespace dxvk {
       // Store the numBonesPerVertex in the RasterGeometry as well to allow it to be overridden
       geometryData.numBonesPerVertex = skinningData.numBonesPerVertex;
     }
+    // NV-DXVK end
   }
 
   void DrawCallState::setCategory(InstanceCategories category, bool doSet) {
@@ -570,7 +575,7 @@ namespace dxvk {
   void DrawCallState::setupCategoriesForHeuristics(uint32_t prevFrameSeenCamerasCount,
                                                    std::vector<Vector3>& seenCameraPositions) {
     const SkyDetectionSource skySource = shouldBakeSky(*this,
-                                                       futureSkinningData.valid(),
+                                                       futureSkinningData.valid() || skinningData.numBones > 0,
                                                        prevFrameSeenCamerasCount,
                                                        seenCameraPositions);
     setCategory(InstanceCategories::Sky, skySource != SkyDetectionSource::None);

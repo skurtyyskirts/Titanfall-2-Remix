@@ -307,21 +307,21 @@ namespace dxvk {
       }
 
       if (!handledAsBoneInstancing && boneIdxSem && boneSrv) {
-        // GPU bone path: both buffers are GPU-only. Submit each instance
-        // separately with instanceIndex as boneIndex. The interleaver will
-        // read the bone index from the GPU instance buffer and fetch the
-        // bone matrix from t30 on the GPU.
-        const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
+        // GPU bone path: pass bone matrix buffer + bone index buffer to the
+        // geometry and let the interleaver apply per-instance transforms on
+        // the GPU. This avoids N separate SubmitDraw calls (< 1 FPS).
         static uint32_t sGpuInstLog = 0;
         if (sGpuInstLog < 3) {
           ++sGpuInstLog;
           Logger::info(str::format(
             "[D3D11Rtx] GPU bone instancing: ", instanceCount, " instances",
-            " (max ", maxInstances, ")"));
+            " — single draw with bone buffers attached"));
         }
-        // All instances share bone 0 (COLOR1.y=0 for all). No need to
-        // expand per-instance — submit once with bone 0.
+        m_attachBoneBuffers = true;
+        m_boneInstanceCount = instanceCount;
         SubmitDraw(indexed, count, start, base);
+        m_attachBoneBuffers = false;
+        m_boneInstanceCount = 0;
         handledAsBoneInstancing = true;
       }
 
@@ -2431,6 +2431,16 @@ namespace dxvk {
                              UINT start,
                              INT  base,
                              const Matrix4* instanceTransform) {
+    // NV-DXVK: Diagnostic — confirm SubmitDraw is reached
+    {
+      static uint32_t sEntryLog = 0;
+      if (sEntryLog < 3) {
+        ++sEntryLog;
+        Logger::info(str::format("[D3D11Rtx] SubmitDraw ENTERED count=", count,
+          " indexed=", indexed ? 1 : 0, " raw=", m_rawDrawCount));
+      }
+    }
+
     // NV-DXVK: Previously this returned early on deferred contexts because
     // D3D11Rtx::Initialize() is only called on the immediate context, leaving
     // m_pGeometryWorkers null everywhere else.  That meant Source-engine
@@ -2620,6 +2630,8 @@ namespace dxvk {
     const D3D11RtxSemantic* nrmSem = nullptr;
     const D3D11RtxSemantic* tcSem  = nullptr;
     const D3D11RtxSemantic* colSem = nullptr;
+    const D3D11RtxSemantic* bwSem  = nullptr; // BLENDWEIGHT  — per-vertex bone weights
+    const D3D11RtxSemantic* biSem  = nullptr; // BLENDINDICES — per-vertex bone indices
 
     static auto isTexcoordFmt = [](VkFormat f) {
       return f == VK_FORMAT_R32G32_SFLOAT        // 103 — standard 2-float UVs
@@ -2640,6 +2652,10 @@ namespace dxvk {
         tcSem  = &s;
       else if (!colSem && std::strncmp(s.name, "COLOR",    5) == 0 && s.index == 0)
         colSem = &s;
+      else if (!bwSem  && std::strncmp(s.name, "BLENDWEIGHT",  11) == 0 && s.index == 0)
+        bwSem  = &s;
+      else if (!biSem  && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0)
+        biSem  = &s;
     }
 
     // Fallback: accept TEXCOORD at any semantic index (some engines use
@@ -2851,6 +2867,11 @@ namespace dxvk {
       colBuffer = makeVertexBuffer(colSem);
     }
 
+    // NV-DXVK start: Per-vertex skinning buffers (BLENDWEIGHT + BLENDINDICES)
+    RasterBuffer bwBuffer  = makeVertexBuffer(bwSem);
+    RasterBuffer biBuffer  = makeVertexBuffer(biSem);
+    // NV-DXVK end
+
     RasterBuffer idxBuffer;
     if (indexed) {
       const auto& ib = m_context->m_state.ia.indexBuffer;
@@ -2885,10 +2906,48 @@ namespace dxvk {
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
 
-    // NV-DXVK: Track bone buffer for UpdateSubresource interception.
-    // The per-draw transform comes from cb3 (extracted by the world matrix scan),
-    // NOT from the bone system. The bone buffer is shared across all draws.
-    if (posSem->format == VK_FORMAT_R32G32_UINT) {
+    // NV-DXVK start: Per-vertex skinning — populate blend buffers and bone count
+    if (bwBuffer.defined() && biBuffer.defined()) {
+      geo.blendWeightBuffer  = bwBuffer;
+      geo.blendIndicesBuffer = biBuffer;
+      // Derive bones-per-vertex from the blend weight format:
+      // Each explicit float weight implies one bone; the last bone's weight is
+      // implicit (1 - sum).  So 1 float = 2 bones, 2 floats = 3, etc.
+      switch (bwSem->format) {
+        case VK_FORMAT_R32_SFLOAT:                geo.numBonesPerVertex = 2; break;
+        case VK_FORMAT_R32G32_SFLOAT:             geo.numBonesPerVertex = 3; break;
+        case VK_FORMAT_R32G32B32_SFLOAT:          geo.numBonesPerVertex = 4; break;
+        case VK_FORMAT_R32G32B32A32_SFLOAT:       geo.numBonesPerVertex = 4; break;
+        default:                                  geo.numBonesPerVertex = 0; break;
+      }
+    }
+    // NV-DXVK end
+
+    // NV-DXVK start: Diagnostic — dump first N unique input layouts
+    {
+      static uint32_t sLayoutLog = 0;
+      static uintptr_t sLastLayout = 0;
+      uintptr_t layoutAddr = reinterpret_cast<uintptr_t>(m_context->m_state.ia.inputLayout.ptr());
+      if (layoutAddr != sLastLayout && sLayoutLog < 20) {
+        sLastLayout = layoutAddr;
+        ++sLayoutLog;
+        Logger::info(str::format("[D3D11Rtx] Layout #", sLayoutLog,
+                                 " (", semantics.size(), " semantics):"));
+        for (const auto& s : semantics) {
+          Logger::info(str::format("[D3D11Rtx]   name=", s.name,
+            " idx=", s.index, " fmt=", uint32_t(s.format),
+            " slot=", s.inputSlot, " off=", s.byteOffset,
+            " inst=", s.perInstance ? 1 : 0));
+        }
+      }
+    }
+    // NV-DXVK end
+
+    // NV-DXVK: Track bone buffer and attach bone data for GPU instancing.
+    // For R32G32_UINT positions AND for instanced bone draws (m_attachBoneBuffers),
+    // attach the t30 bone matrix buffer and per-instance bone index buffer to the
+    // geometry so the interleaver can apply per-instance transforms on the GPU.
+    if (posSem->format == VK_FORMAT_R32G32_UINT || m_attachBoneBuffers) {
       const uint32_t kBoneSrvSlot = 30;
       if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
         auto boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
@@ -2896,11 +2955,15 @@ namespace dxvk {
           Com<ID3D11Resource> boneRes;
           boneSrv->GetResource(&boneRes);
           auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
-          if (boneBuf) m_lastBoneBuffer = boneBuf;
-          // Don't bind bone buffers — rotation-only worldToView + cb3 handles transforms.
+          if (boneBuf) {
+            m_lastBoneBuffer = boneBuf;
+            // Attach bone matrix buffer to geometry for GPU-side transform lookup
+            geo.boneMatrixBuffer = RasterBuffer(
+              boneBuf->GetBufferSlice(), 0, 48, VK_FORMAT_UNDEFINED);
+          }
         }
       }
-      // Per-instance bone index from slot 1
+      // Per-instance bone index from the per-instance semantic
       for (const auto& s : semantics) {
         if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
           const auto& instVb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
@@ -3095,6 +3158,115 @@ namespace dxvk {
     // swap chain routes EndFrame/OnPresent through us, not a video-playback
     // device that happened to present first.
     FillMaterialData(dcs.materialData);
+
+    // NV-DXVK start: Per-vertex skinning — capture bone matrices from VS SRV t30
+    if (geo.numBonesPerVertex > 0) {
+      bool gotBones = false;
+      const uint32_t kBoneSrvSlot = 30;
+      ID3D11ShaderResourceView* boneSrv = nullptr;
+      if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+        boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+
+      if (boneSrv) {
+        Com<ID3D11Resource> boneRes;
+        boneSrv->GetResource(&boneRes);
+        auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
+
+        if (boneBuf) {
+          // Try multiple paths to access bone data (buffer may be GPU-only)
+          const uint8_t* bonePtr = nullptr;
+          size_t boneBufLen = 0;
+
+          // Path 1: mapped slice (WRITE_DISCARD mapped memory)
+          {
+            const auto mapped = boneBuf->GetMappedSlice();
+            if (mapped.mapPtr && mapped.length >= 48) {
+              bonePtr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+              boneBufLen = mapped.length;
+            }
+          }
+
+          // Path 2: DxvkBuffer direct mapPtr (host-visible buffers)
+          if (!bonePtr) {
+            DxvkBufferSlice boneSlice = boneBuf->GetBufferSlice();
+            if (boneSlice.defined()) {
+              void* p = boneSlice.buffer()->mapPtr(0);
+              if (p) {
+                bonePtr = reinterpret_cast<const uint8_t*>(p) + boneSlice.offset();
+                boneBufLen = boneSlice.length();
+              }
+            }
+          }
+
+          // Path 3: cached from UpdateSubresource interception
+          if (!bonePtr && m_hasCachedBone0 && m_lastBoneBuffer == boneBuf) {
+            bonePtr = reinterpret_cast<const uint8_t*>(m_cachedBone0);
+            boneBufLen = 48; // Only bone 0 is cached
+          }
+
+          if (bonePtr && boneBufLen >= 48) {
+            const uint32_t numBones = static_cast<uint32_t>(boneBufLen / 48);
+            const uint32_t maxBones = std::min(numBones, 256u); // SkinningArgs limit
+
+            dcs.skinningData.numBonesPerVertex = geo.numBonesPerVertex;
+            dcs.skinningData.numBones = maxBones;
+            dcs.skinningData.minBoneIndex = 0;
+            dcs.skinningData.pBoneMatrices.resize(maxBones);
+
+            bool allValid = true;
+            for (uint32_t b = 0; b < maxBones; ++b) {
+              const float* m = reinterpret_cast<const float*>(bonePtr + b * 48);
+              // Validate bone data isn't garbage
+              if (!std::isfinite(m[0]) || !std::isfinite(m[3])) {
+                allValid = false;
+                break;
+              }
+              // float3x4 row-major → Matrix4
+              dcs.skinningData.pBoneMatrices[b] = Matrix4(
+                Vector4(m[0], m[1], m[2],  0.0f),
+                Vector4(m[4], m[5], m[6],  0.0f),
+                Vector4(m[8], m[9], m[10], 0.0f),
+                Vector4(m[3], m[7], m[11], 1.0f));
+            }
+
+            if (allValid) {
+              dcs.skinningData.computeHash();
+              gotBones = true;
+            }
+          }
+        }
+      }
+
+      // If we couldn't read bone matrices, disable skinning for this draw
+      // to prevent dispatchSkinning from running with empty bone data.
+      if (!gotBones) {
+        static uint32_t sBoneFailLog = 0;
+        if (sBoneFailLog < 5) {
+          ++sBoneFailLog;
+          Logger::warn(str::format(
+            "[D3D11Rtx] Per-vertex skinning: could not read bone matrices from t30.",
+            " SRV=", boneSrv ? "bound" : "null",
+            " bonesPerVert=", geo.numBonesPerVertex,
+            " bwFmt=", bwSem ? uint32_t(bwSem->format) : 0,
+            " biFmt=", biSem ? uint32_t(biSem->format) : 0));
+        }
+        geo.numBonesPerVertex = 0;
+        geo.blendWeightBuffer  = RasterBuffer();
+        geo.blendIndicesBuffer = RasterBuffer();
+        dcs.geometryData = geo;
+      } else {
+        static uint32_t sBoneOkLog = 0;
+        if (sBoneOkLog < 3) {
+          ++sBoneOkLog;
+          Logger::info(str::format(
+            "[D3D11Rtx] Per-vertex skinning: captured ", dcs.skinningData.numBones,
+            " bones (", geo.numBonesPerVertex, " per vertex)",
+            " bwFmt=", uint32_t(bwSem->format),
+            " biFmt=", uint32_t(biSem->format)));
+        }
+      }
+    }
+    // NV-DXVK end
 
     DrawParameters params;
     params.instanceCount = 1;
