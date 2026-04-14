@@ -338,43 +338,76 @@ namespace dxvk {
             }
           }
 
-          // Log t31 status every N batches
-          static uint32_t sT31Log = 0;
-          if (sT31Log < 20) {
-            ++sT31Log;
-            std::string matDump;
-            if (t31Data && t31Len >= 208) {
-              for (uint32_t k = 0; k < 4u && k * 208 + 48 <= t31Len; ++k) {
-                const float* m = reinterpret_cast<const float*>(t31Data + k * 208);
-                matDump += str::format(" m", k, "T=(", m[3], ",", m[7], ",", m[11], ")");
+          // Debug logging — fires after frame 50 (when user has loaded into scene)
+          static uint32_t sFrameCount = 0;
+          static uint32_t sDumpedAll = 0;
+          sFrameCount++;
+
+          // Track a specific batch's t31 translation across frames to see
+          // if it's view-dependent (changes when camera moves) or stable.
+          static uint64_t sTrackedKey = 0;
+          static uint32_t sTrackedCount = 0;
+          if (t31Data && t31Len >= 48 && sTrackedCount < 30) {
+            // Pick the first batch we see and track its t31[0] every frame
+            uint64_t myKey = reinterpret_cast<uintptr_t>(boneSrv);
+            if (sTrackedKey == 0) sTrackedKey = myKey;
+            if (myKey == sTrackedKey) {
+              const float* m = reinterpret_cast<const float*>(t31Data);
+              ++sTrackedCount;
+              Logger::info(str::format(
+                "[D3D11Rtx] Track srv=", myKey, " frame=", sFrameCount,
+                " t31[0].T=(", m[3], ",", m[7], ",", m[11], ")"));
+            }
+          }
+
+          // #3: Dump ALL t31 translations ONCE after 50 frames
+          if (sFrameCount > 50 && sDumpedAll < 1 && t31Data && t31Len >= 48) {
+            ++sDumpedAll;
+            uint32_t numInst = static_cast<uint32_t>(t31Len / 208);
+            std::string dump = str::format("inst=", numInst);
+            for (uint32_t k = 0; k < numInst && k * 208 + 48 <= t31Len; ++k) {
+              const float* m = reinterpret_cast<const float*>(t31Data + k * 208);
+              dump += str::format(" [", k, "]=(", m[3], ",", m[7], ",", m[11], ")");
+            }
+            Logger::info(str::format("[D3D11Rtx] DumpAllT31: ", dump));
+
+            // (vertex decode test removed — Z offset bug already fixed from shader decomp)
+
+            // #5: log cb0, cb2, cb3 sizes
+            const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+            for (uint32_t sl = 0; sl < 4; ++sl) {
+              if (vsCbs[sl].buffer != nullptr) {
+                Logger::info(str::format("[D3D11Rtx] VS cb[", sl, "] size=",
+                  vsCbs[sl].buffer->Desc()->ByteWidth,
+                  " off=", vsCbs[sl].constantOffset));
               }
             }
-            Logger::info(str::format(
-              "[D3D11Rtx] t31: ptr=", (t31Data != nullptr ? 1 : 0),
-              " len=", t31Len,
-              " instCount=", instanceCount,
-              " maxInst=", std::min(instanceCount, RtxOptions::maxInstanceSubmissions()),
-              matDump));
           }
 
           if (!m_instBufCache.empty() && t31Data) {
             const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
-            // Key includes the t31 buffer pointer so different batches don't collide.
-            // Hash the SRV resource pointer + start + count.
-            uintptr_t t31Ptr = 0;
-            {
-              Com<ID3D11Resource> r;
-              boneSrv->GetResource(&r);
-              t31Ptr = reinterpret_cast<uintptr_t>(r.ptr());
+            // Content-based key: hash the actual t31 matrix data for this batch.
+            // The same SRV is reused across multiple draws per frame with different
+            // data, so pointer-based keys collide.
+            uint64_t batchKey = static_cast<uint64_t>(maxInstances) * 2654435761ull
+                              ^ (static_cast<uint64_t>(startInstance) * 40503ull);
+            if (t31Data) {
+              const size_t hashBytes = std::min(static_cast<size_t>(maxInstances) * 208, t31Len);
+              const uint64_t* words = reinterpret_cast<const uint64_t*>(t31Data);
+              const size_t nWords = hashBytes / sizeof(uint64_t);
+              for (size_t w = 0; w < nWords; ++w) {
+                batchKey = batchKey * 0x100000001B3ull ^ words[w];
+              }
             }
-            const uint64_t batchKey =
-              (t31Ptr ^ (static_cast<uint64_t>(startInstance) * 2654435761ull)
-                      ^ (static_cast<uint64_t>(maxInstances) * 40503ull));
+
+            // (Map cleanup deferred to EndFrame to avoid use-after-free
+            // while scene manager holds instancesToObject pointers.)
 
             // Create entry if needed (unique_ptr survives rehash)
             auto& entryPtr = m_boneExtracts[batchKey];
             if (!entryPtr) entryPtr = std::make_unique<BoneExtractEntry>();
             auto& entry = *entryPtr;
+            entry.lastUsedFrame = m_boneInstFrameId;
 
             // Auto-detect bones-per-character stride from the bone buffer.
             // Each character has N bones. Within one character, all bone
@@ -409,6 +442,8 @@ namespace dxvk {
 
             const bool needRebuild = !entry.hasTransforms || entry.boneDataHash != curHash;
             const bool sizeWouldChange = entry.hasTransforms && entry.transforms.size() != maxInstances;
+            if (needRebuild) m_boneInstCacheMisses++;
+            else m_boneInstCacheHits++;
 
             if (needRebuild && !sizeWouldChange) {
               const uint8_t* instData = m_instBufCache.data();
@@ -3388,11 +3423,38 @@ namespace dxvk {
           " finalInst0=(", o2w[3][0] + i2o0[3][0], ",",
           o2w[3][1] + i2o0[3][1], ",", o2w[3][2] + i2o0[3][2], ")"));
       }
+      // t31 contains VIEW-SPACE transforms (view * model). Need inv(worldToView)
+      // to get world-space matrices. Pre-compute inv(w2v) once per SubmitDraw
+      // and multiply with each instance's transform.
+      //
+      // Game shader: clipPos = cb2 * t31[i] * localPos  (cb2 = projection only)
+      // We want:     worldPos = inv(worldToView) * t31[i] * localPos
+      // => instancesToObject[i] = inv(worldToView) * t31[i]
+      //
+      // Since we can't modify the vector here (it's shared, stable pointer),
+      // we apply the inverse via objectToWorld. Each i2o[i] is already t31[i],
+      // so objectToWorld = inv(worldToView) gives the same math.
       dcs.transformData.instancesToObject = m_currentInstancesToObject;
-      // t31 matrices are world-space transforms. cb3 is unrelated (the shader
-      // uses only cb2/view-proj). Zero out objectToWorld to use t31 directly.
+      // objectToWorld = identity: t31[i] becomes the full world transform.
+      // This was the configuration where objects were visible (just at wrong positions).
       dcs.transformData.objectToWorld = Matrix4();
       dcs.transformData.objectToView = dcs.transformData.worldToView;
+
+      static uint32_t sPostLog = 0;
+      if (sPostLog < 5) {
+        ++sPostLog;
+        const auto& o2w = dcs.transformData.objectToWorld;
+        // Compute magnitude of each row of the 3x3 rotation part
+        auto col_mag = [&](int c) {
+          float s = o2w[c][0]*o2w[c][0] + o2w[c][1]*o2w[c][1] + o2w[c][2]*o2w[c][2];
+          return std::sqrt(s);
+        };
+        Logger::info(str::format(
+          "[D3D11Rtx] InvW2V: T=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " col0=(", o2w[0][0], ",", o2w[0][1], ",", o2w[0][2], ") mag=", col_mag(0),
+          " col1=(", o2w[1][0], ",", o2w[1][1], ",", o2w[1][2], ") mag=", col_mag(1),
+          " col2=(", o2w[2][0], ",", o2w[2][1], ",", o2w[2][2], ") mag=", col_mag(2)));
+      }
       dcs.geometryData.boneMatrixBuffer = RasterBuffer();
       dcs.geometryData.boneIndexBuffer = RasterBuffer();
       geo.boneMatrixBuffer = RasterBuffer();
@@ -3618,6 +3680,26 @@ namespace dxvk {
     {
       const auto& T = dcs.transformData;
       const auto& G = dcs.geometryData;
+
+      // NV-DXVK: Log the VS hash of non-instanced bone draws (these work
+      // correctly — their shader tells us the right cbuffer layout Remix reads).
+      static uint32_t sLoggedNonInstBone = 0;
+      const bool isBoneInst = (m_boneInstanceCount > 0 && m_currentInstancesToObject);
+      if (sLoggedNonInstBone < 5 && G.boneMatrixBuffer.defined() && !isBoneInst
+          && G.positionBuffer.vertexFormat() == VK_FORMAT_R32G32_UINT
+          && std::abs(T.objectToWorld[3][0]) > 100.f) {  // real world translation
+        ++sLoggedNonInstBone;
+        auto vsShader = m_context->m_state.vs.shader;
+        if (vsShader.ptr() != nullptr && vsShader->GetCommonShader() != nullptr) {
+          auto& shader = vsShader->GetCommonShader()->GetShader();
+          if (shader.ptr() != nullptr) {
+            Logger::info(str::format(
+              "[D3D11Rtx] Non-inst bone VS: ", shader->getShaderKey().toString(),
+              " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")"));
+          }
+        }
+      }
+
       Logger::info(str::format(
         "[D3D11Rtx] COMMIT id=", dcs.drawCallID,
         " verts=", G.vertexCount,
@@ -3715,20 +3797,36 @@ namespace dxvk {
       m_filterCounts[i] = 0;
 
     // NV-DXVK: Per-frame bone instancing summary
+    // Evict entries not used in the last 4 frames. By that point the scene
+    // manager has definitely consumed their instancesToObject pointers.
+    uint32_t evicted = 0;
+    if (m_boneInstFrameId > 4) {
+      const uint32_t cutoff = m_boneInstFrameId - 4;
+      for (auto it = m_boneExtracts.begin(); it != m_boneExtracts.end(); ) {
+        if (it->second && it->second->lastUsedFrame < cutoff) {
+          it = m_boneExtracts.erase(it);
+          evicted++;
+        } else {
+          ++it;
+        }
+      }
+    }
+    ++m_boneInstFrameId;
+
     if (m_boneInstBatches > 0) {
       Logger::info(str::format(
         "[D3D11Rtx] BoneInst: batches=", m_boneInstBatches,
-        " totalInstances=", m_boneInstTotal,
-        " skipped=", m_boneInstSkipped,
-        " noCache=", m_boneInstNoCache,
-        " instBufCache=", m_instBufCache.size(),
-        " boneCache=", m_fullBoneCache.size(),
-        " extractEntries=", m_boneExtracts.size()));
+        " instances=", m_boneInstTotal,
+        " cacheHit=", m_boneInstCacheHits, "/", (m_boneInstCacheHits + m_boneInstCacheMisses),
+        " mapEntries=", m_boneExtracts.size(),
+        " evicted=", evicted));
     }
     m_boneInstBatches = 0;
     m_boneInstTotal = 0;
     m_boneInstSkipped = 0;
     m_boneInstNoCache = 0;
+    m_boneInstCacheHits = 0;
+    m_boneInstCacheMisses = 0;
 
     // Safety net: if no draw set the camera this frame (all filtered, empty
     // present, geometry-hash failures, etc.), push a viewport-derived camera

@@ -64,6 +64,8 @@ namespace dxvk {
     uint32_t                             m_boneInstTotal = 0;
     uint32_t                             m_boneInstSkipped = 0;
     uint32_t                             m_boneInstNoCache = 0;
+    uint32_t                             m_boneInstCacheHits = 0;   // entry already existed with matching hash
+    uint32_t                             m_boneInstCacheMisses = 0; // new entry or rebuild
 
   public:
     // Per-filter rejection reasons tracked for one frame at a time.  Kept
@@ -154,8 +156,10 @@ namespace dxvk {
       uint32_t instanceCount = 0;
       std::vector<Matrix4> transforms;
       bool hasTransforms = false;
-      uint64_t boneDataHash = 0;  // Hash of bone data used to build transforms
+      uint64_t boneDataHash = 0;
+      uint32_t lastUsedFrame = 0;  // For LRU eviction
     };
+    uint32_t                             m_boneInstFrameId = 0;
     std::unordered_map<uint64_t, std::unique_ptr<BoneExtractEntry>> m_boneExtracts;
     const std::vector<Matrix4>*          m_currentInstancesToObject = nullptr;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan

@@ -120,7 +120,7 @@ namespace interleaver {
       //   v0.x bits 21-31 + v0.y bits 0-9 (21 bits) → Y
       //   v0.y bits 10-31 (22 bits) → Z
       // Decoded: float(uint_val) * (1.0/1024.0) + offset
-      //   X, Y offset = -1024.0,  Z offset = -2048.0
+      //   X, Y offset = -1024.0,  Z offset = -2080.0 (from shader magic 0xC5020000)
       uint u0 = asuint(input[index + 0]);
       uint u1 = asuint(input[index + 1]);
       uint xi = u0 & 0x001FFFFFu;                           // 21 bits
@@ -129,7 +129,7 @@ namespace interleaver {
       const float kScale = 1.0f / 1024.0f;  // 0.0009765625
       float x = float(xi) * kScale - 1024.0f;
       float y = float(yi) * kScale - 1024.0f;
-      float z = float(zi) * kScale - 2048.0f;
+      float z = float(zi) * kScale - 2080.0f;
       return float3(x, y, z);
     }
     case SupportedVkFormats::VK_FORMAT_R32G32_SFLOAT:
@@ -187,7 +187,7 @@ namespace interleaver {
     const float kScale = 1.0f / 1024.0f;
     float x = float(xi) * kScale - 1024.0f;
     float y = float(yi) * kScale - 1024.0f;
-    float z = float(zi) * kScale - 2048.0f;
+    float z = float(zi) * kScale - 2080.0f;  // verified from shader magic 0xC5020000
     // DEBUG: output u0 raw bits to verify color0 uint buffer is reading correctly.
     // If u0_lo = low 16 bits of u0, compare with raw dump word 0.
     // e.g. raw dump v0 word0 = 0x33CFD48A → low16 = 0xD48A = 54410
