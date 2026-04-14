@@ -1979,6 +1979,16 @@ namespace dxvk {
               Vector4(R20, R21, R22, 0.0f),
               Vector4(Tx,  Ty,  Tz,  1.0f))) != 0)
           return false;
+        // NV-DXVK (Titanfall 2): reject identity. TF2 packs two float3x4 blocks
+        // back-to-back in VS s3 where block 0 (offset 0) is identity and block 1
+        // (offset 48) is the real objectToWorld. Accepting identity here made the
+        // caller stop searching and every static world draw landed at origin.
+        if (std::abs(R00 - 1.0f) < 1e-6f && std::abs(R11 - 1.0f) < 1e-6f && std::abs(R22 - 1.0f) < 1e-6f
+            && std::abs(R01) < 1e-6f && std::abs(R02) < 1e-6f
+            && std::abs(R10) < 1e-6f && std::abs(R12) < 1e-6f
+            && std::abs(R20) < 1e-6f && std::abs(R21) < 1e-6f
+            && std::abs(Tx) < 1e-6f && std::abs(Ty) < 1e-6f && std::abs(Tz) < 1e-6f)
+          return false;
         // Row-major Matrix4 from row-major float3x4.
         transforms.objectToWorld = Matrix4(
           Vector4(R00, R01, R02, 0.0f),
@@ -2072,6 +2082,38 @@ namespace dxvk {
         if (!found)
           found = trySourceFloat3x4(vsCbs, kSourceModelSlot, 0);
 
+        // NV-DXVK (Titanfall 2): camera-relative rendering fallback.
+        // Most TF2 VS (VS_759738774e, VS_ef94e6c7, ...) use CBufCommonPerCamera at
+        // cb2 and have NO CBufModelInstance at cb3. Vertex buffers already contain
+        // (world - c_cameraOrigin); the VS only multiplies by c_cameraRelativeToClip.
+        // Remix defaults o2w=identity, builds BLAS at origin, camera sees nothing.
+        // Restore world placement by using c_cameraOrigin (cb2 offset 4, float3)
+        // as the o2w translation: BLAS_vert + cameraOrigin = (world - cameraOrigin)
+        //                                                  + cameraOrigin = world.
+        if (!found) {
+          const auto& cb2 = vsCbs[2];
+          if (cb2.buffer != nullptr) {
+            const auto mapped = cb2.buffer->GetMappedSlice();
+            const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            const size_t base = static_cast<size_t>(cb2.constantOffset) * 16;
+            const size_t sz = cb2.buffer->Desc()->ByteWidth;
+            if (p && base + 16 <= sz) {
+              const float* f = reinterpret_cast<const float*>(p + base);
+              // c_cameraOrigin at offset 4 (f[1..3]); f[0] is c_zNear.
+              const float camX = f[1], camY = f[2], camZ = f[3];
+              if (std::isfinite(camX) && std::isfinite(camY) && std::isfinite(camZ)
+                  && (std::abs(camX) + std::abs(camY) + std::abs(camZ)) > 1.0f) {
+                transforms.objectToWorld = Matrix4(
+                  Vector4(1.0f, 0.0f, 0.0f, 0.0f),
+                  Vector4(0.0f, 1.0f, 0.0f, 0.0f),
+                  Vector4(0.0f, 0.0f, 1.0f, 0.0f),
+                  Vector4(camX, camY, camZ, 1.0f));
+                found = true;
+              }
+            }
+          }
+        }
+
         // Per-draw diagnostic — now logs first 8 hits PER FRAME rather than
         // per session, so in-game transforms are visible even after menu loading.
         static uint32_t s_f3x4LogFrame = UINT32_MAX;
@@ -2124,8 +2166,12 @@ namespace dxvk {
         }
         // Last resort: try float3x4 scan over all VS slots (covers engines that
         // put the model matrix in a non-slot-3 location).
+        // NV-DXVK (Titanfall 2): start at slot 1, not 2 — TF2 shaders commonly
+        // leave VS s0 null and put a 48-byte float3x4 world matrix in VS s1.
+        // trySourceFloat3x4 rejects identity/view/proj so materialsystem data
+        // in slot 1 on other engines won't produce false positives.
         if (!found) {
-          for (uint32_t s = 2; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT && !found; ++s) {
+          for (uint32_t s = 1; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT && !found; ++s) {
             if (projStage == 0 && s == projSlot) continue;
             if (trySourceFloat3x4(vsCbs, s)) found = true;
           }
@@ -2230,6 +2276,49 @@ namespace dxvk {
         " proj diag=(", p[0][0], ",", p[1][1], ",", p[2][2], ")",
         " m[2][3]=", p[2][3],
         m_columnMajor ? " [column-major]" : " [row-major]"));
+    }
+
+    // DEBUG: dump info for non-bone draws returning identity o2w.
+    // Per-frame counter so we don't saturate on drawID=0. Skip fallback draws
+    // because those get rejected downstream — we want the REAL submissions.
+    if (!m_currentDrawIsBoneTransformed && isIdentityExact(transforms.objectToWorld)
+        && !m_lastExtractUsedFallback) {
+      static uint32_t s_silentFrame = UINT32_MAX;
+      static uint32_t s_silentPerFrame = 0;
+      static uint32_t s_silentPrevID = UINT32_MAX;
+      if (m_drawCallID == 0 || m_drawCallID < s_silentPrevID) {
+        s_silentFrame++;
+        s_silentPerFrame = 0;
+      }
+      s_silentPrevID = m_drawCallID;
+      if (s_silentFrame < 3 && s_silentPerFrame < 3) {
+        ++s_silentPerFrame;
+        const auto& vsCbs = m_context->m_state.vs.constantBuffers;
+        std::string vsHashStr = "?";
+        auto vsShader = m_context->m_state.vs.shader;
+        if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
+          auto& shader = vsShader->GetCommonShader()->GetShader();
+          if (shader != nullptr)
+            vsHashStr = shader->getShaderKey().toString();
+        }
+        Logger::warn(str::format("[D3D11Rtx] === SILENT-ID drawID=", m_drawCallID, " VS=", vsHashStr, " cbuffer dump ==="));
+        for (uint32_t s = 0; s < 8; ++s) {
+          const auto& cb = vsCbs[s];
+          if (cb.buffer == nullptr) continue;
+          const auto mapped = cb.buffer->GetMappedSlice();
+          const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+          if (!p) continue;
+          const size_t base = static_cast<size_t>(cb.constantOffset) * 16;
+          const size_t sz = cb.buffer->Desc()->ByteWidth;
+          const size_t n = std::min<size_t>(sz - base, 256);
+          const float* f = reinterpret_cast<const float*>(p + base);
+          // Dump as float4 rows
+          for (size_t r = 0; r * 16 + 16 <= n; ++r) {
+            Logger::warn(str::format(
+              "  VS s", s, " [", r, "] = (", f[r*4+0], ", ", f[r*4+1], ", ", f[r*4+2], ", ", f[r*4+3], ")"));
+          }
+        }
+      }
     }
 
     return transforms;
@@ -3519,9 +3608,17 @@ namespace dxvk {
       if (s_submitLogFrame >= 1 && s_submitLogFrame <= 10) {
         const auto& T = dcs.transformData;
         const bool o2wIdentity = isIdentityExact(T.objectToWorld);
+        // VS hash
+        std::string vsHash = "?";
+        auto vsShaderCom = m_context->m_state.vs.shader;
+        if (vsShaderCom != nullptr && vsShaderCom->GetCommonShader() != nullptr) {
+          auto& s = vsShaderCom->GetCommonShader()->GetShader();
+          if (s != nullptr) vsHash = s->getShaderKey().toString();
+        }
         Logger::info(str::format(
           "[D3D11Rtx] Submit drawID=", dcs.drawCallID,
           " frame=", s_submitLogFrame,
+          " VS=", vsHash,
           " verts=", geo.vertexCount,
           " o2w:", o2wIdentity ? "IDENTITY" : "nonId",
           " T=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
