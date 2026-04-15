@@ -61,6 +61,16 @@ namespace dxvk {
     uint32_t getLastCameraCutFrameId() const { return m_lastCameraCutFrameId; }
     bool isCameraCutThisFrame() const;
 
+    // NV-DXVK: TLAS-coherence support. Distinguishes Main set by the classifier
+    // (trusted pose — draw's projection matched a gameplay VS hash at depth
+    // range 0.05 and |w2vT| > 100) from Main set by the safety net
+    // (processExternalCamera — just whatever ExtractTransforms produced, often
+    // identity during menus/cinematics). The TLAS coherence filter only trusts
+    // classifier-set Main; safety-net Main passes all draws through.
+    bool isMainSetByClassifier() const { return m_mainSetByClassifierFrameId != UINT32_MAX; }
+    uint32_t getMainClassifierFrameId() const { return m_mainSetByClassifierFrameId; }
+    void noteMainSetByClassifier(uint32_t frameId) { m_mainSetByClassifierFrameId = frameId; }
+
   private:
     template<
       typename T,
@@ -82,6 +92,9 @@ namespace dxvk {
     std::array<RtCamera, CameraType::Count> m_cameras;
     CameraType::Enum m_lastSetCameraType = CameraType::Unknown;
     uint32_t m_lastCameraCutFrameId = -1;
+    // NV-DXVK: last frame where Main was latched by the classifier (vs. safety
+    // net). UINT32_MAX means never. See isMainSetByClassifier() doc above.
+    uint32_t m_mainSetByClassifierFrameId = UINT32_MAX;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);

@@ -61,6 +61,14 @@ namespace dxvk {
     // of them were rejected by SubmitDraw's pre-filters".
     uint32_t                             m_rawDrawCount = 0;
 
+    // NV-DXVK: communication channel from ExtractTransforms() back to the
+    // caller (SubmitDraw) for the TLAS-coherence filter. ExtractTransforms
+    // captures the draw's c_cameraOrigin (cb2 offset 4) into these; SubmitDraw
+    // compares against the latched Main camera world position post-extract
+    // and rejects draws whose coord space disagrees with Main.
+    Vector3                              m_lastDrawCamOrigin{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_lastDrawCamOriginSet = false;
+
     // NV-DXVK: Per-frame bone instancing stats
     uint32_t                             m_boneInstBatches = 0;
     uint32_t                             m_boneInstTotal = 0;

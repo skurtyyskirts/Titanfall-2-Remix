@@ -548,11 +548,13 @@ namespace dxvk {
             const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
             constexpr uint32_t BYTES_PER_INSTANCE = 208;
 
-            // NV-DXVK (TF2 BSP): t31 stores absolute world transforms but
-            // Remix's "world" frame is camera-relative (the bone-skinned path
-            // uses small camera-relative bone matrices and renders correctly).
-            // Subtract c_cameraOrigin from each translation so BSP TLAS
-            // instances land in Remix's camera-relative world frame.
+            // NV-DXVK (TF2 BSP): t31 stores objectToCameraRelative transforms
+            // (vertex buffers hold world - cameraOrigin). Remix's camera, NRC,
+            // denoisers, and motion-vector systems live in absolute world, so
+            // we ADD c_cameraOrigin to each per-instance translation at push
+            // time to shift BSP from camera-relative into absolute world.
+            // camOrigin is read from CBufCommonPerCamera offset 4 below and
+            // applied in the tforms loop.
             float camOrigin[3] = { 0.0f, 0.0f, 0.0f };
             bool haveCamOrigin = false;
             // DEBUG: log failure reason once per unique VS
@@ -687,9 +689,14 @@ namespace dxvk {
               if (!allFinite) continue;
               if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) continue;
 
-              // t31 is already in camera-relative coords (matches Remix's
-              // implicit "world" frame derived from c_cameraRelativeToClip).
-              // No cameraOrigin adjustment.
+              // t31 is camera-relative per TF2's objectToCameraRelative.
+              // TF2's worldToView matrix has near-zero translation (camera-at-
+              // origin convention). Keeping BSP in camera-relative space means
+              // both Remix's camera (near origin) and BSP TLAS (near origin)
+              // share a single consistent frame — no mismatch, no NRC motion
+              // artifacts, no reinit thrash. Earlier attempts to shift to
+              // absolute world required also shifting Remix's camera; without
+              // both shifts they go out of sync.
               tforms->push_back(Matrix4(
                 Vector4(m[0], m[4], m[8],  0.0f),
                 Vector4(m[1], m[5], m[9],  0.0f),
@@ -1200,6 +1207,7 @@ namespace dxvk {
     // skip RTX submission, let the native raster path handle it).
     m_lastExtractUsedFallback = false;
     m_currentDrawIsBoneTransformed = false;
+    m_lastDrawCamOriginSet = false;
     m_skipViewMatrixScan = false;
 
     // Maximum bytes to scan per cbuffer. Projection/view/world matrices are
@@ -1375,35 +1383,67 @@ namespace dxvk {
     // Use offset 96 (prev-frame VP) — offset 16 (current-frame VP) is
     // identity on early draws and can contain degenerate values during
     // loading/transitions that cause assertion failures in SetupByFrustum.
+    // --- TF2 deterministic projection: CBufCommonPerCamera at cb2 VS.
+    // Layout (from VS RDEF / shader disasm):
+    //   offset  0: c_zNear
+    //   offset  4: c_cameraOrigin
+    //   offset 16: row_major float4x4 c_cameraRelativeToClip    ← CURRENT-FRAME VP
+    //   offset 84: c_cameraOriginPrevFrame
+    //   offset 96: row_major float4x4 c_cameraRelativeToClipPrevFrame ← PREV VP
+    // The active VP for THIS draw is whichever the game wrote into offset 16
+    // for that pass (gameplay/shadow/portal/fog/...). Remix classifies the
+    // resulting camera downstream. No scoring, no multi-slot scan.
     if (projSlot == UINT32_MAX) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const uint32_t kSourceCamSlot = 2;
-      const size_t   kSourceCamOff  = 96;
       const auto& srcCb = vsCbs[kSourceCamSlot];
       if (srcCb.buffer != nullptr) {
         const auto mapped = srcCb.buffer->GetMappedSlice();
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
-        if (ptr && srcCb.buffer->Desc()->ByteWidth >= kSourceCamOff + 64) {
-          Matrix4 raw = readCbMatrix(ptr, kSourceCamOff, srcCb.buffer->Desc()->ByteWidth);
-          int cls = classifyPerspective(raw, true);
-          static uint32_t sFastLog = 0;
-          if (sFastLog < 5) {
-            ++sFastLog;
-            Logger::info(str::format(
-              "[D3D11Rtx] Source fast-path cb2@96: cls=", cls,
-              " diag=(", raw[0][0], ",", raw[1][1], ",", raw[2][2], ")",
-              " m23=", raw[2][3], " m33=", raw[3][3],
-              " bufSize=", srcCb.buffer->Desc()->ByteWidth,
-              " mapPtr=", (mapped.mapPtr != nullptr ? 1 : 0)));
+        const size_t bufSize = srcCb.buffer->Desc()->ByteWidth;
+        if (ptr && bufSize >= 160) {
+          Matrix4 raw16 = readCbMatrix(ptr, 16, bufSize);
+          const int cls16 = classifyPerspective(raw16, true);
+          int usedCls = 0;
+          if (cls16 > 0) {
+            projSlot    = kSourceCamSlot;
+            projOffset  = 16;
+            projStage   = 0;
+            m_projSlot    = kSourceCamSlot;
+            m_projOffset  = 16;
+            m_projStage   = 0;
+            m_columnMajor = (cls16 == 2);
+            usedCls = cls16;
+          } else {
+            Matrix4 raw96 = readCbMatrix(ptr, 96, bufSize);
+            const int cls96 = classifyPerspective(raw96, true);
+            if (cls96 > 0) {
+              projSlot    = kSourceCamSlot;
+              projOffset  = 96;
+              projStage   = 0;
+              m_projSlot    = kSourceCamSlot;
+              m_projOffset  = 96;
+              m_projStage   = 0;
+              m_columnMajor = (cls96 == 2);
+              usedCls = cls96;
+            }
           }
-          if (cls > 0) {
-            projSlot   = kSourceCamSlot;
-            projOffset = kSourceCamOff;
-            projStage  = 0;  // VS
-            m_projSlot   = kSourceCamSlot;
-            m_projOffset = kSourceCamOff;
-            m_projStage  = 0;
-            m_columnMajor = (cls == 2);
+          static uint32_t sFastLog = 0;
+          static uint32_t sFirstPerspLog = 0;
+          const bool isPersp = (usedCls > 0);
+          // Log first 3 calls (including identity failures) AND the first 3
+          // successful perspective picks separately, so we can see exactly
+          // when real gameplay VPs start arriving at cb2@16.
+          if (sFastLog < 3 || (isPersp && sFirstPerspLog < 3)) {
+            if (sFastLog < 3) ++sFastLog;
+            if (isPersp) ++sFirstPerspLog;
+            Logger::info(str::format(
+              "[D3D11Rtx] TF2 deterministic VP: offset=",
+              (projSlot == kSourceCamSlot ? (int)projOffset : -1),
+              " cls=", usedCls,
+              " isPersp=", isPersp ? 1 : 0,
+              " diag16=(", raw16[0][0], ",", raw16[1][1], ",", raw16[2][2], ")",
+              " m23_16=", raw16[2][3], " m33_16=", raw16[3][3]));
           }
         }
       }
@@ -1578,9 +1618,25 @@ namespace dxvk {
               //       [Tx' Ty' Tz' 1]
               //
               // where T' = -dot(dir, pos) for each axis (the "eye-space translation").
-              const float dotR = -(right.x * Tx + right.y * Ty + right.z * Tz);
-              const float dotU = -(up.x    * Tx + up.y    * Ty + up.z    * Tz);
-              const float dotF = -(fwd.x   * Tx + fwd.y   * Ty + fwd.z   * Tz);
+              //
+              // NV-DXVK EXPERIMENT: TF2 renders camera-relative — vertex buffers
+              // hold (world - cameraOrigin) and t31 (objectToCameraRelative)
+              // transforms place geometry relative to camera. Our TLAS therefore
+              // sits in camera-at-origin space. If we encode c_cameraOrigin into
+              // the view matrix, Remix's RtCamera::position = cameraOrigin in
+              // world, but our TLAS entries are at small camera-relative coords —
+              // rays fire from the wrong origin and miss everything. Force the
+              // view translation to zero so Remix's camera sits at origin,
+              // matching the TLAS frame. Only the viewmodel/particles (already
+              // at identity in view space) were rendering before; with this,
+              // world geometry should also be hit.
+              constexpr bool kCameraAtOrigin = true;
+              const float Tx_use = kCameraAtOrigin ? 0.0f : Tx;
+              const float Ty_use = kCameraAtOrigin ? 0.0f : Ty;
+              const float Tz_use = kCameraAtOrigin ? 0.0f : Tz;
+              const float dotR = -(right.x * Tx_use + right.y * Ty_use + right.z * Tz_use);
+              const float dotU = -(up.x    * Tx_use + up.y    * Ty_use + up.z    * Tz_use);
+              const float dotF = -(fwd.x   * Tx_use + fwd.y   * Ty_use + fwd.z   * Tz_use);
 
               transforms.worldToView = Matrix4(
                 Vector4(right.x, right.y, right.z, 0.0f),
@@ -2609,6 +2665,10 @@ namespace dxvk {
         // Restore world placement by using c_cameraOrigin (cb2 offset 4, float3)
         // as the o2w translation: BLAS_vert + cameraOrigin = (world - cameraOrigin)
         //                                                  + cameraOrigin = world.
+        //
+        // NV-DXVK: capture the draw's cameraOrigin for the TLAS-coherence filter
+        // that runs at the SubmitInstancedDraw call site after ExtractTransforms
+        // returns (can't bare-return here — this function returns a value).
         if (!found) {
           const auto& cb2 = vsCbs[2];
           if (cb2.buffer != nullptr) {
@@ -2628,6 +2688,8 @@ namespace dxvk {
                   Vector4(0.0f, 0.0f, 1.0f, 0.0f),
                   Vector4(camX, camY, camZ, 1.0f));
                 found = true;
+                m_lastDrawCamOrigin    = Vector3(camX, camY, camZ);
+                m_lastDrawCamOriginSet = true;
               }
             }
           }
@@ -3968,6 +4030,163 @@ namespace dxvk {
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
 
+    // NV-DXVK: TLAS coherence filter + matrix finiteness guard.
+    // Fires for BOTH non-instanced (OnDraw/OnDrawIndexed → SubmitDraw) and
+    // instanced (OnDrawInstanced/OnDrawIndexedInstanced → SubmitInstancedDraw
+    // → SubmitDraw) paths since everything funnels here.
+    //
+    // (1) TLAS coherence: reject draws whose c_cameraOrigin doesn't match the
+    //     Main camera's world position within kEpsilon. Different cameras mean
+    //     different BLAS placements → TLAS mixes coord spaces → pathological
+    //     bounds → ray traversal can run effectively forever → GPU TDR.
+    // (2) Finiteness guard: reject draws whose objectToWorld matrix has any
+    //     non-finite component or absurd translation magnitude. Observed in TF2
+    //     where game cbuffers occasionally contain NaN (VS s2[10]=(-nan,...)).
+    {
+      const auto& m = dcs.transformData.objectToWorld;
+      bool badMatrix = false;
+      for (int r = 0; r < 4 && !badMatrix; ++r) {
+        for (int c = 0; c < 4 && !badMatrix; ++c) {
+          if (!std::isfinite(m[r][c])) badMatrix = true;
+        }
+      }
+      constexpr float kMaxComponentMagnitude = 1.0e7f; // TF2 coords are ~1e4
+      for (int r = 0; r < 4 && !badMatrix; ++r) {
+        if (std::abs(m[3][r]) > kMaxComponentMagnitude) badMatrix = true;
+      }
+      if (badMatrix) {
+        static uint32_t sBadMatLog = 0;
+        if (sBadMatLog < 20) {
+          ++sBadMatLog;
+          Logger::err(str::format(
+            "[TLAS-FILTER] reject draw=", m_drawCallID,
+            " non-finite/absurd o2w: T=(", m[3][0], ",", m[3][1], ",", m[3][2], ")",
+            " diag=(", m[0][0], ",", m[1][1], ",", m[2][2], ")"));
+        }
+        BumpFilter(FilterReason::FullscreenQuad);
+        return;
+      }
+    }
+
+    // The filter compares EVERY draw's WORLD-SPACE camera position against
+    // Main's. Per-draw position is derived as inverse(worldToView)[3].xyz()
+    // — same construction RtCamera::getPosition uses internally — so both
+    // sides share an identical coordinate convention. Comparing raw
+    // worldToView[3] columns directly fails because RtCamera's matCache
+    // sometimes overwrites WorldToView with identity (depending on
+    // freeCameraViewRelative()), but getPosition() always returns a valid
+    // world position derived from the original view-to-world.
+    Vector3 drawCamPos;
+    {
+      const Matrix4 v2w = inverse(dcs.transformData.worldToView);
+      drawCamPos = Vector3(v2w[3][0], v2w[3][1], v2w[3][2]);
+    }
+
+    if (m_context->m_device != nullptr) {
+      auto& sceneMgr = m_context->m_device->getCommon()->getSceneManager();
+      auto& camMgr = sceneMgr.getCameraManager();
+      auto& mainCam = camMgr.getCamera(CameraType::Main);
+      const uint32_t frameId = m_context->m_device->getCurrentFrameId();
+      // Only trust Main's position if the CLASSIFIER (not safety net) latched
+      // it in the last few frames. Safety-net Main is whatever ExtractTransforms
+      // produced — often identity/(-1,-1,-1) during menus/cinematics — and
+      // would otherwise cause us to reject every real world draw.
+      const bool classifierLatched = camMgr.isMainSetByClassifier();
+      const uint32_t lastClassifierFrame = camMgr.getMainClassifierFrameId();
+      constexpr uint32_t kMaxStaleFrames = 5; // allow last ~5 frames after latch
+      const bool mainRecentlyLatched =
+        classifierLatched
+        && (frameId <= lastClassifierFrame
+            || (frameId - lastClassifierFrame) <= kMaxStaleFrames);
+      const bool mainEverValid = mainRecentlyLatched;
+
+      // Per-frame stats — reset when we see the drawCallID counter roll over.
+      static uint32_t s_tlasFilterFrame = UINT32_MAX;
+      static uint32_t s_tlasAccept = 0;
+      static uint32_t s_tlasReject = 0;
+      static uint32_t s_tlasNoMain = 0;
+      static uint32_t s_tlasPrevID = UINT32_MAX;
+      if (m_drawCallID == 0 || m_drawCallID < s_tlasPrevID) {
+        if (s_tlasFilterFrame != UINT32_MAX
+            && (s_tlasAccept + s_tlasReject + s_tlasNoMain) > 0
+            && s_tlasFilterFrame < 600) {
+          Logger::info(str::format(
+            "[TLAS-FILTER] frame=", s_tlasFilterFrame,
+            " accept=", s_tlasAccept,
+            " reject=", s_tlasReject,
+            " noMain=", s_tlasNoMain));
+        }
+        s_tlasFilterFrame = (s_tlasFilterFrame == UINT32_MAX) ? 0 : s_tlasFilterFrame + 1;
+        s_tlasAccept = 0;
+        s_tlasReject = 0;
+        s_tlasNoMain = 0;
+      }
+      s_tlasPrevID = m_drawCallID;
+
+      if (mainEverValid) {
+        // RtCamera::getPosition returns the world-space camera position,
+        // derived from inverse(worldToView). Same convention as drawCamPos
+        // above.
+        const Vector3 mainCamPos = mainCam.getPosition(/*freecam=*/false);
+        const float dx = drawCamPos.x - mainCamPos.x;
+        const float dy = drawCamPos.y - mainCamPos.y;
+        const float dz = drawCamPos.z - mainCamPos.z;
+        const float d2 = dx*dx + dy*dy + dz*dz;
+        // Big epsilon. TF2 world coords are ~1e4; draws in Main's coord space
+        // share Main's worldToView translation exactly. Draws from other
+        // cameras (shadow, viewmodel, reflection, cinematic origin) differ
+        // by hundreds-thousands of units. 100 cleanly separates clusters.
+        constexpr float kEpsilon = 100.0f;
+        const bool mismatch = d2 > (kEpsilon * kEpsilon);
+
+        if (mismatch) {
+          struct Key { int x, y, z; };
+          static std::vector<Key> seenOrigins;
+          Key k{ int(drawCamPos.x), int(drawCamPos.y), int(drawCamPos.z) };
+          bool seen = false;
+          for (const auto& s : seenOrigins) {
+            if (s.x == k.x && s.y == k.y && s.z == k.z) { seen = true; break; }
+          }
+          if (!seen && seenOrigins.size() < 32) {
+            seenOrigins.push_back(k);
+            Logger::info(str::format(
+              "[TLAS-FILTER] new foreign cam #", seenOrigins.size(),
+              " draw=", m_drawCallID, " frame=", s_tlasFilterFrame,
+              " drawCamPos=(", drawCamPos.x, ",", drawCamPos.y, ",", drawCamPos.z, ")",
+              " mainCamPos=(", mainCamPos.x, ",", mainCamPos.y, ",", mainCamPos.z, ")",
+              " |delta|=", std::sqrt(d2)));
+          }
+
+          // NV-DXVK: rejection DISABLED. Filter runs on the D3D11 thread
+          // BEFORE classification (which happens on CS thread inside
+          // processCameraData). Rejecting a draw here prevents it from
+          // reaching the classifier, which prevents Main from re-latching
+          // when the gameplay camera moves. Net effect: Main froze at the
+          // first latch and every subsequent gameplay draw was "foreign"
+          // by stale comparison. Keep counting/logging for diagnostic, but
+          // let the draw through. Coord-space coherence has to be enforced
+          // downstream of the classifier (e.g., in RtInstanceManager when
+          // building the TLAS), not pre-classification.
+          ++s_tlasReject;
+          // BumpFilter(FilterReason::FullscreenQuad);
+          // return;
+        } else {
+          ++s_tlasAccept;
+        }
+      } else {
+        // No Main yet — permit the draw through. Log once per session so we
+        // know the filter is observing but passing during the first-frame gap.
+        static bool sNoMainLogged = false;
+        if (!sNoMainLogged) {
+          sNoMainLogged = true;
+          Logger::info(str::format(
+            "[TLAS-FILTER] no Main latched yet at frame ", frameId,
+            " — passing draws through until Main is available"));
+        }
+        ++s_tlasNoMain;
+      }
+    }
+
     // NV-DXVK: scene dump for cbuffer-based BSP draws (non-fanout). The
     // bone-instance fanout dump above only catches g_modelInst-style draws.
     // Anything that uses CBufModelInstance (cbuffer-based world matrix)
@@ -4258,6 +4477,34 @@ namespace dxvk {
     dcs.cameraType       = CameraType::Unknown;
     dcs.usesVertexShader = (m_context->m_state.vs.shader != nullptr);
     dcs.usesPixelShader  = (m_context->m_state.ps.shader != nullptr);
+
+    // NV-DXVK: Deterministic pass classifier — pass the current D3D11 viewport
+    // to Remix so camera_manager can distinguish gameplay draws (viewport ==
+    // back buffer) from shadow cascades / cubemaps / RT targets (off-size or
+    // square viewports). No matrix heuristics involved.
+    {
+      const auto& vps = m_context->m_state.rs.viewports;
+      if (vps[0].Width > 0.0f && vps[0].Height > 0.0f) {
+        dcs.transformData.viewportWidth  = vps[0].Width;
+        dcs.transformData.viewportHeight = vps[0].Height;
+      }
+    }
+
+    // NV-DXVK: Capture bound VS hash for game-native per-draw identification.
+    // Gameplay-world passes use a small, stable set of vertex shaders; fullscreen /
+    // post / UI draws use different ones even when they share a projection shape.
+    // Keying Main-camera classification off this hash eliminates the need for
+    // matrix-property heuristics (aspect/tinyScale/maxZ/w2vT).
+    if (m_context->m_state.vs.shader != nullptr) {
+      auto* common = m_context->m_state.vs.shader->GetCommonShader();
+      if (common != nullptr) {
+        const auto& dxvkShader = common->GetShader();
+        if (dxvkShader != nullptr) {
+          dcs.transformData.vertexShaderHash =
+            static_cast<XXH64_hash_t>(dxvkShader->getHash());
+        }
+      }
+    }
 
     // D3D11 shaders are always SM 4.0+.
     if (dcs.usesVertexShader)
@@ -4708,7 +4955,21 @@ namespace dxvk {
     // Keeping the camera invalid lets injectRTX early-return (see
     // rtx_context.cpp:492) and the native raster content passes through
     // the presenter unchanged.
-    if (draws > 0) {
+    // NV-DXVK: safety net DISABLED. It was preempting the classifier:
+    // EndFrame's EmitCs lambda runs on the CS thread NEXT frame, calls
+    // processExternalCamera with frame N's last-extracted transforms
+    // (often a UI/fallback matrix with the wrong FoV) stamped as frame N+1's
+    // frameId. The next frame's gameplay draws then saw Main valid for
+    // frame N+1 already → shouldUpdateMainCamera=false → classifier never
+    // re-latched → loop self-sustained forever, with Main pinned to a
+    // garbage UI transform.
+    //
+    // Without this safety net, frames where the classifier doesn't latch
+    // simply leave Main invalid; the RT pipeline early-returns (rtx_context.cpp
+    // injectRTX), the native raster path's content passes through the
+    // presenter unchanged. That was the original intent of the safety net,
+    // but it wasn't needed to achieve it.
+    if (false && draws > 0) {
       DrawCallTransforms t = ExtractTransforms();
       if (!isIdentityExact(t.viewToProjection)) {
         Matrix4 wtv = t.worldToView;

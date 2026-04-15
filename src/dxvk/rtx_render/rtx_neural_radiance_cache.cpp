@@ -581,26 +581,81 @@ namespace dxvk {
       return;
     }
 
+    const bool dbgBufDiffers =
+      m_nrcCtx->isDebugBufferRequired() != NrcOptions::s_nrcDebugBufferIsRequired;
+    const bool customCfgDiffers =
+      m_delayedEnableCustomNetworkConfig != NrcCtxOptions::enableCustomNetworkConfig();
+    // [REMIX-3810] WAR to fully recreate NRC when resolution changes to avoid occasional corruption
+    // when changing resolutions
+    const bool widthDiffers =
+      frameBeginCtx.downscaledExtent.width != m_nrcCtxSettings->frameDimensions.x;
+    const bool heightDiffers =
+      frameBeginCtx.downscaledExtent.height != m_nrcCtxSettings->frameDimensions.y;
     const bool reinitializeNrcContext =
-      m_nrcCtx->isDebugBufferRequired() != NrcOptions::s_nrcDebugBufferIsRequired
-      || m_delayedEnableCustomNetworkConfig != NrcCtxOptions::enableCustomNetworkConfig()
-      // [REMIX-3810] WAR to fully recreate NRC when resolution changes to avoid occasional corruption
-      // when changing resolutions
-      || frameBeginCtx.downscaledExtent.width != m_nrcCtxSettings->frameDimensions.x
-      || frameBeginCtx.downscaledExtent.height != m_nrcCtxSettings->frameDimensions.y;
+      dbgBufDiffers || customCfgDiffers || widthDiffers || heightDiffers;
+
+    // NV-DXVK: death-loop safety. Repeated NRC re-inits (observed 6+ in 1.5s
+     // in TF2) cause NRC EndFrame to return InternalError and the driver to
+     // TDR (VK_ERROR_DEVICE_LOST). If re-init has already run twice in the
+     // last ~60 frames, suppress further re-inits for this window — better
+     // to live with whatever visual quirk the WAR was guarding against than
+     // to freeze the game. The diag log above still records WHY we would
+     // have re-inited so the root oscillation can be fixed at its source.
+    static uint32_t sReinitCount = 0;
+    static uint32_t sReinitSuppressWindowEndFrame = 0;
+    const uint32_t currentFrameId = ctx->getDevice()->getCurrentFrameId();
+    const bool inSuppressionWindow = currentFrameId < sReinitSuppressWindowEndFrame;
 
     if (reinitializeNrcContext) {
-
-      NrcCtxOptions::enableCustomNetworkConfig.setDeferred(m_delayedEnableCustomNetworkConfig);
-
-      NrcContext::Configuration nrcContextCfg;
-      nrcContextCfg.debugBufferIsRequired = NrcOptions::s_nrcDebugBufferIsRequired;
-      m_nrcCtx = new NrcContext(*ctx->getDevice(), nrcContextCfg);
-
-      if (m_nrcCtx->initialize() != nrc::Status::OK) {
-        Logger::err(str::format("[RTX Neural Radiance Cache] Failed to initialize NRC context"));
-        return;
+      // NV-DXVK: diagnostic — identify which condition is forcing re-init.
+      static uint32_t sReinitLog = 0;
+      if (sReinitLog < 10) {
+        ++sReinitLog;
+        Logger::info(str::format(
+          "[NRC] reinit-request #", sReinitLog,
+          " dbgBuf=", dbgBufDiffers ? 1 : 0,
+          " customCfg=", customCfgDiffers ? 1 : 0,
+          " width=", widthDiffers ? 1 : 0, " (", frameBeginCtx.downscaledExtent.width,
+          " vs ", m_nrcCtxSettings->frameDimensions.x, ")",
+          " height=", heightDiffers ? 1 : 0, " (", frameBeginCtx.downscaledExtent.height,
+          " vs ", m_nrcCtxSettings->frameDimensions.y, ")",
+          " suppressed=", inSuppressionWindow ? 1 : 0));
       }
+
+      if (inSuppressionWindow) {
+        // Skip re-init. Sync the recorded frame dimensions to whatever is
+        // being requested so we don't re-log every frame for the same delta.
+        m_nrcCtxSettings->frameDimensions = nrc_uint2 {
+          frameBeginCtx.downscaledExtent.width,
+          frameBeginCtx.downscaledExtent.height
+        };
+      } else {
+        ++sReinitCount;
+        // Arm the suppression window once we've re-inited twice recently.
+        if (sReinitCount >= 2) {
+          sReinitSuppressWindowEndFrame = currentFrameId + 60;
+          Logger::warn(str::format(
+            "[NRC] suppressing further re-inits until frame ",
+            sReinitSuppressWindowEndFrame,
+            " to avoid device-lost death loop"));
+        }
+
+        NrcCtxOptions::enableCustomNetworkConfig.setDeferred(m_delayedEnableCustomNetworkConfig);
+
+        NrcContext::Configuration nrcContextCfg;
+        nrcContextCfg.debugBufferIsRequired = NrcOptions::s_nrcDebugBufferIsRequired;
+        m_nrcCtx = new NrcContext(*ctx->getDevice(), nrcContextCfg);
+
+        if (m_nrcCtx->initialize() != nrc::Status::OK) {
+          Logger::err(str::format("[RTX Neural Radiance Cache] Failed to initialize NRC context"));
+          return;
+        }
+      }
+    }
+    // Once the suppression window ends, reset the counter so a later legitimate
+    // resolution change can still trigger one re-init.
+    if (inSuppressionWindow && currentFrameId >= sReinitSuppressWindowEndFrame) {
+      sReinitCount = 0;
     }
 
     const VkExtent3D& downscaledExtent = ctx->getCommonObjects()->getResources().getDownscaleDimensions();

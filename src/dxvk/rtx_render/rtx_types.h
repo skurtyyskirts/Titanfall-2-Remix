@@ -502,6 +502,22 @@ struct DrawCallTransforms {
   // can leave this null and only fill instancesToObject.
   std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
 
+  // NV-DXVK: Deterministic camera-pass classifier. Populated by d3d11_rtx
+  // from the currently-bound D3D11 viewport at draw submission time. Used by
+  // camera_manager to distinguish gameplay draws (viewport matches back
+  // buffer / non-square aspect) from shadow cascade / cubemap / RT draws
+  // (square viewport, often 1024x1024, 2048x2048, 256x256 for cubes).
+  // Zero means "not populated" — camera_manager will fall back to its
+  // existing matrix-based heuristics.
+  float viewportWidth  = 0.0f;
+  float viewportHeight = 0.0f;
+
+  // NV-DXVK: VS hash of the draw that produced this transform. Populated by
+  // d3d11_rtx from m_state.gp.shaders.vs->getHash() at draw submission time.
+  // Used by camera_manager to allowlist gameplay-world draws (game-native,
+  // deterministic). Zero means "not populated / no VS bound".
+  XXH64_hash_t vertexShaderHash = 0;
+
   void sanitize() {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;
     if (objectToView[3][3] == 0.f) objectToView[3][3] = 1.f;

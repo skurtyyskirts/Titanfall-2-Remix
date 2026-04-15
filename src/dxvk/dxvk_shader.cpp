@@ -67,6 +67,13 @@ namespace dxvk {
   // with Unknown (0) + declaring StorageImageRead/WriteWithoutFormat
   // capabilities is the standard fix (see DXVK's own dxbc_compiler.cpp:969).
   // Both capabilities are already enabled by the D3D11 device init.
+  //
+  // Safety: we only insert the WithoutFormat capabilities if we actually
+  // replaced at least one non-zero Image Format operand. Adding unused
+  // capabilities to graphics shaders was previously correlated with TDRs
+  // during pipeline compilation on some drivers — the gated insertion keeps
+  // the patch a strict no-op for shaders that already declare Unknown
+  // everywhere (which includes all DXVK DXBC-translated game VS/PS).
   static std::vector<uint32_t> patchSpirvImageFormats(const uint32_t* src, size_t wordCount) {
     std::vector<uint32_t> code(src, src + wordCount);
     if (code.size() < 5 || code[0] != 0x07230203u) {
@@ -96,23 +103,35 @@ namespace dxvk {
       i += wc;
     }
 
-    // Second pass: overwrite Image Format operand (operand 8 of OpTypeImage).
+    // Second pass: overwrite Image Format operand (operand 8 of OpTypeImage)
+    // when it is non-zero (i.e. declares a concrete format). Track whether
+    // we actually changed anything so we know whether to insert capabilities.
+    bool anyPatched = false;
     for (size_t i = 5; i < code.size(); ) {
       const uint32_t w = code[i];
       const uint16_t op = uint16_t(w & 0xFFFFu);
       const uint16_t wc = uint16_t(w >> 16);
       if (wc == 0) break;
       if (op == 25u /* OpTypeImage */ && wc >= 9 && i + 8 < code.size()) {
-        code[i + 8] = 0u; // ImageFormatUnknown
+        if (code[i + 8] != 0u) {
+          code[i + 8] = 0u; // ImageFormatUnknown
+          anyPatched = true;
+        }
       }
       i += wc;
     }
 
-    std::vector<uint32_t> toInsert;
-    if (!hasReadWithoutFmt)  { toInsert.push_back((2u << 16) | 17u); toInsert.push_back(28u); }
-    if (!hasWriteWithoutFmt) { toInsert.push_back((2u << 16) | 17u); toInsert.push_back(29u); }
-    if (!toInsert.empty()) {
-      code.insert(code.begin() + capabilityInsertPos, toInsert.begin(), toInsert.end());
+    // Only add WithoutFormat capabilities when we actually rewrote a format
+    // operand. If the shader was already Unknown throughout, it doesn't need
+    // the new capabilities and introducing them risks driver validation
+    // surprises during pipeline compile.
+    if (anyPatched) {
+      std::vector<uint32_t> toInsert;
+      if (!hasReadWithoutFmt)  { toInsert.push_back((2u << 16) | 17u); toInsert.push_back(28u); }
+      if (!hasWriteWithoutFmt) { toInsert.push_back((2u << 16) | 17u); toInsert.push_back(29u); }
+      if (!toInsert.empty()) {
+        code.insert(code.begin() + capabilityInsertPos, toInsert.begin(), toInsert.end());
+      }
     }
     return code;
   }
@@ -131,6 +150,11 @@ namespace dxvk {
     m_stage.pName = "main";
     m_stage.pSpecializationInfo = nullptr;
 
+    // NV-DXVK: patchSpirvImageFormats is a strict no-op for shaders that
+    // already declare Unknown format (e.g. DXVK DXBC-translated D3D11 VS/PS).
+    // It only modifies bytecode when a concrete Image Format operand is found,
+    // and only then inserts the WithoutFormat capabilities. Safe to apply to
+    // all shader stages.
     const std::vector<uint32_t> patched =
       patchSpirvImageFormats(code.data(), code.size() / sizeof(uint32_t));
 

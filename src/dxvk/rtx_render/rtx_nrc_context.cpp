@@ -317,9 +317,48 @@ namespace dxvk {
     const nrc::FrameSettings& frameSettings,
     bool* hasCacheBeenReset) {
 
-    if (config != m_nrcContextSettings) {
+    // NV-DXVK: rate-limit Configure. The adaptive-training-dimensions logic
+    // recomputes training dims every frame; during TF2's opening cinematic
+    // this oscillates, making config != m_nrcContextSettings fire continuously.
+    // Each Configure is heavyweight (frees/recreates NRC buffers + internal
+    // submit) — hammering it 10× per second lets in-flight command buffers
+    // referencing freed buffers collide on the driver side and TDR.
+    //
+    // Allow at most one Configure per kConfigureCooldownFrames frames. Between
+    // those, cache the new settings (for subsequent compare) but don't run the
+    // heavy path. Exception: if frameDimensions itself changed, we must
+    // reconfigure immediately since NRC allocations depend on it.
+    constexpr uint32_t kConfigureCooldownFrames = 30;
+    static bool sHasConfiguredOnce = false;
+    static uint32_t sLastConfigureFrame = 0;
+    const uint32_t nowFrame = m_device->getCurrentFrameId();
+
+    const bool settingsChanged = (config != m_nrcContextSettings);
+    const bool frameDimsChanged =
+      config.frameDimensions.x != m_nrcContextSettings.frameDimensions.x ||
+      config.frameDimensions.y != m_nrcContextSettings.frameDimensions.y;
+    const bool cooldownElapsed =
+      sHasConfiguredOnce && (nowFrame - sLastConfigureFrame) >= kConfigureCooldownFrames;
+    // First ever Configure (sHasConfiguredOnce=false) always goes through so NRC
+    // actually gets initial settings. After that, only frameDims changes bypass
+    // the cooldown; smaller drifts (trainingDims, requestReset, sceneBounds) wait.
+    const bool doConfigure =
+      settingsChanged && (!sHasConfiguredOnce || frameDimsChanged || cooldownElapsed);
+
+    if (settingsChanged && !doConfigure) {
+      // Skip this reconfigure. IMPORTANT: don't update m_nrcContextSettings —
+      // it must continue to reflect what NRC was last actually configured
+      // with, so the next frame's compare still sees a diff and eventually
+      // (after cooldown) triggers a real Configure. If we overwrote it here,
+      // the rate-limit would latch forever on the first mismatch.
+      *hasCacheBeenReset = false;
+    }
+
+    if (doConfigure) {
       // Configuration has changed
       m_nrcContextSettings = config;
+      sLastConfigureFrame = nowFrame;
+      sHasConfiguredOnce = true;
 
       const bool forceAllocate = false;
 
@@ -348,9 +387,19 @@ namespace dxvk {
       // NRC's Configure() performs internal vkQueueSubmit calls (weights upload, network init)
       // AND frees/recreates Vulkan resources (buffers, command pools). It races both on the
       // queue (threading violation) and on pending GPU work (VUID-vkFreeCommandBuffers-00047).
-      // Use lockSubmission() (synchronized) so pending DXVK submissions drain BEFORE NRC
-      // reconfigures — otherwise a camera cut triggering reconfigure while RT work is in
-      // flight frees command buffers still in use -> VK_ERROR_DEVICE_LOST on NVIDIA.
+      //
+      // Previous code used lockSubmission() alone, assuming it would drain pending DXVK work.
+      // It does NOT — lockSubmission() only serializes the submit mutex; GPU commands can
+      // still be executing when NRC frees resources underneath them → VK_ERROR_DEVICE_LOST.
+      // The only correct fix is to drain the GPU: flush any queued DXVK command list so it
+      // reaches the submit queue, then waitForIdle() to block until the GPU has actually
+      // finished. lockSubmission around the NRC call then ensures its internal vkQueueSubmit
+      // doesn't race dxvk-submit on the queue handle itself.
+      //
+      // This is a cold path (only when NRC settings actually change — resolution / training
+      // dimensions / reset), so the waitForIdle stall is acceptable.
+      ctx.flushCommandList();
+      m_device->waitForIdle();
       m_device->lockSubmission();
       nrc::Status status = m_nrcContext->Configure(m_nrcContextSettings, &m_nrcBuffers,
         NrcCtxOptions::enableCustomNetworkConfig()
@@ -414,7 +463,18 @@ namespace dxvk {
     // - NRC should ideally change this API to avoid doing submissions internally to avoid the need for us to lock submissions or synchronize with the
     //   dxvk-submit thread to begin with as this will never be ideal. If anything it should allow us to submit the fence ourselves on the dxvk-submit
     //   thread and pass the fence in directly or something.
-    m_device->lockSubmissionUnsynchronized();
+    // NV-DXVK: switched from lockSubmissionUnsynchronized() to
+    // lockSubmission(). Per the comment block above, unsynchronized was
+    // chosen for DLSS-FG perf; however under heavy D3D11 submission load
+    // (TF2 ~400 draws/frame, multiple shadow cascades + fog passes) the
+    // unsynchronized vkQueueSubmit inside NRC::EndFrame races with the
+    // dxvk-submit thread — NRC returns InternalError and the device loses
+    // after repeated NRC Context re-inits. This is the same class of bug
+    // the Configure() path hit earlier (fixed by switching that one to
+    // lockSubmission too). Synchronizing here ensures all dxvk-submit-thread
+    // work has drained before NRC does its internal submit, which is the
+    // correct ordering the original comment already identified as proper.
+    m_device->lockSubmission();
     const nrc::Status status = m_nrcContext->EndFrame(nativeCmdQueue);
     m_device->unlockSubmission();
 
