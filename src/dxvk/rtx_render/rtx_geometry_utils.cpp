@@ -938,6 +938,13 @@ namespace dxvk {
     args.hasBoneTransform = (input.boneMatrixBuffer.defined() && input.boneIndexBuffer.defined()) ? 1 : 0;
     args.boneIndex = input.boneInstanceIndex;  // instance index for bone lookup
 
+    // NV-DXVK: defaults preserve legacy single-bone-per-draw skinning behavior.
+    // For TF2 BSP / batched static props, RasterGeometry overrides these.
+    args.bonePerVertex     = input.bonePerVertex ? 1u : 0u;
+    args.boneMatrixStride  = input.boneMatrixStrideBytes != 0 ? input.boneMatrixStrideBytes : 48u;
+    args.boneIndexStride   = input.boneIndexStrideBytes  != 0 ? input.boneIndexStrideBytes  : 8u;
+    args.boneIndexMask     = input.boneIndexMask         != 0 ? input.boneIndexMask         : 0xFFFFu;
+
     // NV-DXVK DEBUG: Log interleaver dispatch info for bone draws
     if (args.hasBoneTransform) {
       static uint32_t sInterleaveDiag = 0;
@@ -953,10 +960,33 @@ namespace dxvk {
       }
     }
 
-    const uint32_t kNumVerticesToProcessOnCPU = 1024;
-    const bool useGPU = input.vertexCount > kNumVerticesToProcessOnCPU || mustUseGPU;
+    // NV-DXVK: always use GPU path. The CPU optimization for small N has
+    // multiple latent bugs (no bone transforms, no R32G32_UINT remap, depends
+    // on CPU-mappable buffers) that silently produce zero/garbage geometry.
+    // Per-dispatch overhead is small relative to debugging cost of two paths.
+    // The CPU else-branch below still references kNumVerticesToProcessOnCPU as
+    // a stack-array size — keep the constant defined even though that branch
+    // is now dead.
+    constexpr uint32_t kNumVerticesToProcessOnCPU = 1024;
+    (void)kNumVerticesToProcessOnCPU;
+    const bool useGPU = true;
 
     if (useGPU) {
+      // DEBUG: log first N GPU interleave dispatches per session, broken down
+      // by whether bone transform is being applied (skinning) or not (BSP).
+      static uint32_t sInterleaveGpuBone = 0;
+      static uint32_t sInterleaveGpuPlain = 0;
+      uint32_t* counter = args.hasBoneTransform ? &sInterleaveGpuBone : &sInterleaveGpuPlain;
+      if (*counter < 8) {
+        ++(*counter);
+        Logger::info(str::format(
+          "[rtx-interleaver] GPU dispatch (",
+          args.hasBoneTransform ? "bone" : "plain",
+          "): posFmt=", args.positionFormat,
+          " verts=", input.vertexCount,
+          " posNeedsUintRead=", (args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) ? 1 : 0,
+          " counts(bone=", sInterleaveGpuBone, " plain=", sInterleaveGpuPlain, ")"));
+      }
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_OUTPUT, DxvkBufferSlice(output.buffer));
 
       ctx->bindResourceBuffer(INTERLEAVE_GEOMETRY_BINDING_POSITION_INPUT, input.positionBuffer);
@@ -1000,7 +1030,12 @@ namespace dxvk {
       ctx->dispatch(workgroups.width, workgroups.height, workgroups.depth);
 
       // NV-DXVK: Dump raw INPUT vertex buffer bytes for R32G32_UINT draws
-      if (false && args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+      // NV-DXVK: enable raw VBUF + interleaver output dump for first N R32G32_UINT
+      // dispatches so we can verify the unpack actually produces sensible
+      // float positions for BSP geometry.
+      static uint32_t sUintDumpCount = 0;
+      if ((sUintDumpCount < 4) && args.positionFormat == interleaver::SupportedVkFormats::VK_FORMAT_R32G32_UINT) {
+        ++sUintDumpCount;
         static uint32_t sRawDumpCount = 0;
         if (sRawDumpCount < 3) {
           ++sRawDumpCount;

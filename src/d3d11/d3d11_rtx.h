@@ -1,6 +1,7 @@
 #pragma once
 
 #include "d3d11_include.h"
+#include <unordered_map>
 #include <unordered_set>
 
 #include "../dxvk/rtx_render/rtx_types.h"
@@ -100,6 +101,19 @@ namespace dxvk {
     };
   private:
     uint32_t m_filterCounts[static_cast<uint32_t>(FilterReason::Count)] = {};
+
+    // NV-DXVK: per-frame VS-hash bookkeeping so EndFrame can dump "this VS was
+    // rejected as noPS 42 times, submitted 0 times" — lets us pinpoint which
+    // shader category is getting nuked by which filter, no guessing.
+    struct VsFrameStats {
+      uint32_t submitted = 0;
+      uint32_t rejects[static_cast<uint32_t>(FilterReason::Count)] = {};
+    };
+    std::unordered_map<std::string, VsFrameStats> m_vsFrameStats;
+    // Called instead of ++m_filterCounts[X] — records the current VS hash too.
+    void BumpFilter(FilterReason r);
+    // Current VS hash cache (set per SubmitDraw entry; empty if no VS).
+    std::string m_currentVsHashCache;
 
     // NV-DXVK: Set by ExtractTransforms to report whether it had to fall
     // back to a viewport-derived perspective instead of finding a real

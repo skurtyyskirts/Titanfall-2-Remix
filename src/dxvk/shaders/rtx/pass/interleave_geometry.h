@@ -187,7 +187,11 @@ namespace interleaver {
     const float kScale = 1.0f / 1024.0f;
     float x = float(xi) * kScale - 1024.0f;
     float y = float(yi) * kScale - 1024.0f;
-    float z = float(zi) * kScale - 2080.0f;  // verified from shader magic 0xC5020000
+    // NV-DXVK: bias was -2080 (from a misread `0xC5020000` constant). Actual
+    // value in VS_759738774 / VS_4798dc2d / etc. disasm is l(-2048.0f) for the
+    // Z component of the unpack `mad`. Verified by dumping VBUF + CPU-decoded
+    // reference and observing exact -32 offset between them.
+    float z = float(zi) * kScale - 2048.0f;
     // DEBUG: output u0 raw bits to verify color0 uint buffer is reading correctly.
     // If u0_lo = low 16 bits of u0, compare with raw dump word 0.
     // e.g. raw dump v0 word0 = 0x33CFD48A → low16 = 0xD48A = 54410
@@ -200,8 +204,11 @@ namespace interleaver {
 
   // NV-DXVK: Apply bone matrix (float3x4, 12 floats per matrix) to position.
   // boneMatrix layout: [r00 r01 r02 tx | r10 r11 r12 ty | r20 r21 r22 tz]
-  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, float3 pos) {
-    uint32_t base = boneIndex * 12;  // 12 floats per float3x4
+  // strideFloats accounts for cases where rows are followed by per-instance padding
+  // (e.g. TF2 g_modelInst is 208 bytes/row = 52 floats, of which only first 12 form
+  // the matrix). For standard g_boneMatrix pass strideFloats == 12.
+  float3 applyBoneMatrix(ReadBuffer(float) boneBuffer, uint32_t boneIndex, uint32_t strideFloats, float3 pos) {
+    uint32_t base = boneIndex * strideFloats;
     float3 row0 = float3(boneBuffer[base+0], boneBuffer[base+1], boneBuffer[base+2]);
     float  tx   = boneBuffer[base+3];
     float3 row1 = float3(boneBuffer[base+4], boneBuffer[base+5], boneBuffer[base+6]);
@@ -240,12 +247,22 @@ namespace interleaver {
     // NV-DXVK: Apply bone matrix if available (Source Engine 2 skinning/instancing).
     // The bone matrix transforms decoded object-space positions to camera-relative space.
     if (cb.hasBoneTransform) {
-      // Use COLOR1.x (first uint16, low bits of first uint32 in instance buffer)
-      // as the bone index. COLOR1.x varies per instance (0,1,2,...) and may
-      // index into the 53 bones uploaded to t30.
-      uint32_t packed = srcBoneIndex[0];  // instance 0 for non-instanced draws
-      uint32_t boneIdx = packed & 0xFFFFu;  // COLOR1.x = low 16 bits
-      position = applyBoneMatrix(srcBoneMatrix, boneIdx, position);
+      uint32_t boneIdx;
+      if (cb.bonePerVertex != 0u) {
+        // TF2 BSP / batched static props: each vertex has its own COLOR1 instance
+        // index. boneIndexStride is the byte stride of the source vertex stream
+        // (8 for R16G16B16A16_UINT, 16 for R32G32B32A32_UINT). Divide by 4 to get
+        // the per-vertex offset in the uint32_t-typed StructuredBuffer.
+        const uint32_t indexStrideFloats = cb.boneIndexStride / 4u;
+        const uint32_t packed = srcBoneIndex[srcVertexIndex * indexStrideFloats];
+        boneIdx = packed & cb.boneIndexMask;
+      } else {
+        // Legacy single-bone-per-draw path (skinned characters).
+        const uint32_t packed = srcBoneIndex[0];
+        boneIdx = packed & cb.boneIndexMask;
+      }
+      const uint32_t strideFloats = cb.boneMatrixStride / 4u;
+      position = applyBoneMatrix(srcBoneMatrix, boneIdx, strideFloats, position);
     }
 
     dst[idx * cb.outputStride + writeOffset++] = position.x;

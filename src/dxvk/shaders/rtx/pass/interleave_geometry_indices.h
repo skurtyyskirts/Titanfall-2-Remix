@@ -47,8 +47,15 @@ struct InterleaveGeometryArgs {
   uint32_t forceNormals; // When set, reserve normal space in output even if hasNormals is false (writes zeros)
 
   // NV-DXVK: Source Engine 2 bone matrix transform
-  uint32_t hasBoneTransform;  // When set, fetch bone matrix from t30 and apply to position
-  uint32_t boneIndex;         // Index into the bone matrix buffer (from per-instance data)
+  uint32_t hasBoneTransform;   // When set, fetch bone matrix from bone slot and apply to position
+  uint32_t boneIndex;          // Fallback index if bonePerVertex == 0
+
+  // NV-DXVK (TF2 BSP): per-vertex instance index lookup for g_modelInst-style
+  // batched drawing. Each vertex's COLOR1 picks its own transform.
+  uint32_t bonePerVertex;      // 0 = use args.boneIndex (legacy single-bone), 1 = read srcBoneIndex[vertexIdx]
+  uint32_t boneMatrixStride;   // bytes/row in bone buffer (48 for g_boneMatrix, 208 for g_modelInst)
+  uint32_t boneIndexStride;    // bytes/vertex in bone-index buffer (8 for R16G16B16A16_UINT, 16 for R32G32B32A32_UINT)
+  uint32_t boneIndexMask;      // 0xFFFF for 16-bit index (legacy), 0xFFFFFFFF for full 32-bit
 };
 
 // NV-DXVK (DX11 port): shift past the D3D11 graphics slot range (0..1151) so

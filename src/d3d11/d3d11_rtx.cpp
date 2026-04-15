@@ -223,26 +223,92 @@ namespace dxvk {
       const D3D11RtxSemantic* boneIdxSem = nullptr;
       ID3D11ShaderResourceView* boneSrv = nullptr;
       {
-        // Find per-instance UINT semantic (bone indices)
+        // Find per-instance UINT semantic. Accepts both:
+        //   R16G16B16A16_UINT — legacy skinned-character per-instance bone idx
+        //   R32G32_UINT       — TF2 BSP / batched-prop per-instance modelInst idx
         for (const auto& s : semantics) {
           if (!s.perInstance) continue;
-          if (s.format == VK_FORMAT_R16G16B16A16_UINT) {
+          if (s.format == VK_FORMAT_R16G16B16A16_UINT
+              || s.format == VK_FORMAT_R32G32_UINT
+              || s.format == VK_FORMAT_R32G32B32A32_UINT) {
             boneIdxSem = &s;
             break;
           }
         }
-        // Check VS SRV slots 30 (t30 = skinning bones) and 31 (t31 = per-instance transforms).
-        // The instanced shader we decompiled uses t31 with 208-byte stride per instance.
-        const uint32_t kInstTransformSlot = 31;
-        const uint32_t kBoneSrvSlot = 30;
-        uint32_t usedSlot = 0;
-        if (kInstTransformSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-          boneSrv = m_context->m_state.vs.shaderResources.views[kInstTransformSlot].ptr();
-          if (boneSrv) usedSlot = kInstTransformSlot;
+        // DEBUG: count fanout entries by semantic format
+        if (boneIdxSem) {
+          static uint32_t sFanoutR16 = 0, sFanoutR32x2 = 0, sFanoutR32x4 = 0;
+          uint32_t* counter = (boneIdxSem->format == VK_FORMAT_R16G16B16A16_UINT) ? &sFanoutR16
+                            : (boneIdxSem->format == VK_FORMAT_R32G32_UINT) ? &sFanoutR32x2
+                            : &sFanoutR32x4;
+          if ((*counter) < 5) {
+            ++(*counter);
+            Logger::info(str::format(
+              "[D3D11Rtx] FanoutSem: fmt=", uint32_t(boneIdxSem->format),
+              " perInst=", boneIdxSem->perInstance ? 1 : 0,
+              " slot=", boneIdxSem->inputSlot,
+              " byteOff=", boneIdxSem->byteOffset,
+              " counts(R16=", sFanoutR16, " R32x2=", sFanoutR32x2,
+              " R32x4=", sFanoutR32x4, ")"));
+          }
         }
-        if (!boneSrv && kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-          boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
-          if (boneSrv) usedSlot = kBoneSrvSlot;
+        // NV-DXVK: deterministic slot selection via RDEF — ask the VS itself
+        // whether it reads g_modelInst (BSP) or g_boneMatrix (skinned). Falls
+        // back to blind t31/t30 probing for shaders without RDEF.
+        uint32_t usedSlot = 0;
+        bool isModelInstFanout = false;
+        {
+          uint32_t modelInstSlot = UINT32_MAX, boneMatrixSlot = UINT32_MAX;
+          auto vsPtr = m_context->m_state.vs.shader;
+          if (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr) {
+            const D3D11CommonShader* common = vsPtr->GetCommonShader();
+            modelInstSlot  = common->FindResourceSlot("g_modelInst");
+            boneMatrixSlot = common->FindResourceSlot("g_boneMatrix");
+          }
+          if (modelInstSlot != UINT32_MAX
+              && modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+            boneSrv = m_context->m_state.vs.shaderResources.views[modelInstSlot].ptr();
+            if (boneSrv) { usedSlot = modelInstSlot; isModelInstFanout = true; }
+          }
+          if (!boneSrv && boneMatrixSlot != UINT32_MAX
+              && boneMatrixSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+            boneSrv = m_context->m_state.vs.shaderResources.views[boneMatrixSlot].ptr();
+            if (boneSrv) usedSlot = boneMatrixSlot;
+          }
+          if (!boneSrv) {
+            // Last-resort blind probe — RDEF didn't tell us which slot the VS
+            // reads. Log loudly: every blind hit is a shader we can't classify
+            // deterministically and may mis-route (BSP transforms vs bone
+            // matrices). Either RDEF was stripped or the resource has a name
+            // we don't recognize.
+            const uint32_t kInstTransformSlot = 31, kBoneSrvSlot = 30;
+            if (kInstTransformSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+              boneSrv = m_context->m_state.vs.shaderResources.views[kInstTransformSlot].ptr();
+              if (boneSrv) { usedSlot = kInstTransformSlot; isModelInstFanout = true; }
+            }
+            if (!boneSrv && kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+              boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+              if (boneSrv) usedSlot = kBoneSrvSlot;
+            }
+            if (boneSrv) {
+              static std::unordered_set<uintptr_t> sBlindLogged;
+              auto vsPtr = m_context->m_state.vs.shader;
+              uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
+              if (key && sBlindLogged.insert(key).second) {
+                std::string vsHash = "?";
+                if (vsPtr->GetCommonShader() != nullptr) {
+                  auto& s = vsPtr->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsHash = s->getShaderKey().toString();
+                }
+                Logger::err(str::format(
+                  "[D3D11Rtx] BLIND-PROBE fanout for VS=", vsHash,
+                  " (RDEF lookup found neither g_modelInst nor g_boneMatrix)",
+                  " — guessing slot=", usedSlot,
+                  " isModelInst=", isModelInstFanout ? 1 : 0,
+                  ". This shader will use heuristic routing and may be wrong."));
+              }
+            }
+          }
         }
         static bool sLoggedSlot = false;
         if (!sLoggedSlot && boneSrv) {
@@ -401,6 +467,80 @@ namespace dxvk {
             const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
             constexpr uint32_t BYTES_PER_INSTANCE = 208;
 
+            // NV-DXVK (TF2 BSP): t31 stores absolute world transforms but
+            // Remix's "world" frame is camera-relative (the bone-skinned path
+            // uses small camera-relative bone matrices and renders correctly).
+            // Subtract c_cameraOrigin from each translation so BSP TLAS
+            // instances land in Remix's camera-relative world frame.
+            float camOrigin[3] = { 0.0f, 0.0f, 0.0f };
+            bool haveCamOrigin = false;
+            // DEBUG: log failure reason once per unique VS
+            const char* failReason = nullptr;
+            {
+              auto vsPtr4 = m_context->m_state.vs.shader;
+              if (vsPtr4 == nullptr || vsPtr4->GetCommonShader() == nullptr) {
+                failReason = "no_common_shader";
+              } else {
+                const D3D11CommonShader* common = vsPtr4->GetCommonShader();
+                auto camLoc = common->FindCBField("CBufCommonPerCamera", "c_cameraOrigin");
+                if (!camLoc) {
+                  failReason = "FindCBField_returned_null";
+                } else if (camLoc->size < 12) {
+                  failReason = "size<12";
+                } else if (camLoc->slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                  failReason = "slot_oob";
+                } else {
+                  const auto& vsCbs2 = m_context->m_state.vs.constantBuffers;
+                  const auto& cb = vsCbs2[camLoc->slot];
+                  if (cb.buffer == nullptr) {
+                    failReason = "cb_buffer_null";
+                  } else {
+                    const auto mapped = cb.buffer->GetMappedSlice();
+                    const uint8_t* p = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                    const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + camLoc->offset;
+                    if (!p) {
+                      failReason = "mapPtr_null";
+                    } else if (base + 12 > cb.buffer->Desc()->ByteWidth) {
+                      failReason = "base+12_oob";
+                    } else {
+                      const float* fp = reinterpret_cast<const float*>(p + base);
+                      if (!std::isfinite(fp[0]) || !std::isfinite(fp[1]) || !std::isfinite(fp[2])) {
+                        failReason = "non_finite";
+                      } else {
+                        camOrigin[0] = fp[0]; camOrigin[1] = fp[1]; camOrigin[2] = fp[2];
+                        haveCamOrigin = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            if (failReason) {
+              static std::unordered_set<uintptr_t> sFailLogged;
+              auto vsPtr6 = m_context->m_state.vs.shader;
+              uintptr_t key6 = (vsPtr6 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr6.ptr()) : 0;
+              if (key6 && sFailLogged.insert(key6).second && sFailLogged.size() < 12) {
+                std::string vsHash6 = "?";
+                if (vsPtr6->GetCommonShader() != nullptr) {
+                  auto& s = vsPtr6->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsHash6 = s->getShaderKey().toString();
+                }
+                Logger::warn(str::format(
+                  "[D3D11Rtx] BSP camOrigin lookup FAILED VS=", vsHash6,
+                  " reason=", failReason));
+              }
+            }
+            // DEBUG: log camOrigin once per unique VS that uses BSP fanout.
+            if (haveCamOrigin) {
+              static std::unordered_set<uintptr_t> sCamOriginLogged;
+              auto vsPtr5 = m_context->m_state.vs.shader;
+              uintptr_t key5 = (vsPtr5 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr5.ptr()) : 0;
+              if (key5 && sCamOriginLogged.insert(key5).second && sCamOriginLogged.size() < 12) {
+                Logger::info(str::format(
+                  "[D3D11Rtx] BSP camOrigin=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")"));
+              }
+            }
+
             // Track unique position vertex buffers this frame
             {
               uint32_t posSlot = UINT32_MAX;
@@ -422,12 +562,42 @@ namespace dxvk {
             const uint8_t* instData = m_instBufCache.data();
             const uint32_t stride = instVb.stride;
             const uint32_t boneOff = boneIdxSem->byteOffset;
+            // DEBUG: per-VS, dump the first few charIdx values + raw t31 matrix
+            // so we can verify the per-instance VB actually contains valid
+            // indices and the t31 lookups produce sensible matrices.
+            std::string idxDumpLine;
+            std::string t31DumpLine;
+            bool dumpThisDraw = false;
+            {
+              static std::unordered_set<uintptr_t> sIdxDumpVsLogged;
+              auto vsPtr2 = m_context->m_state.vs.shader;
+              uintptr_t key2 = (vsPtr2 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr2.ptr()) : 0;
+              if (key2 && sIdxDumpVsLogged.size() < 12 && sIdxDumpVsLogged.insert(key2).second)
+                dumpThisDraw = true;
+            }
             for (uint32_t i = 0; i < maxInstances; ++i) {
               size_t instOff = static_cast<size_t>(startInstance + i) * stride + boneOff;
-              uint16_t charIdx = 0;
-              if (instOff + 2 <= m_instBufCache.size())
-                charIdx = *reinterpret_cast<const uint16_t*>(instData + instOff);
+              // Index width depends on the semantic format.
+              // R16G16B16A16_UINT -> first uint16 (legacy bones)
+              // R32G32_UINT / R32G32B32A32_UINT -> first uint32 (BSP)
+              uint32_t charIdx = 0;
+              if (boneIdxSem->format == VK_FORMAT_R16G16B16A16_UINT) {
+                if (instOff + 2 <= m_instBufCache.size())
+                  charIdx = *reinterpret_cast<const uint16_t*>(instData + instOff);
+              } else {
+                if (instOff + 4 <= m_instBufCache.size())
+                  charIdx = *reinterpret_cast<const uint32_t*>(instData + instOff);
+              }
               size_t t31Off = static_cast<size_t>(charIdx) * BYTES_PER_INSTANCE;
+              if (dumpThisDraw && i < 6) {
+                idxDumpLine += str::format(" [", i, "]=", charIdx);
+                if (t31Off + 48 <= t31Len) {
+                  const float* mm = reinterpret_cast<const float*>(t31Data + t31Off);
+                  t31DumpLine += str::format(" T", i, "=(", mm[3], ",", mm[7], ",", mm[11], ")");
+                } else {
+                  t31DumpLine += str::format(" T", i, "=OOB");
+                }
+              }
               if (t31Off + 48 > t31Len) continue;
 
               const float* m = reinterpret_cast<const float*>(t31Data + t31Off);
@@ -436,6 +606,9 @@ namespace dxvk {
               if (!allFinite) continue;
               if (m[0] == 0.f && m[1] == 0.f && m[2] == 0.f && m[3] == 0.f) continue;
 
+              // t31 is already in camera-relative coords (matches Remix's
+              // implicit "world" frame derived from c_cameraRelativeToClip).
+              // No cameraOrigin adjustment.
               tforms->push_back(Matrix4(
                 Vector4(m[0], m[4], m[8],  0.0f),
                 Vector4(m[1], m[5], m[9],  0.0f),
@@ -443,7 +616,39 @@ namespace dxvk {
                 Vector4(m[3], m[7], m[11], 1.0f)));
             }
 
+            if (dumpThisDraw) {
+              std::string vsHash3 = "?";
+              auto vsPtr3 = m_context->m_state.vs.shader;
+              if (vsPtr3 != nullptr && vsPtr3->GetCommonShader() != nullptr) {
+                auto& s = vsPtr3->GetCommonShader()->GetShader();
+                if (s != nullptr) vsHash3 = s->getShaderKey().toString();
+              }
+              Logger::info(str::format(
+                "[D3D11Rtx] InstIdxDump VS=", vsHash3,
+                " maxInst=", maxInstances, " stride=", stride, " boneOff=", boneOff,
+                " t31Len=", t31Len,
+                " idx:", idxDumpLine,
+                " t31_T:", t31DumpLine));
+            }
             if (!tforms->empty()) {
+              // DEBUG: per-VS-hash fanout-submit log (first time per unique VS).
+              static std::unordered_set<uintptr_t> sFanoutVsLogged;
+              auto vsPtr = m_context->m_state.vs.shader;
+              uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
+              if (key && sFanoutVsLogged.size() < 30 && sFanoutVsLogged.insert(key).second) {
+                std::string vsHash = "?";
+                if (vsPtr->GetCommonShader() != nullptr) {
+                  auto& s = vsPtr->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsHash = s->getShaderKey().toString();
+                }
+                Logger::info(str::format(
+                  "[D3D11Rtx] FanoutSubmit VS=", vsHash,
+                  " isModelInst=", isModelInstFanout ? 1 : 0,
+                  " usedSlot=", usedSlot,
+                  " tforms=", tforms->size(),
+                  " idxFmt=", uint32_t(boneIdxSem->format),
+                  " sample T0=(", (*tforms)[0][3][0], ",", (*tforms)[0][3][1], ",", (*tforms)[0][3][2], ")"));
+              }
               // Keep alive via ring buffer
               if (m_boneTransformRing.empty()) m_boneTransformRing.resize(4);
               m_boneTransformRing[m_boneInstFrameId % 4].push_back(tforms);
@@ -2027,13 +2232,71 @@ namespace dxvk {
       bool found = false;
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
 
-      // NV-DXVK: Source/Titanfall 2 PRIORITY PATH — try VS slot 3 as float3x4
-      // FIRST, before the generic 4x4 scanner.
-      // IDA confirms engine code binds slot 3 as [objectToWorld|worldToView]
-      // (two float3x4 back-to-back, 96 bytes total).  We read only the first.
-      // This must run before tryWorldCb's generic scan so that materialsystem's
-      // slot 0/1 viewport data cannot produce false-positive world matrices.
-      {
+      // NV-DXVK: DETERMINISTIC EXTRACTION via DXBC RDEF reflection.
+      // The VS itself declares the cbuffers it binds (names + slots) and their
+      // field offsets. We look up by HLSL cbuffer/field name — no size or content
+      // heuristics. Only guessing is replaced; legacy path retained below as a
+      // fallback for shaders that stripped RDEF.
+      const D3D11CommonShader* commonVS = nullptr;
+      auto vsPtr = m_context->m_state.vs.shader;
+      if (vsPtr != nullptr) commonVS = vsPtr->GetCommonShader();
+
+      auto rdefReadFloats = [&](const D3D11ConstantBufferBindings& cbs,
+                                uint32_t slot, uint32_t fieldOff,
+                                uint32_t fieldSize, float* out) -> bool {
+        if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) return false;
+        const auto& cb = cbs[slot];
+        if (cb.buffer == nullptr) return false;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!ptr) return false;
+        const size_t base = static_cast<size_t>(cb.constantOffset) * 16 + fieldOff;
+        if (base + fieldSize > cb.buffer->Desc()->ByteWidth) return false;
+        std::memcpy(out, ptr + base, fieldSize);
+        return true;
+      };
+
+      if (commonVS != nullptr) {
+        // Titanfall 2 Source Engine 2 transform chain (verified via RDEF):
+        //   object -> camera_relative : CBufModelInstance.objectToCameraRelative
+        //                               (float3x4 at cb offset 0)
+        //   camera_relative -> clip   : CBufCommonPerCamera.c_cameraRelativeToClip
+        //                               (float4x4 at cb offset 16)
+        //
+        // The engine has NO absolute-world matrix in its shader pipeline — all
+        // rendering is camera-relative. Remix's w2v is likewise camera-relative
+        // (translation column is the camera-relative camera origin, i.e. zero
+        // for the main view). BLAS should therefore hold geometry in the same
+        // camera-relative frame; objectToWorld = objectToCameraRelative directly.
+        //
+        // If CBufModelInstance isn't bound, the VB is already in camera-relative
+        // space (CPU-baked) and objectToWorld = identity is correct.
+
+        auto modelCb = commonVS->FindCBuffer("CBufModelInstance");
+        if (modelCb && modelCb->bindSlot != UINT32_MAX) {
+          float m[12];
+          if (rdefReadFloats(vsCbs, modelCb->bindSlot, 0, 48, m)) {
+            bool ok = true;
+            for (int k = 0; k < 12 && ok; ++k)
+              if (!std::isfinite(m[k])) ok = false;
+            if (ok) {
+              // Row-major float3x4: row r = (basis_r.xyz, translation.comp_r)
+              transforms.objectToWorld = Matrix4(
+                Vector4(m[0], m[1],  m[2],  0.0f),
+                Vector4(m[4], m[5],  m[6],  0.0f),
+                Vector4(m[8], m[9],  m[10], 0.0f),
+                Vector4(m[3], m[7],  m[11], 1.0f));
+              found = true;
+            }
+          }
+        }
+        // Otherwise objectToWorld stays identity (correct for VBs already in
+        // camera-relative coords — e.g. world mesh / screen-space passes).
+      }
+
+      // ======== LEGACY HEURISTIC FALLBACK (shaders without RDEF only) ========
+      // Skipped entirely when we have commonVS-derived metadata above.
+      if (!found && commonVS == nullptr) {
         const uint32_t kSourceModelSlot = 3;
 
         // === VERBOSE SLOT-3 DIAGNOSTIC ===
@@ -2322,6 +2585,21 @@ namespace dxvk {
     }
 
     return transforms;
+  }
+
+  // NV-DXVK: latch set in EndFrame once real gameplay starts — drives the
+  // per-draw Submit log so it prints during actual scene rendering, not boot.
+  static uint32_t s_GameplayLogFrames = 0;
+
+  // NV-DXVK: helper — bump m_filterCounts AND record the reject against the
+  // current VS so EndFrame can show per-shader outcomes.
+  void D3D11Rtx::BumpFilter(FilterReason r) {
+    const uint32_t ri = static_cast<uint32_t>(r);
+    ++m_filterCounts[ri];
+    if (!m_currentVsHashCache.empty()) {
+      auto& st = m_vsFrameStats[m_currentVsHashCache];
+      ++st.rejects[ri];
+    }
   }
 
   Future<GeometryHashes> D3D11Rtx::ComputeGeometryHashes(
@@ -2665,6 +2943,16 @@ namespace dxvk {
                              UINT start,
                              INT  base,
                              const Matrix4* instanceTransform) {
+    // NV-DXVK: cache VS hash at entry so BumpFilter() / submit tracking can
+    // attribute stats without re-fetching it at every reject site.
+    m_currentVsHashCache.clear();
+    {
+      auto vsShader = m_context->m_state.vs.shader;
+      if (vsShader != nullptr && vsShader->GetCommonShader() != nullptr) {
+        auto& s = vsShader->GetCommonShader()->GetShader();
+        if (s != nullptr) m_currentVsHashCache = s->getShaderKey().toString();
+      }
+    }
     // NV-DXVK: Diagnostic — confirm SubmitDraw is reached
     {
       static uint32_t sEntryLog = 0;
@@ -2776,7 +3064,7 @@ namespace dxvk {
     // Throttle: don't exceed the worker ring buffer capacity.
     // Beyond this point new futures would overwrite in-flight ones → corrupt hashes.
     if (m_drawCallID >= kMaxConcurrentDraws) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::Throttle)];
+      BumpFilter(FilterReason::Throttle);
       return;
     }
 
@@ -2787,7 +3075,7 @@ namespace dxvk {
     const D3D11_PRIMITIVE_TOPOLOGY d3dTopology = m_context->m_state.ia.primitiveTopology;
     if (d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
         d3dTopology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NonTriTopology)];
+      BumpFilter(FilterReason::NonTriTopology);
       return;
     }
 
@@ -2795,7 +3083,7 @@ namespace dxvk {
     // Most engines draw opaque geometry twice — once for depth prepass (PS == null)
     // and once for the color pass (PS != null) with the same vertices.
     if (m_context->m_state.ps.shader == nullptr) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPixelShader)];
+      BumpFilter(FilterReason::NoPixelShader);
       return;
     }
 
@@ -2814,14 +3102,14 @@ namespace dxvk {
         }
       }
       if (!anyRtvBound) {
-        ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoRenderTarget)];
+        BumpFilter(FilterReason::NoRenderTarget);
         return;
       }
     }
 
     // Skip trivially small draws (< 3 elements = 0 triangles).
     if (count < 3) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::CountTooSmall)];
+      BumpFilter(FilterReason::CountTooSmall);
       return;
     }
 
@@ -2843,20 +3131,20 @@ namespace dxvk {
     // Only skip if BOTH depth test and write are off — some engines do
     // "depth off, write on" for sky or "depth on, write off" for decals.
     if (!zEnable && !zWriteEnable && count <= 6) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::FullscreenQuad)];
+      BumpFilter(FilterReason::FullscreenQuad);
       return;
     }
 
     D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
     if (!layout) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoInputLayout)];
+      BumpFilter(FilterReason::NoInputLayout);
       return;
     }
 
     const auto& semantics = layout->GetRtxSemantics();
 
     if (semantics.empty()) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoSemantics)];
+      BumpFilter(FilterReason::NoSemantics);
       return;
     }
 
@@ -2940,7 +3228,7 @@ namespace dxvk {
     }
 
     if (!posSem) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosition)];
+      BumpFilter(FilterReason::NoPosition);
       return;
     }
 
@@ -3032,7 +3320,7 @@ namespace dxvk {
             }
           }
         }
-        ++m_filterCounts[static_cast<uint32_t>(FilterReason::UnsupPosFmt)];
+        BumpFilter(FilterReason::UnsupPosFmt);
         static uint32_t sUnsupPosLog = 0;
         if (sUnsupPosLog < 3) {
           ++sUnsupPosLog;
@@ -3058,7 +3346,7 @@ namespace dxvk {
 
     RasterBuffer posBuffer = makeVertexBuffer(posSem);
     if (!posBuffer.defined()) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoPosBuffer)];
+      BumpFilter(FilterReason::NoPosBuffer);
       return;
     }
 
@@ -3110,7 +3398,7 @@ namespace dxvk {
     if (indexed) {
       const auto& ib = m_context->m_state.ia.indexBuffer;
       if (ib.buffer == nullptr) {
-        ++m_filterCounts[static_cast<uint32_t>(FilterReason::NoIndexBuffer)];
+        BumpFilter(FilterReason::NoIndexBuffer);
         return;
       }
       VkIndexType idxType = (ib.format == DXGI_FORMAT_R32_UINT)
@@ -3179,32 +3467,189 @@ namespace dxvk {
 
     // NV-DXVK: Track bone buffer and attach bone data for GPU instancing.
     // For R32G32_UINT positions AND for instanced bone draws (m_attachBoneBuffers),
-    // attach the t30 bone matrix buffer and per-instance bone index buffer to the
-    // geometry so the interleaver can apply per-instance transforms on the GPU.
+    // attach a SRV-backed transform buffer + per-vertex/per-instance index source.
+    //
+    // Two TF2 patterns share most of the plumbing:
+    //   (A) Skinned characters (g_boneMatrix at t30, stride=48):
+    //       - Per-instance R16G16B16A16_UINT semantic (bone indices)
+    //       - One bone matrix per draw (use index from semantic)
+    //   (B) BSP / batched static props (g_modelInst at t31, stride=208):
+    //       - Per-vertex COLOR1 R32G32B32A32_UINT semantic (instance indices)
+    //       - Each vertex picks its own transform via cb.bonePerVertex path
+    // DEBUG: log posSem format + SRV slot occupancy for first N draws of each
+    // unique VS, so we can see why the BSP path doesn't fire.
+    {
+      static std::unordered_set<uintptr_t> sPosFmtLogged;
+      auto vsPtr = m_context->m_state.vs.shader;
+      uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
+      if (key && sPosFmtLogged.size() < 40 && sPosFmtLogged.insert(key).second) {
+        const auto& srvs = m_context->m_state.vs.shaderResources.views;
+        std::string vsHash = "?";
+        if (vsPtr->GetCommonShader() != nullptr) {
+          auto& s = vsPtr->GetCommonShader()->GetShader();
+          if (s != nullptr) vsHash = s->getShaderKey().toString();
+        }
+        Logger::info(str::format(
+          "[D3D11Rtx] PosFmtProbe VS=", vsHash,
+          " posFmt=", posSem ? uint32_t(posSem->format) : 0,
+          " posPerInst=", posSem ? (posSem->perInstance ? 1 : 0) : 0,
+          " m_attachBoneBuffers=", m_attachBoneBuffers ? 1 : 0,
+          " t30=", srvs[30].ptr() ? 1 : 0,
+          " t31=", srvs[31].ptr() ? 1 : 0,
+          " bspGuard=", (posSem && posSem->format == VK_FORMAT_R32G32_UINT) || m_attachBoneBuffers ? 1 : 0));
+      }
+    }
     if (posSem->format == VK_FORMAT_R32G32_UINT || m_attachBoneBuffers) {
-      const uint32_t kBoneSrvSlot = 30;
-      if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-        auto boneSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
-        if (boneSrv) {
-          Com<ID3D11Resource> boneRes;
-          boneSrv->GetResource(&boneRes);
-          auto* boneBuf = static_cast<D3D11Buffer*>(boneRes.ptr());
-          if (boneBuf) {
-            m_lastBoneBuffer = boneBuf;
-            // Attach bone matrix buffer to geometry for GPU-side transform lookup
-            geo.boneMatrixBuffer = RasterBuffer(
-              boneBuf->GetBufferSlice(), 0, 48, VK_FORMAT_UNDEFINED);
+      // NV-DXVK: ask the VS RDEF which resource it actually declares — both
+      // t30 and t31 may be bound by app state, but each VS only reads ONE.
+      // Preferring t30 by default mis-routed BSP draws (which read g_modelInst
+      // at t31) into the bone-skinning path and they ended up at origin.
+      uint32_t modelInstSlot = UINT32_MAX;
+      uint32_t boneMatrixSlot = UINT32_MAX;
+      {
+        auto vsPtr = m_context->m_state.vs.shader;
+        if (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr) {
+          const D3D11CommonShader* common = vsPtr->GetCommonShader();
+          modelInstSlot  = common->FindResourceSlot("g_modelInst");
+          boneMatrixSlot = common->FindResourceSlot("g_boneMatrix");
+        }
+        // DEBUG: log RDEF resource lookup result per unique VS
+        static std::unordered_set<uintptr_t> sRdefLookupLogged;
+        uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
+        if (key && sRdefLookupLogged.size() < 30 && sRdefLookupLogged.insert(key).second) {
+          std::string vsHash = "?";
+          if (vsPtr->GetCommonShader() != nullptr) {
+            auto& s = vsPtr->GetCommonShader()->GetShader();
+            if (s != nullptr) vsHash = s->getShaderKey().toString();
+          }
+          Logger::info(str::format(
+            "[D3D11Rtx] RdefLookup VS=", vsHash,
+            " g_modelInst=", modelInstSlot,
+            " g_boneMatrix=", boneMatrixSlot));
+        }
+      }
+      // BSP / batched static props use g_modelInst when present. Otherwise
+      // fall back to g_boneMatrix (skinned characters). Final fallback: scan
+      // both slots blindly (covers shaders without RDEF).
+      ID3D11ShaderResourceView* xformSrv = nullptr;
+      bool isModelInst = false;
+      if (modelInstSlot != UINT32_MAX
+          && modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+        xformSrv = m_context->m_state.vs.shaderResources.views[modelInstSlot].ptr();
+        if (xformSrv) isModelInst = true;
+      }
+      if (!xformSrv && boneMatrixSlot != UINT32_MAX
+          && boneMatrixSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+        xformSrv = m_context->m_state.vs.shaderResources.views[boneMatrixSlot].ptr();
+      }
+      if (!xformSrv) {
+        // Last-resort blind probe (no RDEF / unknown shader).
+        constexpr uint32_t kBoneSrvSlot = 30;
+        constexpr uint32_t kModelInstSrvSlot = 31;
+        if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+          xformSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
+        if (!xformSrv && kModelInstSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+          xformSrv = m_context->m_state.vs.shaderResources.views[kModelInstSrvSlot].ptr();
+          isModelInst = (xformSrv != nullptr);
+        }
+        if (xformSrv) {
+          static std::unordered_set<uintptr_t> sBlindAttachLogged;
+          auto vsPtr = m_context->m_state.vs.shader;
+          uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
+          if (key && sBlindAttachLogged.insert(key).second) {
+            std::string vsHash = "?";
+            if (vsPtr->GetCommonShader() != nullptr) {
+              auto& s = vsPtr->GetCommonShader()->GetShader();
+              if (s != nullptr) vsHash = s->getShaderKey().toString();
+            }
+            Logger::err(str::format(
+              "[D3D11Rtx] BLIND-PROBE attach for VS=", vsHash,
+              " (RDEF lookup missed g_modelInst/g_boneMatrix)",
+              " — guessed isModelInst=", isModelInst ? 1 : 0,
+              ". Mis-routing risk: BSP geo may go through bone-skinning path."));
           }
         }
       }
-      // Per-instance bone index from the per-instance semantic
+      if (xformSrv && !isModelInst) {
+        // Legacy skinning path only. For BSP / batched-prop draws (isModelInst)
+        // we do NOT attach a bone matrix here — the per-instance fanout above
+        // already creates one TLAS instance per modelInst row with the correct
+        // transform. Letting the interleave shader also bone-multiply would
+        // double-apply the matrix and put geometry at sqr(transform) * raw_pos.
+        Com<ID3D11Resource> xformRes;
+        xformSrv->GetResource(&xformRes);
+        auto* xformBuf = static_cast<D3D11Buffer*>(xformRes.ptr());
+        if (xformBuf) {
+          m_lastBoneBuffer = xformBuf;
+          const uint32_t matrixStride = 48u;
+          geo.boneMatrixBuffer = RasterBuffer(
+            xformBuf->GetBufferSlice(), 0, matrixStride, VK_FORMAT_UNDEFINED);
+          geo.boneMatrixStrideBytes = matrixStride;
+        }
+      } else if (xformSrv && isModelInst) {
+        // BSP-path: log once per unique buffer so we know fanout activated.
+        Com<ID3D11Resource> xformRes; xformSrv->GetResource(&xformRes);
+        auto* xformBuf = static_cast<D3D11Buffer*>(xformRes.ptr());
+        static uint32_t sBspLogCount = 0;
+        if (xformBuf && sBspLogCount < 20) {
+          ++sBspLogCount;
+          Logger::info(str::format(
+            "[D3D11Rtx] BSP-fanout-path (t31): bufSize=",
+            xformBuf->Desc()->ByteWidth, " (no boneMatrixBuffer attached)"));
+        }
+      }
+      // DEBUG: dump every semantic for the first N BSP-path draws so we can see
+      // what the per-vertex/per-instance index format actually is.
+      if (isModelInst) {
+        static uint32_t sBspSemDump = 0;
+        if (sBspSemDump < 6) {
+          ++sBspSemDump;
+          for (const auto& s : semantics) {
+            Logger::info(str::format(
+              "[D3D11Rtx] BSP semantic dump: name=", s.name, " idx=", s.index,
+              " fmt=", uint32_t(s.format), " slot=", s.inputSlot,
+              " byteOff=", s.byteOffset,
+              " perInst=", s.perInstance ? 1 : 0));
+          }
+        }
+      }
+      // Find the per-vertex/per-instance index semantic. Prefer R32G32B32A32_UINT
+      // (BSP), accept R16G16B16A16_UINT (legacy bone). For BSP the semantic is
+      // typically per-VERTEX (inst=0); for bone-draws it's per-instance (inst=1).
+      // Slice starts at vb.offset + s.byteOffset so the interleave shader can
+      // index by vertex without needing semantic-internal offset awareness.
       for (const auto& s : semantics) {
-        if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
-          const auto& instVb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
-          if (instVb.buffer != nullptr) {
+        if (s.format == VK_FORMAT_R32G32B32A32_UINT) {
+          const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+          if (vb.buffer != nullptr) {
             geo.boneIndexBuffer = RasterBuffer(
-              instVb.buffer->GetBufferSlice(instVb.offset),
-              s.byteOffset, instVb.stride, s.format);
+              vb.buffer->GetBufferSlice(vb.offset + s.byteOffset),
+              0, vb.stride, s.format);
+            geo.bonePerVertex       = !s.perInstance;   // per-vertex for BSP
+            geo.boneIndexStrideBytes = vb.stride;        // typically 16 (4x uint32)
+            geo.boneIndexMask        = 0xFFFFFFFFu;      // full 32-bit index
+            // DEBUG
+            static uint32_t sBspIdxLog = 0;
+            if (sBspIdxLog < 20) {
+              ++sBspIdxLog;
+              Logger::info(str::format(
+                "[D3D11Rtx] BSP idx semantic: name=", s.name,
+                " perInst=", s.perInstance ? 1 : 0,
+                " stride=", vb.stride, " byteOff=", s.byteOffset,
+                " bonePerVertex=", geo.bonePerVertex ? 1 : 0));
+            }
+          }
+          break;
+        }
+        if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+          const auto& vb = m_context->m_state.ia.vertexBuffers[s.inputSlot];
+          if (vb.buffer != nullptr) {
+            geo.boneIndexBuffer = RasterBuffer(
+              vb.buffer->GetBufferSlice(vb.offset + s.byteOffset),
+              0, vb.stride, s.format);
+            geo.bonePerVertex       = false;             // legacy: one bone/draw
+            geo.boneIndexStrideBytes = vb.stride;        // typically 8 (4x uint16)
+            geo.boneIndexMask        = 0xFFFFu;
           }
           break;
         }
@@ -3259,7 +3704,7 @@ namespace dxvk {
     geo.futureGeometryHashes = ComputeGeometryHashes(geo, drawVertexCount,
                                                      hashStart, hashCount);
     if (!geo.futureGeometryHashes.valid()) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::HashFailed)];
+      BumpFilter(FilterReason::HashFailed);
       return;
     }
 
@@ -3269,7 +3714,7 @@ namespace dxvk {
 
     // Reject NDC-space screen quads now that ExtractTransforms has cached the VP.
     if (isNdcScreenQuad) {
-      ++m_filterCounts[static_cast<uint32_t>(FilterReason::FullscreenQuad)];
+      BumpFilter(FilterReason::FullscreenQuad);
       return;
     }
 
@@ -3306,7 +3751,7 @@ namespace dxvk {
         // (VK_ERROR_DEVICE_LOST).  Reject these as UIFallback instead.
         const auto& cached = m_lastGoodTransforms.worldToView;
         if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
-          ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+          BumpFilter(FilterReason::UIFallback);
           return;
         }
         // NV-DXVK: Only reuse the CAMERA transforms (viewToProjection,
@@ -3332,7 +3777,7 @@ namespace dxvk {
           const float maxT = 100000.0f;
           if (std::abs(o2v[3][0]) > maxT || std::abs(o2v[3][1]) > maxT || std::abs(o2v[3][2]) > maxT ||
               !std::isfinite(o2v[3][0]) || !std::isfinite(o2v[3][1]) || !std::isfinite(o2v[3][2])) {
-            ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+            BumpFilter(FilterReason::UIFallback);
             return;
           }
         }
@@ -3348,7 +3793,7 @@ namespace dxvk {
               " w2v T=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")"));
         }
       } else {
-        ++m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)];
+        BumpFilter(FilterReason::UIFallback);
         return;
       }
     }
@@ -3446,6 +3891,9 @@ namespace dxvk {
     dcs.zEnable          = zEnable;
     dcs.stencilEnabled   = stencilEnabled;
     dcs.drawCallID       = m_drawCallID++;
+    // NV-DXVK: record the successful submit against the current VS hash.
+    if (!m_currentVsHashCache.empty())
+      ++m_vsFrameStats[m_currentVsHashCache].submitted;
 
     // Viewport depth range from D3D11_VIEWPORT.MinDepth / MaxDepth.
     {
@@ -3605,7 +4053,9 @@ namespace dxvk {
         ++s_submitLogFrame;
       s_submitPrevID = dcs.drawCallID;
 
-      if (s_submitLogFrame >= 1 && s_submitLogFrame <= 10) {
+      // NV-DXVK: log during first gameplay frames (after boot-time menus).
+      // Tracked via global "gameplay started" latch in EndFrame.
+      if (s_GameplayLogFrames > 0) {
         const auto& T = dcs.transformData;
         const bool o2wIdentity = isIdentityExact(T.objectToWorld);
         // VS hash
@@ -3733,6 +4183,16 @@ namespace dxvk {
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
     const uint32_t draws = m_drawCallID;
     const uint32_t raw = m_rawDrawCount;
+    // Latch: once we see a gameplay-scale frame, log details for N frames.
+    {
+      static bool s_latched = false;
+      if (!s_latched && raw > 50) {
+        s_latched = true;
+        s_GameplayLogFrames = 5;
+      } else if (s_GameplayLogFrames > 0) {
+        --s_GameplayLogFrames;
+      }
+    }
     Logger::info(str::format("[D3D11Rtx] EndFrame: draws=", draws,
       " raw=", raw,
       " backbuffer=", backbuffer != nullptr ? 1 : 0));
@@ -3758,6 +4218,42 @@ namespace dxvk {
         " uiFallback=",     m_filterCounts[static_cast<uint32_t>(FilterReason::UIFallback)],
         " unsupFmt=",       m_filterCounts[static_cast<uint32_t>(FilterReason::UnsupPosFmt)]));
     }
+    // NV-DXVK: per-VS outcome dump — each VS hash, #submits, #rejects per filter.
+    // Gate on frames with meaningful draw counts so boot-time menus don't eat
+    // the quota before gameplay starts.
+    {
+      static uint32_t s_vsDumpGameFrame = 0;
+      const bool isGameplayFrame = (raw > 20);
+      if (isGameplayFrame) ++s_vsDumpGameFrame;
+      if (isGameplayFrame && s_vsDumpGameFrame <= 8 && !m_vsFrameStats.empty()) {
+        static const char* kReasonName[] = {
+          "Throttle","NonTriTopo","NoPS","NoRTV","TooSmall","FsQuad","NoLayout",
+          "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail","UIFallback","UnsupFmt"
+        };
+        Logger::info(str::format("[D3D11Rtx]   per-VS outcome (", m_vsFrameStats.size(), " unique):"));
+        // Stable-ish order: sort by (submits+rejectTotal) desc by copying to vector.
+        std::vector<std::pair<std::string, VsFrameStats>> sorted;
+        sorted.reserve(m_vsFrameStats.size());
+        for (const auto& kv : m_vsFrameStats) sorted.push_back(kv);
+        std::sort(sorted.begin(), sorted.end(),
+          [](const auto& a, const auto& b) {
+            uint32_t at = a.second.submitted, bt = b.second.submitted;
+            for (uint32_t r : a.second.rejects) at += r;
+            for (uint32_t r : b.second.rejects) bt += r;
+            return at > bt;
+          });
+        for (const auto& kv : sorted) {
+          std::string line = str::format("    ", kv.first.substr(0, 18), " subm=", kv.second.submitted);
+          for (uint32_t r = 0; r < static_cast<uint32_t>(FilterReason::Count); ++r) {
+            if (kv.second.rejects[r] > 0)
+              line += str::format(" ", kReasonName[r], "=", kv.second.rejects[r]);
+          }
+          Logger::info(line);
+        }
+      }
+    }
+    m_vsFrameStats.clear();
+
     for (uint32_t i = 0; i < static_cast<uint32_t>(FilterReason::Count); ++i)
       m_filterCounts[i] = 0;
 

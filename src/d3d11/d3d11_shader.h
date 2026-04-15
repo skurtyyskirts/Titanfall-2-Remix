@@ -1,6 +1,8 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 
 #include "../dxbc/dxbc_module.h"
@@ -16,18 +18,32 @@
 namespace dxvk {
   
   class D3D11Device;
-  
+
+  // NV-DXVK: RDEF-derived cbuffer metadata. Used so per-shader ExtractTransforms
+  // looks up slots/offsets deterministically from the shader's own declarations,
+  // instead of guessing with size/content heuristics. See parseRdef() in cpp.
+  struct D3D11CbufferField {
+    uint32_t offset;   // byte offset within the cbuffer
+    uint32_t size;     // bytes
+  };
+  struct D3D11CbufferInfo {
+    uint32_t bindSlot = UINT32_MAX;   // the cbN register the cbuffer is bound to
+    uint32_t size     = 0;            // cbuffer size in bytes
+    // fieldName -> {offset, size}
+    std::unordered_map<std::string, D3D11CbufferField> fields;
+  };
+
   /**
    * \brief Common shader object
-   * 
+   *
    * Stores the compiled SPIR-V shader and the SHA-1
    * hash of the original DXBC shader, which can be
    * used to identify the shader.
    */
   class D3D11CommonShader {
-    
+
   public:
-    
+
     D3D11CommonShader();
     D3D11CommonShader(
             D3D11Device*    pDevice,
@@ -44,16 +60,48 @@ namespace dxvk {
     Rc<DxvkBuffer> GetIcb() const {
       return m_buffer;
     }
-    
+
     std::string GetName() const {
       return m_shader->debugName();
     }
-    
+
+    // NV-DXVK: lookup a cbuffer by name (the HLSL-declared name, e.g.
+    // "CBufCommonPerCamera"). Returns nullptr if the shader doesn't bind it.
+    const D3D11CbufferInfo* FindCBuffer(const std::string& name) const {
+      auto it = m_cbuffers.find(name);
+      return it != m_cbuffers.end() ? &it->second : nullptr;
+    }
+    // NV-DXVK: returns the bind slot (txx / cxx / uxx) the shader uses for a
+    // resource by HLSL name, e.g. "g_modelInst" -> 31 if the VS reads t31.
+    // Returns UINT32_MAX if the shader does not declare that resource.
+    uint32_t FindResourceSlot(const std::string& name) const {
+      auto it = m_resourceSlots.find(name);
+      return it != m_resourceSlots.end() ? it->second : UINT32_MAX;
+    }
+    // Convenience: return {slot, offset, size} for a field, or std::nullopt.
+    struct CBFieldLoc { uint32_t slot, offset, size; };
+    std::optional<CBFieldLoc> FindCBField(const std::string& cbName,
+                                          const std::string& fieldName) const {
+      auto cb = FindCBuffer(cbName);
+      if (!cb) return std::nullopt;
+      auto it = cb->fields.find(fieldName);
+      if (it == cb->fields.end()) return std::nullopt;
+      return CBFieldLoc{ cb->bindSlot, it->second.offset, it->second.size };
+    }
+
   private:
-    
+
+    void parseRdef(const void* pShaderBytecode, size_t BytecodeLength);
+
     Rc<DxvkShader> m_shader;
     Rc<DxvkBuffer> m_buffer;
-    
+
+    // NV-DXVK: cbName -> info. Populated from DXBC RDEF chunk at ctor time.
+    std::unordered_map<std::string, D3D11CbufferInfo> m_cbuffers;
+    // NV-DXVK: resourceName -> bind slot (covers SRVs, UAVs, samplers).
+    // Used by Remix to identify which physical slot a named structured buffer
+    // (g_modelInst at t31, g_boneMatrix at t30, etc.) is read from per shader.
+    std::unordered_map<std::string, uint32_t> m_resourceSlots;
   };
   
   

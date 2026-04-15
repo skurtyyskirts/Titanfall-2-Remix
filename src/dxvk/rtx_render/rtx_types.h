@@ -280,6 +280,13 @@ struct RasterGeometry {
   RasterBuffer boneMatrixBuffer;
   RasterBuffer boneIndexBuffer;
   uint32_t boneInstanceIndex = 0;  // instance index for bone lookup
+  // NV-DXVK (TF2 BSP / batched props): per-vertex instance index lookup.
+  // bonePerVertex=true: each vertex's COLOR1 picks its own transform from
+  // boneMatrixBuffer (which is g_modelInst SRV t31, stride=208).
+  bool     bonePerVertex        = false;
+  uint32_t boneMatrixStrideBytes = 0;  // 0 = use shader default 48 (= float3x4)
+  uint32_t boneIndexStrideBytes  = 0;  // 0 = use shader default 8 (R16G16B16A16_UINT)
+  uint32_t boneIndexMask         = 0;  // 0 = use shader default 0xFFFF (16-bit)
 
   AxisAlignedBoundingBox boundingBox;
   Future<AxisAlignedBoundingBox> futureBoundingBox;
