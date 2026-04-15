@@ -1557,15 +1557,15 @@ namespace dxvk {
               // Recover normalised camera basis.
               Vector3 fwd   = (magFwd   > 0.001f) ? vpFwd   / magFwd   : Vector3(0, 0, -1);
               Vector3 right = (magRight > 0.001f) ? vpRight / magRight : Vector3(1, 0, 0);
-              // Re-derive up from cross product so the basis is exactly orthonormal
-              // (floating-point drift in the VP product can make the original up
-              //  slightly non-perpendicular to right × fwd).
-              Vector3 up = cross(fwd, right);
+              // Re-derive up via RH cross. Source is right-handed; in RH
+              // cross(right, fwd) = up. Previous LH variant cross(fwd, right)
+              // produced up=(0,0,-1) — view inverted, rendered image rolled.
+              Vector3 up = cross(right, fwd);
               const float upLen = length(up);
               if (upLen > 0.001f) up = up / upLen;
               else up = Vector3(0, 0, 1);
               // Re-derive right too so all three are perfectly orthonormal.
-              right = cross(up, fwd);
+              right = cross(fwd, up);
               const float rightLen = length(right);
               if (rightLen > 0.001f) right = right / rightLen;
 
@@ -1638,21 +1638,32 @@ namespace dxvk {
               const float dotU = -(up.x    * Tx_use + up.y    * Ty_use + up.z    * Tz_use);
               const float dotF = -(fwd.x   * Tx_use + fwd.y   * Ty_use + fwd.z   * Tz_use);
 
+              // NV-DXVK: V is D3D-style (V[2] = +fwd, view-space +Z = into scene,
+              // LH convention). The reconstructed projection has perspSign=-1
+              // (RH, expects view-space -Z = into scene). To match V to P,
+              // negate V[2] row (rotation AND translation column for that row)
+              // so view-space -Z is into scene.
               transforms.worldToView = Matrix4(
-                Vector4(right.x, right.y, right.z, 0.0f),
-                Vector4(up.x,    up.y,    up.z,    0.0f),
-                Vector4(fwd.x,   fwd.y,   fwd.z,   0.0f),
-                Vector4(dotR,    dotU,    dotF,    1.0f));
+                Vector4( right.x,  right.y,  right.z, 0.0f),
+                Vector4( up.x,     up.y,     up.z,    0.0f),
+                Vector4(-fwd.x,   -fwd.y,   -fwd.z,   0.0f),
+                Vector4( dotR,     dotU,    -dotF,    1.0f));
 
               // Build a clean pure perspective projection from the extracted scales.
               const float nearZ = 1.0f;
               const float farZ  = 20000.0f;
               const float Q     = farZ / (farZ - nearZ);
+              // NV-DXVK: m[2][2] must share sign with perspSign (m[2][3]).
+              // For a proper RH projection (perspSign=-1), m[2][2] = -Q and
+              // m[3][2] = -near*Q. For LH (perspSign=+1), m[2][2] = +Q and
+              // m[3][2] = -near*Q. Previous build had m[2][2]=+Q with
+              // perspSign=-1 — sign-mixed projection that inverts the
+              // view-space depth direction in Remix's RT raygen.
               proj = Matrix4(
-                Vector4(Sx,   0.0f, 0.0f,          0.0f),
-                Vector4(0.0f, Sy,   0.0f,          0.0f),
-                Vector4(0.0f, 0.0f, Q,             perspSign),
-                Vector4(0.0f, 0.0f, -nearZ * Q,    0.0f));
+                Vector4(Sx,   0.0f,  0.0f,                  0.0f),
+                Vector4(0.0f, Sy,    0.0f,                  0.0f),
+                Vector4(0.0f, 0.0f,  perspSign * Q,         perspSign),
+                Vector4(0.0f, 0.0f, -nearZ * Q,             0.0f));
 
               // Log decompositions periodically (every 100th) so we can
               // verify the camera position/direction tracks player movement
@@ -1784,10 +1795,11 @@ namespace dxvk {
             const float magFwd = length(vpFwd);
             Vector3 fwd   = magFwd > 0.001f ? vpFwd / magFwd : Vector3(0, 0, -1);
             Vector3 right = Sx > 0.001f ? vpRight / Sx : Vector3(1, 0, 0);
-            Vector3 up    = cross(fwd, right);
+            // RH cross: up = right × fwd. Same fix as path 1.
+            Vector3 up    = cross(right, fwd);
             float upLen = length(up);
             if (upLen > 0.001f) up = up / upLen; else up = Vector3(0, 0, 1);
-            right = cross(up, fwd);
+            right = cross(fwd, up);
             float rightLen = length(right);
             if (rightLen > 0.001f) right = right / rightLen;
 
@@ -1814,20 +1826,22 @@ namespace dxvk {
             const float dotR = -(right.x*Tx + right.y*Ty + right.z*Tz);
             const float dotU = -(up.x*Tx    + up.y*Ty    + up.z*Tz);
             const float dotF = -(fwd.x*Tx   + fwd.y*Ty   + fwd.z*Tz);
+            // NV-DXVK: same LH→RH view-space negation as path 1.
             transforms.worldToView = Matrix4(
-              Vector4(right.x, right.y, right.z, 0),
-              Vector4(up.x,    up.y,    up.z,    0),
-              Vector4(fwd.x,   fwd.y,   fwd.z,   0),
-              Vector4(dotR,    dotU,    dotF,    1));
+              Vector4( right.x,  right.y,  right.z, 0),
+              Vector4( up.x,     up.y,     up.z,    0),
+              Vector4(-fwd.x,   -fwd.y,   -fwd.z,   0),
+              Vector4( dotR,     dotU,    -dotF,    1));
 
             const float perspSign = raw[2][3] < 0 ? -1.0f : 1.0f;
             const float nearZ = 1.0f, farZ = 20000.0f;
             const float Q = farZ / (farZ - nearZ);
+            // NV-DXVK: m[2][2] must share sign with perspSign — see path 1.
             transforms.viewToProjection = Matrix4(
-              Vector4(Sx,   0, 0,          0),
-              Vector4(0,    Sy, 0,         0),
-              Vector4(0,    0, Q,          perspSign),
-              Vector4(0,    0, -nearZ*Q,   0));
+              Vector4(Sx,   0, 0,                   0),
+              Vector4(0,    Sy, 0,                  0),
+              Vector4(0,    0, perspSign * Q,       perspSign),
+              Vector4(0,    0, -nearZ*Q,            0));
 
             m_foundRealProjThisFrame = true;
             m_lastGoodTransforms = transforms;

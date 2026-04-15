@@ -367,12 +367,25 @@ namespace dxvk {
       if (sMainLatchLog < 40) {
         ++sMainLatchLog;
         const Vector3 pos = camera.getPosition(/*freecam=*/false);
+        // Print the basis rows of worldToView so we can verify orientation.
+        // Expected Vulkan view convention:
+        //   row0 (right)  ≈ (1,0,0) when camera faces world -Z
+        //   row1 (up)     ≈ (0,1,0)
+        //   row2 (back)   ≈ (0,0,1) (camera looks down -Z so back = +Z view)
+        // 45° roll = row0/row1 rotated around row2 axis.
+        const Matrix4& w = worldToView;
         Logger::info(str::format(
           "[CamMgr.latch] #", sMainLatchLog, " frame=", frameId,
           " pos=(", pos.x, ",", pos.y, ",", pos.z, ")",
           " fov=", decomposeProjectionParams.fov * (180.0f / 3.14159265f), "deg",
           " maxZ=", input.maxZ,
-          " cameraCut=", isCameraCut ? 1 : 0));
+          " cameraCut=", isCameraCut ? 1 : 0,
+          " right=(", w[0][0], ",", w[0][1], ",", w[0][2], ")",
+          " up=(",    w[1][0], ",", w[1][1], ",", w[1][2], ")",
+          " fwd=(",   w[2][0], ",", w[2][1], ",", w[2][2], ")",
+          " VP_m23=", viewToProjection[2][3],   // -1 = RH proj, +1 = LH proj
+          " VP_diag=(", viewToProjection[0][0], ",", viewToProjection[1][1], ",", viewToProjection[2][2], ")",
+          " VP_translateZ=", viewToProjection[3][2]));
       }
     }
 
