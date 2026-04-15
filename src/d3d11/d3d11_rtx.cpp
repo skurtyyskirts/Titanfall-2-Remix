@@ -1,5 +1,8 @@
 #include "d3d11_rtx.h"
 #include <set>
+#include <chrono>
+#include <fstream>
+#include <mutex>
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
 // sibling headers (included bare by rtx_utils.h) are already in the TU.
@@ -17,6 +20,9 @@
 
 #include "../dxvk/rtx_render/rtx_context.h"
 #include "../dxvk/rtx_render/rtx_options.h"
+#include "../dxvk/rtx_render/rtx_point_instancer_system.h"
+#include "../dxvk/rtx_render/rtx_materials.h"
+#include "../dxvk/rtx_render/rtx_debug_view.h"
 #include "../dxvk/rtx_render/rtx_camera.h"
 #include "../dxvk/rtx_render/rtx_camera_manager.h"
 #include "../dxvk/rtx_render/rtx_scene_manager.h"
@@ -27,6 +33,81 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+
+// NV-DXVK: scene dumper. Writes per-instance world-space triangles to
+// scene_dump.obj for offline inspection. Triggered automatically once the game
+// has been rendering for >5 seconds. Currently focused on BSP-style
+// (R32G32_UINT packed position + g_modelInst SRV) draws.
+namespace SceneDump {
+  static std::ofstream g_obj;
+  static std::mutex    g_mutex;
+  static uint32_t      g_baseVtx       = 0;
+  static uint32_t      g_objectsWritten = 0;
+  static bool          g_done          = false;
+  static std::chrono::steady_clock::time_point g_firstFrameTime;
+  static bool          g_armed         = false;
+
+  static const char* const kOutPath =
+    "C:/Users/Friss/Downloads/Compressed/Titanfall-2-Digital-Deluxe-Edition-AnkerGames/Titanfall2/scene_dump.obj";
+
+  static void armOnFirstGameplayFrame(uint32_t rawDraws) {
+    if (g_done || g_armed) return;
+    if (rawDraws < 50) return;  // skip menu frames
+    g_firstFrameTime = std::chrono::steady_clock::now();
+    g_armed = true;
+  }
+  static bool shouldDumpThisFrame() {
+    // NV-DXVK: disabled. Capture path kept compiled for easy re-enable.
+    return false;
+  }
+  static void open() {
+    if (!g_obj.is_open()) {
+      g_obj.open(kOutPath, std::ios::out | std::ios::trunc);
+      if (g_obj.is_open()) {
+        g_obj << "# Titanfall 2 BSP scene dump\n";
+        dxvk::Logger::info(dxvk::str::format("[SceneDump] writing to ", kOutPath));
+      } else {
+        dxvk::Logger::err(dxvk::str::format("[SceneDump] FAILED to open ", kOutPath));
+      }
+    }
+  }
+  // Emit a small unit-cube at (0,0,0) — that's where the camera lives in this
+  // dump's coordinate frame (geometry is camera-relative). Lets you eyeball
+  // distance from camera to BSP chunks in Blender/MeshLab.
+  static void writeCameraMarker() {
+    if (!g_obj.is_open()) return;
+    g_obj << "o CAMERA\n";
+    const float s = 8.0f; // unit cube edge half-size in world units
+    static const float corners[8][3] = {
+      {-s,-s,-s},{ s,-s,-s},{ s, s,-s},{-s, s,-s},
+      {-s,-s, s},{ s,-s, s},{ s, s, s},{-s, s, s},
+    };
+    for (int i = 0; i < 8; ++i)
+      g_obj << "v " << corners[i][0] << " " << corners[i][1] << " " << corners[i][2] << "\n";
+    const uint32_t b = g_baseVtx + 1;
+    // 12 triangles via 6 quads — splitting each into two
+    static const int faces[12][3] = {
+      {0,1,2},{0,2,3},  {4,6,5},{4,7,6},
+      {0,4,5},{0,5,1},  {2,6,7},{2,7,3},
+      {1,5,6},{1,6,2},  {0,3,7},{0,7,4},
+    };
+    for (int i = 0; i < 12; ++i)
+      g_obj << "f " << (b+faces[i][0]) << " " << (b+faces[i][1]) << " " << (b+faces[i][2]) << "\n";
+    g_baseVtx += 8;
+    ++g_objectsWritten;
+  }
+  static void close() {
+    if (g_obj.is_open()) {
+      g_obj.close();
+      g_done = true;
+      dxvk::Logger::info(dxvk::str::format(
+        "[SceneDump] done. ", g_objectsWritten, " objects, ", g_baseVtx, " vertices"));
+    }
+  }
+  static inline uint32_t decodeX(uint32_t u0)              { return u0 & 0x001FFFFFu; }
+  static inline uint32_t decodeY(uint32_t u0, uint32_t u1) { return ((u0 >> 21) & 0x7FFu) | ((u1 & 0x3FFu) << 11u); }
+  static inline uint32_t decodeZ(uint32_t u1)              { return u1 >> 10; }
+}
 
 namespace dxvk {
 
@@ -630,23 +711,194 @@ namespace dxvk {
                 " idx:", idxDumpLine,
                 " t31_T:", t31DumpLine));
             }
+            // NV-DXVK: scene dump. After 5s of gameplay, dump per-instance
+            // BSP geometry to OBJ. Skips skinned characters (their VBs aren't
+            // in immutable storage we can read here).
+            if (isModelInstFanout && !tforms->empty() && SceneDump::shouldDumpThisFrame()) {
+              std::lock_guard<std::mutex> lk(SceneDump::g_mutex);
+              const bool firstOpen = !SceneDump::g_obj.is_open();
+              SceneDump::open();
+              if (firstOpen && SceneDump::g_obj.is_open()) {
+                SceneDump::writeCameraMarker();
+              }
+              if (SceneDump::g_obj.is_open()) {
+                // Find the position semantic + its VB.
+                const D3D11RtxSemantic* posS = nullptr;
+                for (const auto& s : semantics) {
+                  if (!s.perInstance && s.format == VK_FORMAT_R32G32_UINT) { posS = &s; break; }
+                }
+                // Read VB + IB via immutable cache (BSP buffers are typically IMMUTABLE).
+                const uint8_t* posData = nullptr; size_t posLen = 0;
+                if (posS) {
+                  const auto& pvb = m_context->m_state.ia.vertexBuffers[posS->inputSlot];
+                  if (pvb.buffer != nullptr) {
+                    const auto& imm = pvb.buffer->GetImmutableData();
+                    if (!imm.empty()) {
+                      posData = imm.data() + pvb.offset + posS->byteOffset;
+                      posLen  = imm.size() - (pvb.offset + posS->byteOffset);
+                    }
+                  }
+                }
+                const uint8_t* idxData = nullptr; size_t idxLen = 0;
+                VkIndexType ixType = VK_INDEX_TYPE_UINT16;
+                if (indexed) {
+                  const auto& ib = m_context->m_state.ia.indexBuffer;
+                  if (ib.buffer != nullptr) {
+                    const auto& imm = ib.buffer->GetImmutableData();
+                    if (!imm.empty()) {
+                      idxData = imm.data() + ib.offset;
+                      idxLen  = imm.size() - ib.offset;
+                      // ib.format is DXGI_FORMAT, map to VkIndexType.
+                      ixType  = (ib.format == DXGI_FORMAT_R16_UINT)
+                                  ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+                    }
+                  }
+                }
+                if (posData && (!indexed || idxData)) {
+                  const uint32_t posStride = posS ? std::max<uint32_t>(8u, m_context->m_state.ia.vertexBuffers[posS->inputSlot].stride) : 8u;
+                  // Decode constants — match the VS shader: scale 1/1024, bias (-1024,-1024,-2048)
+                  const float kScale  = 1.0f / 1024.0f;
+                  const float kBiasZ  = -2048.0f;
+                  for (uint32_t inst = 0; inst < tforms->size(); ++inst) {
+                    const Matrix4& T = (*tforms)[inst];
+                    SceneDump::g_obj << "o BSP_" << SceneDump::g_objectsWritten++
+                                     << "_inst" << inst << "\n";
+                    // Determine vertex count: use either count (non-indexed) or
+                    // max index seen + 1 (indexed). For simplicity, dump the first
+                    // 'count' vertices for non-indexed; for indexed, dump every
+                    // referenced vertex as positions and emit triangles via faces.
+                    if (!indexed) {
+                      for (uint32_t v = 0; v < count; ++v) {
+                        size_t off = static_cast<size_t>(v) * posStride;
+                        if (off + 8 > posLen) break;
+                        const uint32_t* up = reinterpret_cast<const uint32_t*>(posData + off);
+                        uint32_t xi = SceneDump::decodeX(up[0]);
+                        uint32_t yi = SceneDump::decodeY(up[0], up[1]);
+                        uint32_t zi = SceneDump::decodeZ(up[1]);
+                        float lx = float(xi) * kScale - 1024.0f;
+                        float ly = float(yi) * kScale - 1024.0f;
+                        float lz = float(zi) * kScale + kBiasZ;
+                        float wx = T[0][0]*lx + T[1][0]*ly + T[2][0]*lz + T[3][0];
+                        float wy = T[0][1]*lx + T[1][1]*ly + T[2][1]*lz + T[3][1];
+                        float wz = T[0][2]*lx + T[1][2]*ly + T[2][2]*lz + T[3][2];
+                        SceneDump::g_obj << "v " << wx << " " << wy << " " << wz << "\n";
+                      }
+                      const uint32_t triCount = count / 3;
+                      for (uint32_t t = 0; t < triCount; ++t) {
+                        uint32_t a = SceneDump::g_baseVtx + t * 3 + 1;
+                        SceneDump::g_obj << "f " << a << " " << (a+1) << " " << (a+2) << "\n";
+                      }
+                      SceneDump::g_baseVtx += count;
+                    } else {
+                      // Indexed: scan to find max used vertex, emit those, then faces.
+                      const uint32_t idxStride = (ixType == VK_INDEX_TYPE_UINT16) ? 2u : 4u;
+                      uint32_t maxV = 0;
+                      for (uint32_t i = 0; i < count; ++i) {
+                        size_t io = static_cast<size_t>(start + i) * idxStride;
+                        if (io + idxStride > idxLen) { maxV = 0; break; }
+                        uint32_t idx = (idxStride == 2)
+                          ? *reinterpret_cast<const uint16_t*>(idxData + io)
+                          : *reinterpret_cast<const uint32_t*>(idxData + io);
+                        idx += static_cast<uint32_t>(std::max(base, 0));
+                        if (idx > maxV) maxV = idx;
+                      }
+                      const uint32_t vCount = maxV + 1;
+                      for (uint32_t v = 0; v < vCount; ++v) {
+                        size_t off = static_cast<size_t>(v) * posStride;
+                        if (off + 8 > posLen) break;
+                        const uint32_t* up = reinterpret_cast<const uint32_t*>(posData + off);
+                        uint32_t xi = SceneDump::decodeX(up[0]);
+                        uint32_t yi = SceneDump::decodeY(up[0], up[1]);
+                        uint32_t zi = SceneDump::decodeZ(up[1]);
+                        float lx = float(xi) * kScale - 1024.0f;
+                        float ly = float(yi) * kScale - 1024.0f;
+                        float lz = float(zi) * kScale + kBiasZ;
+                        float wx = T[0][0]*lx + T[1][0]*ly + T[2][0]*lz + T[3][0];
+                        float wy = T[0][1]*lx + T[1][1]*ly + T[2][1]*lz + T[3][1];
+                        float wz = T[0][2]*lx + T[1][2]*ly + T[2][2]*lz + T[3][2];
+                        SceneDump::g_obj << "v " << wx << " " << wy << " " << wz << "\n";
+                      }
+                      const uint32_t triCount = count / 3;
+                      for (uint32_t t = 0; t < triCount; ++t) {
+                        uint32_t i0base = (start + t * 3);
+                        size_t i0o = static_cast<size_t>(i0base + 0) * idxStride;
+                        size_t i1o = static_cast<size_t>(i0base + 1) * idxStride;
+                        size_t i2o = static_cast<size_t>(i0base + 2) * idxStride;
+                        if (i2o + idxStride > idxLen) break;
+                        uint32_t i0 = (idxStride == 2) ? *reinterpret_cast<const uint16_t*>(idxData + i0o) : *reinterpret_cast<const uint32_t*>(idxData + i0o);
+                        uint32_t i1 = (idxStride == 2) ? *reinterpret_cast<const uint16_t*>(idxData + i1o) : *reinterpret_cast<const uint32_t*>(idxData + i1o);
+                        uint32_t i2 = (idxStride == 2) ? *reinterpret_cast<const uint16_t*>(idxData + i2o) : *reinterpret_cast<const uint32_t*>(idxData + i2o);
+                        i0 += static_cast<uint32_t>(std::max(base, 0));
+                        i1 += static_cast<uint32_t>(std::max(base, 0));
+                        i2 += static_cast<uint32_t>(std::max(base, 0));
+                        SceneDump::g_obj << "f " << (SceneDump::g_baseVtx + i0 + 1) << " "
+                                                  << (SceneDump::g_baseVtx + i1 + 1) << " "
+                                                  << (SceneDump::g_baseVtx + i2 + 1) << "\n";
+                      }
+                      SceneDump::g_baseVtx += vCount;
+                    }
+                  }
+                }
+              }
+            }
+
+            // DEBUG: distance to closest geometry from camera, per VS.
+            // In the camera-relative world frame Remix uses, the camera sits
+            // at the origin — so |T| is the distance from camera to that
+            // instance. We also log the absolute-world camera origin (read
+            // from cb2.c_cameraOrigin earlier) for cross-reference with the
+            // GPU cull shader's `cameraPosition` (which comes from
+            // CameraManager and is in absolute world).
+            if (isModelInstFanout && !tforms->empty()) {
+              static std::unordered_set<uintptr_t> sDistLogged;
+              auto vsPtr7 = m_context->m_state.vs.shader;
+              uintptr_t key7 = (vsPtr7 != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr7.ptr()) : 0;
+              if (key7 && sDistLogged.size() < 12 && sDistLogged.insert(key7).second) {
+                float minDistSq = std::numeric_limits<float>::max();
+                float maxDistSq = 0.0f;
+                for (const Matrix4& tm : *tforms) {
+                  const float dx = tm[3][0], dy = tm[3][1], dz = tm[3][2];
+                  const float ds = dx*dx + dy*dy + dz*dz;
+                  if (ds < minDistSq) minDistSq = ds;
+                  if (ds > maxDistSq) maxDistSq = ds;
+                }
+                std::string vsHash7 = "?";
+                if (vsPtr7->GetCommonShader() != nullptr) {
+                  auto& s = vsPtr7->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsHash7 = s->getShaderKey().toString();
+                }
+                Logger::info(str::format(
+                  "[D3D11Rtx] BSP dist VS=", vsHash7,
+                  " tforms=", tforms->size(),
+                  " closest=", std::sqrt(minDistSq),
+                  " farthest=", std::sqrt(maxDistSq),
+                  " camOriginAbs=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
+                  " (camera in our frame is at origin; cullingRadius default is 5000)"));
+              }
+            }
             if (!tforms->empty()) {
-              // DEBUG: per-VS-hash fanout-submit log (first time per unique VS).
-              static std::unordered_set<uintptr_t> sFanoutVsLogged;
+              // NV-DXVK: log EVERY fanout submit (cap ~40 per session) so we can
+              // see which camera context each PI batch belongs to — main view vs
+              // shadow cascade. camOriginAbs is the absolute-world c_cameraOrigin
+              // read from the VS's CBufCommonPerCamera; its value distinguishes
+              // main camera from shadow cascades in TF2.
+              static uint32_t sFanoutLogCount = 0;
               auto vsPtr = m_context->m_state.vs.shader;
-              uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
-              if (key && sFanoutVsLogged.size() < 30 && sFanoutVsLogged.insert(key).second) {
+              if (sFanoutLogCount < 40) {
+                ++sFanoutLogCount;
                 std::string vsHash = "?";
-                if (vsPtr->GetCommonShader() != nullptr) {
+                if (vsPtr != nullptr && vsPtr->GetCommonShader() != nullptr) {
                   auto& s = vsPtr->GetCommonShader()->GetShader();
                   if (s != nullptr) vsHash = s->getShaderKey().toString();
                 }
                 Logger::info(str::format(
-                  "[D3D11Rtx] FanoutSubmit VS=", vsHash,
+                  "[D3D11Rtx] FanoutSubmit #", sFanoutLogCount,
+                  " VS=", vsHash,
                   " isModelInst=", isModelInstFanout ? 1 : 0,
                   " usedSlot=", usedSlot,
                   " tforms=", tforms->size(),
                   " idxFmt=", uint32_t(boneIdxSem->format),
+                  " camOriginAbs=(", camOrigin[0], ",", camOrigin[1], ",", camOrigin[2], ")",
                   " sample T0=(", (*tforms)[0][3][0], ",", (*tforms)[0][3][1], ",", (*tforms)[0][3][2], ")"));
               }
               // Keep alive via ring buffer
@@ -654,11 +906,15 @@ namespace dxvk {
               m_boneTransformRing[m_boneInstFrameId % 4].push_back(tforms);
 
               m_currentInstancesToObject = tforms.get();
+              // NV-DXVK: Carry ownership alongside the raw pointer so the RtInstance
+              // consuming this survives beyond the 4-frame ring buffer.
+              m_currentInstancesToObjectOwner = tforms;
               m_boneInstanceCount = static_cast<uint32_t>(tforms->size());
               m_boneInstTotal += m_boneInstanceCount;
               SubmitDraw(indexed, count, start, base);
               m_boneInstanceCount = 0;
               m_currentInstancesToObject = nullptr;
+              m_currentInstancesToObjectOwner.reset();
             }
             handledAsBoneInstancing = true;
           } else {
@@ -3712,6 +3968,125 @@ namespace dxvk {
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
 
+    // NV-DXVK: scene dump for cbuffer-based BSP draws (non-fanout). The
+    // bone-instance fanout dump above only catches g_modelInst-style draws.
+    // Anything that uses CBufModelInstance (cbuffer-based world matrix)
+    // never reaches the fanout — that's where ground/walls likely live.
+    // Skip if fanout already handled this draw.
+    if (m_currentInstancesToObject == nullptr
+        && SceneDump::shouldDumpThisFrame()
+        && posSem
+        && posSem->format == VK_FORMAT_R32G32_UINT) {
+      std::lock_guard<std::mutex> lk(SceneDump::g_mutex);
+      const bool firstOpen = !SceneDump::g_obj.is_open();
+      SceneDump::open();
+      if (firstOpen && SceneDump::g_obj.is_open()) {
+        SceneDump::writeCameraMarker();
+      }
+      if (SceneDump::g_obj.is_open()) {
+        const auto& pvb = m_context->m_state.ia.vertexBuffers[posSem->inputSlot];
+        const uint8_t* posData = nullptr; size_t posLen = 0;
+        if (pvb.buffer != nullptr) {
+          const auto& imm = pvb.buffer->GetImmutableData();
+          if (!imm.empty()) {
+            posData = imm.data() + pvb.offset + posSem->byteOffset;
+            posLen  = imm.size() - (pvb.offset + posSem->byteOffset);
+          }
+        }
+        const uint8_t* idxData = nullptr; size_t idxLen = 0;
+        VkIndexType ixType = VK_INDEX_TYPE_UINT16;
+        if (indexed) {
+          const auto& ib = m_context->m_state.ia.indexBuffer;
+          if (ib.buffer != nullptr) {
+            const auto& imm = ib.buffer->GetImmutableData();
+            if (!imm.empty()) {
+              idxData = imm.data() + ib.offset;
+              idxLen  = imm.size() - ib.offset;
+              ixType  = (ib.format == DXGI_FORMAT_R16_UINT)
+                          ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            }
+          }
+        }
+        if (posData && (!indexed || idxData)) {
+          const Matrix4& T = dcs.transformData.objectToWorld;
+          const uint32_t posStride = std::max<uint32_t>(8u, pvb.stride);
+          const float kScale = 1.0f / 1024.0f;
+          const float kBiasZ = -2048.0f;
+          SceneDump::g_obj << "o BSP_CB_" << SceneDump::g_objectsWritten++
+                           << "_v" << dcs.geometryData.vertexCount << "\n";
+          if (!indexed) {
+            for (uint32_t v = 0; v < count; ++v) {
+              size_t off = static_cast<size_t>(v) * posStride;
+              if (off + 8 > posLen) break;
+              const uint32_t* up = reinterpret_cast<const uint32_t*>(posData + off);
+              uint32_t xi = SceneDump::decodeX(up[0]);
+              uint32_t yi = SceneDump::decodeY(up[0], up[1]);
+              uint32_t zi = SceneDump::decodeZ(up[1]);
+              float lx = float(xi) * kScale - 1024.0f;
+              float ly = float(yi) * kScale - 1024.0f;
+              float lz = float(zi) * kScale + kBiasZ;
+              float wx = T[0][0]*lx + T[1][0]*ly + T[2][0]*lz + T[3][0];
+              float wy = T[0][1]*lx + T[1][1]*ly + T[2][1]*lz + T[3][1];
+              float wz = T[0][2]*lx + T[1][2]*ly + T[2][2]*lz + T[3][2];
+              SceneDump::g_obj << "v " << wx << " " << wy << " " << wz << "\n";
+            }
+            const uint32_t triCount = count / 3;
+            for (uint32_t t = 0; t < triCount; ++t) {
+              uint32_t a = SceneDump::g_baseVtx + t * 3 + 1;
+              SceneDump::g_obj << "f " << a << " " << (a+1) << " " << (a+2) << "\n";
+            }
+            SceneDump::g_baseVtx += count;
+          } else {
+            const uint32_t idxStride = (ixType == VK_INDEX_TYPE_UINT16) ? 2u : 4u;
+            uint32_t maxV = 0;
+            for (uint32_t i = 0; i < count; ++i) {
+              size_t io = static_cast<size_t>(start + i) * idxStride;
+              if (io + idxStride > idxLen) { maxV = 0; break; }
+              uint32_t idx = (idxStride == 2)
+                ? *reinterpret_cast<const uint16_t*>(idxData + io)
+                : *reinterpret_cast<const uint32_t*>(idxData + io);
+              idx += static_cast<uint32_t>(std::max(base, 0));
+              if (idx > maxV) maxV = idx;
+            }
+            const uint32_t vCount = maxV + 1;
+            for (uint32_t v = 0; v < vCount; ++v) {
+              size_t off = static_cast<size_t>(v) * posStride;
+              if (off + 8 > posLen) break;
+              const uint32_t* up = reinterpret_cast<const uint32_t*>(posData + off);
+              uint32_t xi = SceneDump::decodeX(up[0]);
+              uint32_t yi = SceneDump::decodeY(up[0], up[1]);
+              uint32_t zi = SceneDump::decodeZ(up[1]);
+              float lx = float(xi) * kScale - 1024.0f;
+              float ly = float(yi) * kScale - 1024.0f;
+              float lz = float(zi) * kScale + kBiasZ;
+              float wx = T[0][0]*lx + T[1][0]*ly + T[2][0]*lz + T[3][0];
+              float wy = T[0][1]*lx + T[1][1]*ly + T[2][1]*lz + T[3][1];
+              float wz = T[0][2]*lx + T[1][2]*ly + T[2][2]*lz + T[3][2];
+              SceneDump::g_obj << "v " << wx << " " << wy << " " << wz << "\n";
+            }
+            const uint32_t triCount = count / 3;
+            for (uint32_t t = 0; t < triCount; ++t) {
+              uint32_t i0base = (start + t * 3);
+              size_t i0o = static_cast<size_t>(i0base + 0) * idxStride;
+              size_t i1o = static_cast<size_t>(i0base + 1) * idxStride;
+              size_t i2o = static_cast<size_t>(i0base + 2) * idxStride;
+              if (i2o + idxStride > idxLen) break;
+              uint32_t i0 = (idxStride == 2) ? *reinterpret_cast<const uint16_t*>(idxData + i0o) : *reinterpret_cast<const uint32_t*>(idxData + i0o);
+              uint32_t i1 = (idxStride == 2) ? *reinterpret_cast<const uint16_t*>(idxData + i1o) : *reinterpret_cast<const uint32_t*>(idxData + i1o);
+              uint32_t i2 = (idxStride == 2) ? *reinterpret_cast<const uint16_t*>(idxData + i2o) : *reinterpret_cast<const uint32_t*>(idxData + i2o);
+              i0 += static_cast<uint32_t>(std::max(base, 0));
+              i1 += static_cast<uint32_t>(std::max(base, 0));
+              i2 += static_cast<uint32_t>(std::max(base, 0));
+              SceneDump::g_obj << "f " << (SceneDump::g_baseVtx + i0 + 1) << " "
+                                       << (SceneDump::g_baseVtx + i1 + 1) << " "
+                                       << (SceneDump::g_baseVtx + i2 + 1) << "\n";
+            }
+            SceneDump::g_baseVtx += vCount;
+          }
+        }
+      }
+    }
+
     // Reject NDC-space screen quads now that ExtractTransforms has cached the VP.
     if (isNdcScreenQuad) {
       BumpFilter(FilterReason::FullscreenQuad);
@@ -3837,6 +4212,8 @@ namespace dxvk {
       // we apply the inverse via objectToWorld. Each i2o[i] is already t31[i],
       // so objectToWorld = inv(worldToView) gives the same math.
       dcs.transformData.instancesToObject = m_currentInstancesToObject;
+      // NV-DXVK: Pass ownership too so it flows into RtInstance via instance_manager.
+      dcs.transformData.instancesToObjectOwner = m_currentInstancesToObjectOwner;
       // t31 is already the full world-space model transform.
       // objectToWorld = identity, instancesToObject = t31[i], done.
       dcs.transformData.objectToWorld = Matrix4();
@@ -4183,6 +4560,36 @@ namespace dxvk {
   void D3D11Rtx::EndFrame(const Rc<DxvkImage>& backbuffer) {
     const uint32_t draws = m_drawCallID;
     const uint32_t raw = m_rawDrawCount;
+    // NV-DXVK: arm/finalize the scene dumper.
+    SceneDump::armOnFirstGameplayFrame(raw);
+
+    // NV-DXVK: dump key rtx.conf options once we hit a real gameplay frame so
+    // we can verify the config file is actually being read.
+    {
+      static bool sCfgLogged = false;
+      if (!sCfgLogged && raw > 50) {
+        sCfgLogged = true;
+        Logger::info(str::format("[D3D11Rtx] rtx.conf state at first gameplay frame:"));
+        Logger::info(str::format("  rtx.pointInstancer.enable = ",
+          RtxPointInstancerSystem::enable() ? "True" : "False"));
+        Logger::info(str::format("  rtx.pointInstancer.cullingRadius = ",
+          RtxPointInstancerSystem::cullingRadius()));
+        Logger::info(str::format("  rtx.legacyMaterial.albedoConstant = (",
+          LegacyMaterialDefaults::albedoConstant().x, ",",
+          LegacyMaterialDefaults::albedoConstant().y, ",",
+          LegacyMaterialDefaults::albedoConstant().z, ")"));
+        Logger::info(str::format("  rtx.legacyMaterial.useAlbedoTextureIfPresent = ",
+          LegacyMaterialDefaults::useAlbedoTextureIfPresent() ? "True" : "False"));
+        Logger::info(str::format("  rtx.legacyMaterial.emissiveIntensity = ",
+          LegacyMaterialDefaults::emissiveIntensity()));
+        Logger::info(str::format("  rtx.debugView.debugViewIdx = ",
+          DebugView::debugViewIdx()));
+      }
+    }
+    if (SceneDump::g_obj.is_open() && !SceneDump::g_done) {
+      // Closes after the dump frame ends.
+      SceneDump::close();
+    }
     // Latch: once we see a gameplay-scale frame, log details for N frames.
     {
       static bool s_latched = false;

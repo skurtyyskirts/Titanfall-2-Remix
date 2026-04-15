@@ -116,8 +116,12 @@ namespace dxvk {
       ctx->writeToBuffer(m_transformsGpu, 0, transformsSize, batch.transforms->data());
 
       // Fill constant buffer
-      // When culling is disabled, use FLT_MAX so every instance passes the distance test.
-      const bool cullingEnabled = enable();
+      // NV-DXVK (debug): force cull-disable. The conf-driven `enable()` accessor
+      // is returning its hardcoded default (true) instead of the parsed config
+      // value (false), even though `Effective Combined Config` confirms the
+      // value reaches the option layer. Forcing here guarantees BSP doesn't
+      // get mask=0'd by distance cull while we figure out why.
+      const bool cullingEnabled = false; // was: enable();
       PointInstancerCullingConstants constants {};
       memcpy(&constants.objectToWorld, &batch.objectToWorld, sizeof(mat4));
       memcpy(&constants.prevObjectToWorld, &batch.prevObjectToWorld, sizeof(mat4));

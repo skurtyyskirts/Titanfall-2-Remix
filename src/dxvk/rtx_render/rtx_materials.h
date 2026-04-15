@@ -21,6 +21,7 @@
 */
 #pragma once
 
+#include <memory>
 #include "rtx_texture.h"
 #include "rtx_option.h"
 #include "rtx_cb_types.h"
@@ -482,6 +483,12 @@ struct RtSurface {
 
   // PointInstancer support - this surface may represent multiple instances, one for each transform in instancesToObject
   const std::vector<Matrix4>* instancesToObject = nullptr;
+  // NV-DXVK: Lifetime owner for instancesToObject when the pointer references
+  // storage whose lifetime is tied to the frame that created it (e.g. the d3d11
+  // bone-fanout path). Without this, the raw pointer above could dangle once
+  // the originating frame's transform buffer is recycled. Sources with external
+  // ownership leave this null.
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
   // on the GPU, multiple copies of this surface with different transforms will exist.  They will be in a continuous block, starting at surfaceIndexOfFirstInstance.
   size_t surfaceIndexOfFirstInstance = SIZE_MAX;
 };

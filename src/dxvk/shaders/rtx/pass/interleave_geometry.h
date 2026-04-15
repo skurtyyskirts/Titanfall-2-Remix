@@ -171,6 +171,16 @@ namespace interleaver {
       data = (data & 0xFF00FF00u) | (r << 16u) | b;
       return uint3(data, 0, 0);
     }
+    case SupportedVkFormats::VK_FORMAT_R32G32_UINT:
+      // NV-DXVK: Position-uint-read hijack (see rtx_geometry_utils.cpp around
+      // line 913): when source positions are R32G32_UINT, the color0 binding is
+      // repurposed as a uint read source for position decoding. Any actual
+      // color0 data path for this draw is bogus. Return full-white BGRA8 so
+      // that if isVertexColorBakedLighting is (incorrectly) treated as true,
+      // the surface receives full baked-light = visible geometry instead of
+      // near-zero (0x00000001) black. The previous fallback `uint3(1,1,1)`
+      // produced BGRA=(1,0,0,0) ≈ black → invisible BSP.
+      return uint3(0xFFFFFFFFu, 0, 0);
     }
     return uint3(1,1,1);
   }

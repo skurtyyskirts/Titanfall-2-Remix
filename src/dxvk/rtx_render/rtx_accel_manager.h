@@ -177,6 +177,27 @@ private:
   // the GPU culling shader fills them directly in the instance buffer.
   uint32_t m_pointInstancerSlotsPerType[Tlas::Count] = {};
 
+  // NV-DXVK (debug probe B): per-frame routing counters, reset at frame start.
+  static inline uint32_t s_probeB_addBlasCount = 0;
+  static inline uint32_t s_probeB_addPICount = 0;
+  static inline uint32_t s_probeB_addPIInstances = 0;
+
+  // NV-DXVK (debug probe E): handoff of the first PI batch's interleaved BLAS
+  // position buffer ref + meta from addPointInstancerBlas to dispatchPointInstancerCulling
+  // for GPU readback. Reset each frame at the start of mergeInstancesIntoBlas.
+  static inline Rc<DxvkBuffer> s_probeE_posBuffer;
+  static inline VkDeviceSize   s_probeE_posSliceOff = 0; // base offset of the slice
+  static inline uint32_t       s_probeE_posElemOff  = 0; // offsetFromSlice
+  static inline uint32_t       s_probeE_posStride   = 0;
+  static inline uint32_t       s_probeE_vertexCount = 0;
+  static inline VkFormat       s_probeE_posFormat   = VK_FORMAT_UNDEFINED;
+  static inline uint64_t       s_probeE_blasRef     = 0; // for cross-referencing with PI-batch logs
+
+  // NV-DXVK (debug probe F): baseSurfaceIndex of the probeE batch, so we can
+  // read back the corresponding surface template from m_surfaceBuffer.
+  static inline uint32_t       s_probeF_baseSurfaceIndex = 0;
+  static inline bool           s_probeF_valid = false;
+
   Rc<DxvkBuffer> m_vkInstanceBuffer; // Note: Holds Vulkan AS Instances, not RtInstances
   Rc<DxvkBuffer> m_surfaceBuffer;
   Rc<DxvkBuffer> m_surfaceMappingBuffer;

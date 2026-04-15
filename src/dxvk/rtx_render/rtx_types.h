@@ -496,6 +496,11 @@ struct DrawCallTransforms {
   Vector4 clipPlane{ 0.f };
   TexGenMode texgenMode = TexGenMode::None;
   const std::vector<Matrix4>* instancesToObject = nullptr;
+  // NV-DXVK: Optional lifetime owner for instancesToObject. When set, keeps the
+  // backing storage alive as long as this DrawCallState / the RtInstance it feeds
+  // exists. Sources whose storage has external lifetime (e.g. USD replacements)
+  // can leave this null and only fill instancesToObject.
+  std::shared_ptr<const std::vector<Matrix4>> instancesToObjectOwner;
 
   void sanitize() {
     if (objectToWorld[3][3] == 0.f) objectToWorld[3][3] = 1.f;

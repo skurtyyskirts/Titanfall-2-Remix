@@ -586,8 +586,50 @@ namespace dxvk
     float cameraParams[PROJ_NUM];
     DecomposeProjection(NDC_D3D, NDC_D3D, *reinterpret_cast<float4x4*>(&floatModifiedViewToProj), &flags, cameraParams, nullptr, nullptr, nullptr, nullptr);
 
+    // NV-DXVK: Reverse-Z games (TF2, flags=PROJ_REVERSED_Z) can have negative
+    // zNear and angles reported in swapped sign pairs. The raw angle ordering
+    // is therefore not a reliable guard — what matters is whether the final
+    // frustum bounds SetupByFrustum sees (xmin = tan(angleMinX) * zNear, etc.)
+    // satisfy left < right. Compute those and gate on that. Only fall back to
+    // the game's original projection for truly-broken matrices (NaN/Inf or
+    // zero-width frustum).
+    const float kMinNearOverride = std::min(RtxOptions::nearPlaneOverride(), cameraParams[PROJ_ZNEAR]);
+    const float probeNear = kMinNearOverride; // SetupByAngles uses the value passed in, not PROJ_ZNEAR
+    const float xminF = std::tan(cameraParams[PROJ_ANGLEMINX]) * probeNear;
+    const float xmaxF = std::tan(cameraParams[PROJ_ANGLEMAXX]) * probeNear;
+    const float yminF = std::tan(cameraParams[PROJ_ANGLEMINY]) * probeNear;
+    const float ymaxF = std::tan(cameraParams[PROJ_ANGLEMAXY]) * probeNear;
+    const bool degenerate =
+      !(xminF < xmaxF) ||
+      !(yminF < ymaxF) ||
+      !std::isfinite(xminF) || !std::isfinite(xmaxF) ||
+      !std::isfinite(yminF) || !std::isfinite(ymaxF) ||
+      !std::isfinite(cameraParams[PROJ_ZNEAR]) ||
+      !std::isfinite(cameraParams[PROJ_ZFAR]);
+    if (degenerate) {
+      static uint32_t sDegenNearCount = 0;
+      if (sDegenNearCount < 20) {
+        ++sDegenNearCount;
+        const Matrix4& m = floatModifiedViewToProj;
+        Logger::err(str::format(
+          "[RtCamera::overrideNearPlane] DEGENERATE projection #", sDegenNearCount,
+          " flags=0x", std::hex, flags, std::dec,
+          " angles=(minX=", cameraParams[PROJ_ANGLEMINX], ", maxX=", cameraParams[PROJ_ANGLEMAXX],
+          ", minY=", cameraParams[PROJ_ANGLEMINY], ", maxY=", cameraParams[PROJ_ANGLEMAXY], ")",
+          " zNear=", cameraParams[PROJ_ZNEAR],
+          " zFar=", cameraParams[PROJ_ZFAR],
+          " matrix=[",
+            "(", m[0][0], ",", m[0][1], ",", m[0][2], ",", m[0][3], ") ",
+            "(", m[1][0], ",", m[1][1], ",", m[1][2], ",", m[1][3], ") ",
+            "(", m[2][0], ",", m[2][1], ",", m[2][2], ",", m[2][3], ") ",
+            "(", m[3][0], ",", m[3][1], ",", m[3][2], ",", m[3][3], ")]"));
+      }
+      return modifiedViewToProj;
+    }
+
     // Prevent user controls exceeding the near plane distance from original projection
-    const float minNearPlane = std::min(RtxOptions::nearPlaneOverride(), cameraParams[PROJ_ZNEAR]);
+    // (kMinNearOverride was already computed above for the degeneracy probe.)
+    const float minNearPlane = kMinNearOverride;
 
     float4x4 newProjection;
     newProjection.SetupByAngles(cameraParams[PROJ_ANGLEMINX], cameraParams[PROJ_ANGLEMAXX], cameraParams[PROJ_ANGLEMINY], cameraParams[PROJ_ANGLEMAXY], minNearPlane, cameraParams[PROJ_ZFAR], flags);
@@ -956,11 +998,53 @@ namespace dxvk
     float cameraParams[PROJ_NUM];
     DecomposeProjection(NDC_D3D, NDC_D3D, *reinterpret_cast<float4x4*>(&floatModifiedViewToProj), &flags, cameraParams, nullptr, nullptr, nullptr, nullptr);
 
+    // NV-DXVK: Same degeneracy guard as overrideNearPlane. Evaluate what
+    // SetupByFrustum will actually see (xmin/xmax after tan*zNear with the
+    // reverse-Z sign flip) rather than raw angle ordering, so we don't bail
+    // out for valid reverse-Z matrices where min/max are symmetric and zNear
+    // is negative.
+    const float probeNearVol = cameraParams[PROJ_ZNEAR];
+    const float xminFV = std::tan(cameraParams[PROJ_ANGLEMINX]) * probeNearVol;
+    const float xmaxFV = std::tan(cameraParams[PROJ_ANGLEMAXX]) * probeNearVol;
+    const float yminFV = std::tan(cameraParams[PROJ_ANGLEMINY]) * probeNearVol;
+    const float ymaxFV = std::tan(cameraParams[PROJ_ANGLEMAXY]) * probeNearVol;
+    const bool degenerateVol =
+      !(xminFV < xmaxFV) ||
+      !(yminFV < ymaxFV) ||
+      !std::isfinite(xminFV) || !std::isfinite(xmaxFV) ||
+      !std::isfinite(yminFV) || !std::isfinite(ymaxFV) ||
+      !std::isfinite(cameraParams[PROJ_ZNEAR]) ||
+      !std::isfinite(cameraParams[PROJ_ZFAR]);
+    if (degenerateVol) {
+      static uint32_t sDegenVolCount = 0;
+      if (sDegenVolCount < 20) {
+        ++sDegenVolCount;
+        const Matrix4& m = floatModifiedViewToProj;
+        Logger::err(str::format(
+          "[RtCamera::getVolumeDefinitionCamera] DEGENERATE projection #", sDegenVolCount,
+          " flags=0x", std::hex, flags, std::dec,
+          " angles=(minX=", cameraParams[PROJ_ANGLEMINX], ", maxX=", cameraParams[PROJ_ANGLEMAXX],
+          ", minY=", cameraParams[PROJ_ANGLEMINY], ", maxY=", cameraParams[PROJ_ANGLEMAXY], ")",
+          " zNear=", cameraParams[PROJ_ZNEAR],
+          " zFar=", cameraParams[PROJ_ZFAR],
+          " matrix=[",
+            "(", m[0][0], ",", m[0][1], ",", m[0][2], ",", m[0][3], ") ",
+            "(", m[1][0], ",", m[1][1], ",", m[1][2], ",", m[1][3], ") ",
+            "(", m[2][0], ",", m[2][1], ",", m[2][2], ",", m[2][3], ") ",
+            "(", m[3][0], ",", m[3][1], ",", m[3][2], ",", m[3][3], ")]"));
+      }
+    }
+
     // Prevent user controls exceeding the far plane distance from original projection
     const float minFarPlane = std::min(maxDistance, cameraParams[PROJ_ZFAR]);
 
     float4x4 newProjection;
-    newProjection.SetupByAngles(cameraParams[PROJ_ANGLEMINX], cameraParams[PROJ_ANGLEMAXX], cameraParams[PROJ_ANGLEMINY], cameraParams[PROJ_ANGLEMAXY], cameraParams[PROJ_ZNEAR], minFarPlane, flags);
+    if (degenerateVol) {
+      // Use the original projection unchanged for camera.viewToProjection below.
+      memcpy(&newProjection, &floatModifiedViewToProj, sizeof(float4x4));
+    } else {
+      newProjection.SetupByAngles(cameraParams[PROJ_ANGLEMINX], cameraParams[PROJ_ANGLEMAXX], cameraParams[PROJ_ANGLEMINY], cameraParams[PROJ_ANGLEMAXY], cameraParams[PROJ_ZNEAR], minFarPlane, flags);
+    }
 
     memcpy(&floatModifiedViewToProj, &newProjection, sizeof(float4x4));
 

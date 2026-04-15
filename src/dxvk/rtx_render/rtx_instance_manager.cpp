@@ -996,6 +996,11 @@ namespace dxvk {
                                        MaterialData& materialData) {
     currentInstance.m_categoryFlags = drawCall.getCategoryFlags();
     currentInstance.surface.instancesToObject = drawCall.getTransformData().instancesToObject;
+    // NV-DXVK: Couple lifetime of the transform vector to this RtInstance so the
+    // raw pointer above cannot dangle once the draw-call source's own ring-buffer
+    // releases its reference. Null for sources with externally-owned storage
+    // (USD replacements, etc.) — that's fine, they already manage lifetime.
+    currentInstance.surface.instancesToObjectOwner = drawCall.getTransformData().instancesToObjectOwner;
 
     // setFrameLastUpdated() must be called first as it resets instance's state on a first call in a frame
     const bool isFirstUpdateThisFrame = currentInstance.setFrameLastUpdated(m_device->getCurrentFrameId());

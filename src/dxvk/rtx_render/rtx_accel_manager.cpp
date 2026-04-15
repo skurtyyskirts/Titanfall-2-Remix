@@ -430,6 +430,40 @@ namespace dxvk {
     m_reorderedSurfacesFirstIndexOffset.clear();
     m_pointInstancerBatches.clear();
     memset(m_pointInstancerSlotsPerType, 0, sizeof(m_pointInstancerSlotsPerType));
+
+    // NV-DXVK (debug probe B): emit previous frame's addBlas vs addPI routing counts,
+    // then reset. Logs every frame so we see BSP-fanout survival across the session.
+    {
+      static uint32_t sProbeBFrame = 0;
+      static uint32_t sProbeBLastLogFrame = 0xFFFFFFFFu;
+      if (sProbeBFrame != sProbeBLastLogFrame) {
+        // Always log (lightweight, ~1 line per frame): addBlas count, PI count, total PI instances, bucket/instance totals.
+        Logger::info(str::format(
+          "[PI-route] frame=", sProbeBFrame,
+          " addBlas=", s_probeB_addBlasCount,
+          " addPI=", s_probeB_addPICount,
+          " PI_instances=", s_probeB_addPIInstances,
+          " totalRtInstances=", instances.size()));
+        sProbeBLastLogFrame = sProbeBFrame;
+      }
+      ++sProbeBFrame;
+      s_probeB_addBlasCount = 0;
+      s_probeB_addPICount = 0;
+      s_probeB_addPIInstances = 0;
+    }
+
+    // NV-DXVK (debug probe E): clear last frame's captured BLAS position buffer
+    // ref so the readback path in dispatchPointInstancerCulling doesn't dereference
+    // a stale Rc on a frame with zero PI batches.
+    s_probeE_posBuffer    = nullptr;
+    s_probeE_posSliceOff  = 0;
+    s_probeE_posElemOff   = 0;
+    s_probeE_posStride    = 0;
+    s_probeE_vertexCount  = 0;
+    s_probeE_posFormat    = VK_FORMAT_UNDEFINED;
+    s_probeE_blasRef      = 0;
+    s_probeF_baseSurfaceIndex = 0;
+    s_probeF_valid = false;
     for (auto& instances : m_mergedInstances) {
       instances.clear();
     }
@@ -670,8 +704,34 @@ namespace dxvk {
         // Append an instance of this merged BLAS to the merged instance list
         if (rtInstance->surface.instancesToObject == nullptr) {
           addBlas(rtInstance, blasEntry, nullptr);
+          // NV-DXVK (debug probe B): count routing per frame.
+          ++s_probeB_addBlasCount;
         } else {
-          addPointInstancerBlas(rtInstance, blasEntry);
+          // NV-DXVK (debug probe C): bypass the GPU PointInstancer culling path and
+          // expand into N CPU-side addBlas entries. Known-good path (bone characters
+          // render via this). If BSP becomes visible with this, the bug is in the GPU
+          // culling/surface-copy shader. If BSP still invisible, bug is earlier.
+          constexpr bool kProbeC_BypassPI = false;
+          if (kProbeC_BypassPI) {
+            // Expand PI transforms into N CPU-side addBlas entries. We permanently
+            // null instancesToObject on this RtInstance so ALL downstream passes
+            // (uploadSurfaceData, surface-index mapping) treat each slot as a normal
+            // non-PI surface. The shared_ptr owner still keeps storage alive; the
+            // raw pointer is re-set next frame when the draw is resubmitted.
+            const auto* xformsPtr = rtInstance->surface.instancesToObject;
+            rtInstance->surface.instancesToObject = nullptr;
+            rtInstance->surface.surfaceIndexOfFirstInstance = SIZE_MAX;
+            for (uint32_t i = 0; i < xformsPtr->size(); ++i) {
+              addBlas(rtInstance, blasEntry, &(*xformsPtr)[i]);
+            }
+            ++s_probeB_addBlasCount;
+            s_probeB_addPIInstances += static_cast<uint32_t>(xformsPtr->size());
+          } else {
+            addPointInstancerBlas(rtInstance, blasEntry);
+            // NV-DXVK (debug probe B): count routing per frame.
+            ++s_probeB_addPICount;
+            s_probeB_addPIInstances += static_cast<uint32_t>(rtInstance->surface.instancesToObject->size());
+          }
         }
       }
 
@@ -978,8 +1038,10 @@ namespace dxvk {
     // Allocate the instance buffer and copy its contents from host to device memory
     // STORAGE_BUFFER_BIT is required for the PointInstancer GPU culling compute shader
     // which writes VkAccelerationStructureInstanceKHR entries directly into this buffer.
+    // NV-DXVK (debug probe D): TRANSFER_SRC_BIT added so readback copies are legal.
     DxvkBufferCreateInfo info;
     info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+               | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
                | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -1049,7 +1111,414 @@ namespace dxvk {
     RtxPointInstancerSystem& system = m_device->getCommon()->metaPointInstancerSystem();
     const Vector3 cameraPos = cameraManager.getMainCamera().getPosition();
 
+    // NV-DXVK (debug probe A): summary log every ~60 frames showing whether PI dispatch runs.
+    {
+      static uint32_t sDispatchFrame = 0;
+      if ((sDispatchFrame++ % 60) == 0) {
+        uint32_t totalInst = 0;
+        for (const auto& b : m_pointInstancerBatches) totalInst += b.instanceCount;
+        Logger::info(str::format(
+          "[PI-dispatch] frame=", sDispatchFrame,
+          " batches=", m_pointInstancerBatches.size(),
+          " totalInstances=", totalInst,
+          " slotsPerType=[", m_pointInstancerSlotsPerType[0], ",",
+                              m_pointInstancerSlotsPerType[1], ",",
+                              m_pointInstancerSlotsPerType[2], "]",
+          " camPos=(", cameraPos.x, ",", cameraPos.y, ",", cameraPos.z, ")"));
+      }
+    }
+
     system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos);
+
+    // NV-DXVK (debug probe D): DISABLED — readback served its purpose. Enable
+    // by flipping the `if (false)` below. Source buffers now have TRANSFER_SRC_BIT.
+    if (false) {
+      static constexpr uint32_t kRingSize = 3;
+      static constexpr uint32_t kProbeBytesPerEntry = sizeof(VkAccelerationStructureInstanceKHR); // 64
+      static constexpr uint32_t kProbeEntries = 4;
+      static constexpr uint32_t kProbeSize = kProbeBytesPerEntry * kProbeEntries;
+      static Rc<DxvkBuffer> sStaging[kRingSize];
+      static uint32_t sCaptureBatchIdxInType[kRingSize] = {};
+      static uint32_t sCaptureTlasType[kRingSize] = {};
+      static bool sCaptureValid[kRingSize] = {};
+      static uint32_t sProbeDFrame = 0;
+      const uint32_t writeSlot = sProbeDFrame % kRingSize;
+      const uint32_t readSlot  = (sProbeDFrame + 1) % kRingSize; // oldest of the ring
+
+      // Lazily create the staging buffers.
+      for (uint32_t i = 0; i < kRingSize; ++i) {
+        if (sStaging[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = kProbeSize;
+          sStaging[i] = m_device->createBuffer(
+            info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "Probe D - PI TLAS Readback Staging");
+        }
+      }
+
+      // Read back the oldest slot (written 2+ frames ago). Gate logging to
+      // once every ~120 dispatches so the log isn't flooded.
+      const bool logThisFrame = (sProbeDFrame % 60 == 0);
+      if (sCaptureValid[readSlot] && logThisFrame) {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(sStaging[readSlot]->mapPtr(0));
+        if (data != nullptr) {
+          for (uint32_t e = 0; e < kProbeEntries; ++e) {
+            const uint8_t* p = data + e * kProbeBytesPerEntry;
+            float t[12];
+            memcpy(t, p, sizeof(t)); // 3x4 row-major transform
+            uint32_t customIdxAndMask, sbtAndFlags, blasRefLo, blasRefHi;
+            memcpy(&customIdxAndMask, p + 48, 4);
+            memcpy(&sbtAndFlags,      p + 52, 4);
+            memcpy(&blasRefLo,        p + 56, 4);
+            memcpy(&blasRefHi,        p + 60, 4);
+            const uint32_t surfaceIdx = customIdxAndMask & 0x00FFFFFFu;
+            const uint32_t mask       = (customIdxAndMask >> 24) & 0xFFu;
+            Logger::info(str::format(
+              "[PI-readback] tlasType=", sCaptureTlasType[readSlot],
+              " firstIdx=", sCaptureBatchIdxInType[readSlot],
+              " e=", e,
+              " T=(", t[3], ",", t[7], ",", t[11], ")",
+              " r0=(", t[0], ",", t[1], ",", t[2], ")",
+              " surfaceIdx=", surfaceIdx,
+              " mask=", mask,
+              " sbtAndFlags=0x", std::hex, sbtAndFlags, std::dec,
+              " blasRef=0x", std::hex, (uint64_t(blasRefHi) << 32) | blasRefLo, std::dec));
+          }
+        }
+        sCaptureValid[readSlot] = false;
+      }
+
+      // Issue a GPU copy from m_vkInstanceBuffer into this frame's write slot.
+      // We capture the first PI batch's region (first kProbeEntries entries of it).
+      if (!m_pointInstancerBatches.empty()) {
+        const PointInstancerBatch& b0 = m_pointInstancerBatches.front();
+        const uint32_t byteOff = b0.instanceBufferByteOffset;
+        if (byteOff + kProbeSize <= m_vkInstanceBuffer->info().size) {
+          // Barrier: GPU culling writes (shader write) → transfer read.
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+          ctx->copyBuffer(sStaging[writeSlot], 0, m_vkInstanceBuffer, byteOff, kProbeSize);
+          sCaptureValid[writeSlot] = true;
+          sCaptureBatchIdxInType[writeSlot] = b0.firstIndexInType;
+          sCaptureTlasType[writeSlot] = b0.tlasType;
+        }
+      }
+      ++sProbeDFrame;
+    }
+
+    // NV-DXVK (debug probe E): DISABLED — BLAS position buffer likely lacks
+    // TRANSFER_SRC_BIT. Readback served its purpose.
+    if (false && s_probeE_posBuffer.ptr() != nullptr && s_probeE_vertexCount > 0) {
+      static constexpr uint32_t kProbeERingSize = 3;
+      static constexpr uint32_t kProbeEVerts    = 8;
+      static Rc<DxvkBuffer> sStagingE[kProbeERingSize];
+      static uint32_t sStagingEBytes[kProbeERingSize] = {};
+      static uint32_t sStagingEStride[kProbeERingSize] = {};
+      static uint32_t sStagingEVtxCount[kProbeERingSize] = {};
+      static VkFormat sStagingEFmt[kProbeERingSize] = {};
+      static uint64_t sStagingEBlasRef[kProbeERingSize] = {};
+      static bool sStagingEValid[kProbeERingSize] = {};
+      static uint32_t sProbeEFrame = 0;
+      const uint32_t writeE = sProbeEFrame % kProbeERingSize;
+      const uint32_t readE  = (sProbeEFrame + 1) % kProbeERingSize;
+
+      const uint32_t copyVerts = std::min<uint32_t>(kProbeEVerts, s_probeE_vertexCount);
+      const uint32_t copyBytes = copyVerts * s_probeE_posStride;
+
+      // Lazy-allocate staging buffers (size enough for any probe).
+      const uint32_t kMaxBytes = kProbeEVerts * 64; // 64 byte stride upper bound
+      for (uint32_t i = 0; i < kProbeERingSize; ++i) {
+        if (sStagingE[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = kMaxBytes;
+          sStagingE[i] = m_device->createBuffer(
+            info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "Probe E - PI BLAS Position Readback");
+        }
+      }
+
+      // Read the oldest slot.
+      const bool logE = (sProbeEFrame % 60 == 0);
+      if (sStagingEValid[readE] && logE) {
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(sStagingE[readE]->mapPtr(0));
+        if (data != nullptr) {
+          const uint32_t verts = sStagingEBytes[readE] / std::max<uint32_t>(1u, sStagingEStride[readE]);
+          for (uint32_t v = 0; v < verts; ++v) {
+            const uint8_t* p = data + v * sStagingEStride[readE];
+            float x, y, z;
+            memcpy(&x, p + 0, 4);
+            memcpy(&y, p + 4, 4);
+            memcpy(&z, p + 8, 4);
+            // Layout: pos float3 [0..11] | texcoord [12..19] | color0 [20..23]
+            // When stride is 24, color0 sits at byte offset 20 as BGRA_UNORM8.
+            // Decode whichever bytes exist at the end of the element.
+            const uint32_t stride = sStagingEStride[readE];
+            uint32_t col0 = 0;
+            float tcU = 0.f, tcV = 0.f;
+            if (stride >= 20) { memcpy(&tcU, p + 12, 4); memcpy(&tcV, p + 16, 4); }
+            if (stride >= 24) { memcpy(&col0, p + 20, 4); }
+            const uint8_t colB = uint8_t((col0 >>  0) & 0xFFu);
+            const uint8_t colG = uint8_t((col0 >>  8) & 0xFFu);
+            const uint8_t colR = uint8_t((col0 >> 16) & 0xFFu);
+            const uint8_t colA = uint8_t((col0 >> 24) & 0xFFu);
+            Logger::info(str::format(
+              "[PI-vbreadback] blasRef=0x", std::hex, sStagingEBlasRef[readE], std::dec,
+              " v=", v,
+              " stride=", stride,
+              " fmt=", uint32_t(sStagingEFmt[readE]),
+              " vtxCount=", sStagingEVtxCount[readE],
+              " pos=(", x, ",", y, ",", z, ")",
+              " uv=(", tcU, ",", tcV, ")",
+              " col0 BGRA=(", int(colB), ",", int(colG), ",", int(colR), ",", int(colA), ")",
+              " col0raw=0x", std::hex, col0, std::dec));
+          }
+        }
+        sStagingEValid[readE] = false;
+      }
+
+      // Issue copy from BLAS position buffer into write slot.
+      if (copyBytes > 0 && copyBytes <= kMaxBytes) {
+        const VkDeviceSize srcOffset = s_probeE_posSliceOff + s_probeE_posElemOff;
+        if (srcOffset + copyBytes <= s_probeE_posBuffer->info().size) {
+          // The BLAS position buffer is written by the interleaver compute pass
+          // before BLAS build. Barrier: shader write → transfer read.
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT);
+          ctx->copyBuffer(sStagingE[writeE], 0, s_probeE_posBuffer, srcOffset, copyBytes);
+          sStagingEValid[writeE]    = true;
+          sStagingEBytes[writeE]    = copyBytes;
+          sStagingEStride[writeE]   = s_probeE_posStride;
+          sStagingEVtxCount[writeE] = s_probeE_vertexCount;
+          sStagingEFmt[writeE]      = s_probeE_posFormat;
+          sStagingEBlasRef[writeE]  = s_probeE_blasRef;
+        }
+      }
+      ++sProbeEFrame;
+    }
+
+    // NV-DXVK (debug probe F): DISABLED — readback served its purpose.
+    if (false && s_probeF_valid && m_surfaceBuffer != nullptr) {
+      static constexpr uint32_t kProbeFRingSize = 3;
+      static constexpr uint32_t kProbeFBytes    = 256; // kSurfaceGPUSize
+      static Rc<DxvkBuffer> sStagingF[kProbeFRingSize];
+      static uint32_t sStagingFBaseIdx[kProbeFRingSize] = {};
+      static uint64_t sStagingFBlasRef[kProbeFRingSize] = {};
+      static bool sStagingFValid[kProbeFRingSize] = {};
+      static uint32_t sProbeFFrame = 0;
+      const uint32_t writeF = sProbeFFrame % kProbeFRingSize;
+      const uint32_t readF  = (sProbeFFrame + 1) % kProbeFRingSize;
+
+      for (uint32_t i = 0; i < kProbeFRingSize; ++i) {
+        if (sStagingF[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = kProbeFBytes;
+          sStagingF[i] = m_device->createBuffer(
+            info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "Probe F - PI Surface Template Readback");
+        }
+      }
+
+      // Log once every ~120 dispatches.
+      const bool logF = (sProbeFFrame % 60 == 0);
+      if (sStagingFValid[readF] && logF) {
+        const uint8_t* d = reinterpret_cast<const uint8_t*>(sStagingF[readF]->mapPtr(0));
+        if (d != nullptr) {
+          // Parse per RtSurface::writeGPUData layout:
+          uint16_t positionBufferIndex, previousPositionBufferIndex, normalBufferIndex,
+                   texcoordBufferIndex, indexBufferIndex, color0BufferIndex, flags0, packedHash;
+          memcpy(&positionBufferIndex,         d + 0,  2);
+          memcpy(&previousPositionBufferIndex, d + 2,  2);
+          memcpy(&normalBufferIndex,           d + 4,  2);
+          memcpy(&texcoordBufferIndex,         d + 6,  2);
+          memcpy(&indexBufferIndex,            d + 8,  2);
+          memcpy(&color0BufferIndex,           d + 10, 2);
+          memcpy(&flags0,                      d + 12, 2);
+          memcpy(&packedHash,                  d + 14, 2);
+          uint32_t positionOffset, normalOffset, texcoordOffset, color0Offset, objectPickingValue;
+          memcpy(&positionOffset,     d + 16, 4);
+          memcpy(&normalOffset,       d + 20, 4);
+          memcpy(&texcoordOffset,     d + 24, 4);
+          memcpy(&color0Offset,       d + 28, 4);
+          memcpy(&objectPickingValue, d + 32, 4);
+          uint8_t positionStride = d[36];
+          uint8_t normalStride   = d[37];
+          uint8_t texcoordStride = d[38];
+          uint8_t color0Stride   = d[39];
+          // firstIndex is a 24-bit little-endian value packed with indexStride in the 4 bytes at offset 40.
+          uint32_t firstIndex24  = d[40] | (uint32_t(d[41]) << 8) | (uint32_t(d[42]) << 16);
+          uint8_t indexStride    = d[43];
+          uint32_t flags1;
+          memcpy(&flags1, d + 44, 4);
+          Logger::info(str::format(
+            "[PI-surf] blasRef=0x", std::hex, sStagingFBlasRef[readF], std::dec,
+            " base=", sStagingFBaseIdx[readF],
+            " posBufIdx=", positionBufferIndex,
+            " prevPosBufIdx=", previousPositionBufferIndex,
+            " nrmBufIdx=", normalBufferIndex,
+            " tcBufIdx=", texcoordBufferIndex,
+            " idxBufIdx=", indexBufferIndex,
+            " col0BufIdx=", color0BufferIndex,
+            " flags0=0x", std::hex, flags0, std::dec,
+            " hash=0x", std::hex, packedHash, std::dec,
+            " posOff=", positionOffset,
+            " firstIdx=", firstIndex24,
+            " strides(p,n,t,c,i)=", int(positionStride), ",", int(normalStride), ",",
+                                     int(texcoordStride), ",", int(color0Stride), ",",
+                                     int(indexStride),
+            " flags1=0x", std::hex, flags1, std::dec));
+        }
+        sStagingFValid[readF] = false;
+      }
+
+      // Issue the readback copy.
+      const VkDeviceSize srcOffset = VkDeviceSize(s_probeF_baseSurfaceIndex) * kProbeFBytes;
+      if (srcOffset + kProbeFBytes <= m_surfaceBuffer->info().size) {
+        // Barrier: compute writes (GPU culling copies template into per-instance
+        // slots; it also reads the template) → transfer read. Same barrier as E.
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_READ_BIT);
+        ctx->copyBuffer(sStagingF[writeF], 0, m_surfaceBuffer, srcOffset, kProbeFBytes);
+        sStagingFValid[writeF]   = true;
+        sStagingFBaseIdx[writeF] = s_probeF_baseSurfaceIndex;
+        sStagingFBlasRef[writeF] = s_probeE_blasRef;
+      }
+      ++sProbeFFrame;
+    }
+
+    // NV-DXVK (debug probe G): read back the MATERIAL template from
+    // surfaceMaterialBuffer at baseSurfaceIndex for the probeE/F batch.
+    // kSurfaceMaterialGPUSize = 64 bytes. Material layout (opaque) per
+    // rtx_materials.h:574:
+    //   word 0 = flags (low byte = surfaceMaterialTypeX; upper bits = feature flags)
+    //   word 1 = samplerIndex
+    //   word 2 = albedoOpacityTextureIndex
+    //   word 3 = secondaryTextureIndex
+    //   words 4-7 = albedoOpacityConstant (rgba fp16)
+    //   word 12 = emissiveColorTextureIndex
+    //   words 16-18 = emissiveColorConstant (rgb fp16)
+    //   word 19 = emissiveIntensity (fp16)
+    //   word 20 = roughnessConstant (fp16)
+    //   word 21 = metallicConstant (fp16)
+    // NV-DXVK (debug probe G): DISABLED — material template readback served its purpose.
+    if (false && s_probeF_valid && surfaceMaterialBuffer != nullptr) {
+      static constexpr uint32_t kProbeGRingSize = 3;
+      static constexpr uint32_t kProbeGBytes    = 64; // kSurfaceMaterialGPUSize
+      static Rc<DxvkBuffer> sStagingG[kProbeGRingSize];
+      static uint32_t sStagingGBaseIdx[kProbeGRingSize] = {};
+      static uint64_t sStagingGBlasRef[kProbeGRingSize] = {};
+      static bool sStagingGValid[kProbeGRingSize] = {};
+      static uint32_t sProbeGFrame = 0;
+      const uint32_t writeG = sProbeGFrame % kProbeGRingSize;
+      const uint32_t readG  = (sProbeGFrame + 1) % kProbeGRingSize;
+
+      for (uint32_t i = 0; i < kProbeGRingSize; ++i) {
+        if (sStagingG[i].ptr() == nullptr) {
+          DxvkBufferCreateInfo info;
+          info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+          info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+          info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+          info.size   = kProbeGBytes;
+          sStagingG[i] = m_device->createBuffer(
+            info,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            DxvkMemoryStats::Category::RTXBuffer,
+            "Probe G - PI Material Template Readback");
+        }
+      }
+
+      const bool logG = (sProbeGFrame % 60 == 0);
+      if (sStagingGValid[readG] && logG) {
+        const uint8_t* d = reinterpret_cast<const uint8_t*>(sStagingG[readG]->mapPtr(0));
+        if (d != nullptr) {
+          auto halfToFloat = [](uint16_t h) -> float {
+            // Standard IEEE half -> float conversion, no denorm special-case needed for sane values.
+            const uint32_t sign = (h & 0x8000u) << 16;
+            const uint32_t exp  = (h & 0x7C00u) >> 10;
+            const uint32_t mant = (h & 0x03FFu);
+            uint32_t bits;
+            if (exp == 0) {
+              bits = sign; // 0 or denorm -> treat as 0 for log brevity
+              if (mant != 0) {
+                // Normalize denorm
+                int e = -14;
+                uint32_t m = mant;
+                while ((m & 0x0400u) == 0) { m <<= 1; --e; }
+                m &= 0x03FFu;
+                bits = sign | (uint32_t(e + 127) << 23) | (m << 13);
+              }
+            } else if (exp == 31) {
+              bits = sign | 0x7F800000u | (mant << 13);
+            } else {
+              bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
+            }
+            float f;
+            memcpy(&f, &bits, 4);
+            return f;
+          };
+          uint16_t w[32];
+          memcpy(w, d, 64);
+          const uint32_t matType = (w[0] & 0x3);
+          Logger::info(str::format(
+            "[PI-mat] blasRef=0x", std::hex, sStagingGBlasRef[readG], std::dec,
+            " base=", sStagingGBaseIdx[readG],
+            " matType=", matType, " (0=opaque 1=translucent 2=rayportal)",
+            " flags=0x", std::hex, w[0], std::dec,
+            " samplerIdx=", w[1],
+            " albedoTexIdx=", w[2],
+            " secondaryTexIdx=", w[3],
+            " albedoRGBA=(", halfToFloat(w[4]), ",", halfToFloat(w[5]), ",",
+                              halfToFloat(w[6]), ",", halfToFloat(w[7]), ")",
+            " emissiveTexIdx=", w[12],
+            " emissiveRGB=(", halfToFloat(w[16]), ",", halfToFloat(w[17]), ",",
+                               halfToFloat(w[18]), ")",
+            " emissiveIntensity=", halfToFloat(w[19]),
+            " roughness=", halfToFloat(w[20]),
+            " metallic=", halfToFloat(w[21])));
+        }
+        sStagingGValid[readG] = false;
+      }
+
+      const VkDeviceSize srcOffsetG = VkDeviceSize(s_probeF_baseSurfaceIndex) * kProbeGBytes;
+      if (srcOffsetG + kProbeGBytes <= surfaceMaterialBuffer->info().size) {
+        // GPU culling shader copies material template into per-instance slots
+        // before this point; also BLAS build reads from this buffer. Barrier:
+        // compute/transfer write → transfer read.
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_READ_BIT);
+        ctx->copyBuffer(sStagingG[writeG], 0, surfaceMaterialBuffer, srcOffsetG, kProbeGBytes);
+        sStagingGValid[writeG]   = true;
+        sStagingGBaseIdx[writeG] = s_probeF_baseSurfaceIndex;
+        sStagingGBlasRef[writeG] = s_probeE_blasRef;
+      }
+      ++sProbeGFrame;
+    }
   }
 
   void AccelManager::buildParticleSurfaceMapping(std::vector<uint32_t>& surfaceIndexMapping) {
@@ -1150,9 +1619,12 @@ namespace dxvk {
     // Allocate the instance buffer and copy its contents from host to device memory
     // STORAGE_BUFFER_BIT is required for the GPU PointInstancer culling shader
     // which writes per-instance surface data (transforms) directly into this buffer.
+    // NV-DXVK (debug probe F): TRANSFER_SRC_BIT added so readback copies are legal.
     DxvkBufferCreateInfo info;
-    info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    info.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+      | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+      | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+      | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
     info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
     info.size = align(surfacesGPUSize, kBufferAlignment);
@@ -1586,6 +2058,62 @@ namespace dxvk {
     batch.tlasType = primaryType;
     batch.instanceBufferByteOffset = 0; // resolved before dispatch
     m_pointInstancerBatches.push_back(batch);
+
+    // NV-DXVK (debug probe E): capture the interleaved BLAS position buffer ref
+    // for the PI batch with the LARGEST vertex count. This is almost certainly
+    // the main-view BSP world geometry, which is the batch we actually care
+    // about diagnosing. Resets at frame start in mergeInstancesIntoBlas; each
+    // subsequent addPointInstancerBlas call compares and replaces if larger.
+    if (blasEntry != nullptr) {
+      const auto& geom = blasEntry->modifiedGeometryData;
+      if (geom.vertexCount > s_probeE_vertexCount) {
+        s_probeE_posBuffer    = geom.positionBuffer.buffer();
+        s_probeE_posSliceOff  = geom.positionBuffer.offset();
+        s_probeE_posElemOff   = geom.positionBuffer.offsetFromSlice();
+        s_probeE_posStride    = geom.positionBuffer.stride();
+        s_probeE_vertexCount  = geom.vertexCount;
+        s_probeE_posFormat    = geom.positionBuffer.vertexFormat();
+        s_probeE_blasRef      = batch.blasReference;
+        s_probeF_baseSurfaceIndex = batch.baseSurfaceIndex;
+        s_probeF_valid = true;
+      }
+    }
+
+    // NV-DXVK (debug probe A): log first ~20 PI batches to confirm BSP reaches this path
+    // with sane blasRef, mask, counts, and transforms. Remove once root cause is found.
+    {
+      static uint32_t sPiBatchLogCount = 0;
+      if (sPiBatchLogCount < 20) {
+        ++sPiBatchLogCount;
+        const Matrix4& o2w = batch.objectToWorld;
+        const float t0x = transforms->empty() ? 0.f : (*transforms)[0][3][0];
+        const float t0y = transforms->empty() ? 0.f : (*transforms)[0][3][1];
+        const float t0z = transforms->empty() ? 0.f : (*transforms)[0][3][2];
+        // Include camera registration bits so we can see which cameras this
+        // instance was seen with. Bits: 0=Main 1=ViewModel 2=Portal0 3=Portal1
+        // 4=Sky 5=RenderToTexture 6=Unknown.
+        uint32_t camBits = 0;
+        for (uint32_t t = 0; t < CameraType::Count; ++t) {
+          if (rtInstance->isCameraRegistered(static_cast<CameraType::Enum>(t))) {
+            camBits |= (1u << t);
+          }
+        }
+        Logger::info(str::format(
+          "[PI-batch #", sPiBatchLogCount, "] blasRef=0x", std::hex, batch.blasReference, std::dec,
+          " baseSurf=", batch.baseSurfaceIndex,
+          " count=", batch.instanceCount,
+          " mask=", uint32_t(batch.instanceMask),
+          " tlasType=", uint32_t(batch.tlasType),
+          " firstIdxInType=", batch.firstIndexInType,
+          " camBits=0x", std::hex, camBits, std::dec,
+          " seenMain=", (camBits & 1u) ? 1 : 0,
+          " hidden=", rtInstance->isHidden() ? 1 : 0,
+          " customIdxFlags=0x", std::hex, batch.customIndexFlags, std::dec,
+          " sbtOffAndFlags=0x", std::hex, batch.sbtOffsetAndFlags, std::dec,
+          " o2w.T=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+          " t0.T=(", t0x, ",", t0y, ",", t0z, ")"));
+      }
+    }
 
     // Also reserve SSS TLAS slots if needed
     if (!isUnordered && rtInstance->isSubsurface()) {

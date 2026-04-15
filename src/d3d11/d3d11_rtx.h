@@ -174,6 +174,10 @@ namespace dxvk {
     std::vector<std::vector<std::shared_ptr<std::vector<Matrix4>>>> m_boneTransformRing;
     uint32_t                             m_boneInstFrameId = 0;
     const std::vector<Matrix4>*          m_currentInstancesToObject = nullptr;
+    // NV-DXVK: Companion shared_ptr carrying ownership of the storage that
+    // m_currentInstancesToObject points at, so the RtInstance consuming it
+    // can hold it alive beyond the 4-frame ring buffer's lifetime.
+    std::shared_ptr<const std::vector<Matrix4>> m_currentInstancesToObjectOwner;
     // NV-DXVK: Set true during ExtractTransforms for bone draws to skip world matrix scan
     bool                                 m_currentDrawIsBoneTransformed = false;
     // NV-DXVK: Skip view matrix scan but allow world matrix scan
