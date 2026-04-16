@@ -293,6 +293,14 @@ struct RasterGeometry {
 
   remixapi_MaterialHandle externalMaterial = nullptr;
 
+  // NV-DXVK: CPU snapshot of index data captured on the main/deferred context
+  // thread at SubmitDraw time (before any subsequent Map/DISCARD can rename
+  // the source D3D11 buffer's physical slice). When populated,
+  // cacheIndexDataOnGPU uploads from this instead of doing a racy GPU→GPU
+  // copy from the (possibly renamed) source.
+  // shared_ptr so copying RasterGeometry into EmitCs lambda captures is cheap.
+  std::shared_ptr<std::vector<uint8_t>> indexDataSnapshot;
+
   template<uint32_t rule>
   const XXH64_hash_t getHashForRule() const {
     return hashes.getHashForRule<rule>();

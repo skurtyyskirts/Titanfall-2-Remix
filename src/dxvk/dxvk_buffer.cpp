@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <numeric>
+#include <unordered_set>
 
 namespace dxvk {
   
@@ -111,13 +112,20 @@ namespace dxvk {
     }
     // NV-DXVK end
 
+    if (m_deviceAddress != 0) {
+      Logger::info(str::format("[BUFMAP-FREE] addr=0x", std::hex, m_deviceAddress,
+        " end=0x", (m_deviceAddress + m_info.size), std::dec,
+        " size=", m_info.size,
+        " usage=0x", std::hex, m_info.usage, std::dec));
+    }
+
     const auto& vkd = m_device->vkd();
 
     for (const auto& buffer : m_buffers)
       vkd->vkDestroyBuffer(vkd->device(), buffer.buffer, nullptr);
     vkd->vkDestroyBuffer(vkd->device(), m_buffer.buffer, nullptr);
   }
-  
+
 
   VkDeviceAddress DxvkBuffer::getDeviceAddress() {
     const auto& vkd = m_device->vkd();
@@ -127,6 +135,10 @@ namespace dxvk {
       bufferInfo.buffer = m_physSlice.handle;
       m_deviceAddress = vkd->vkGetBufferDeviceAddress(vkd->device(), &bufferInfo);
       m_deviceAddress += getDynamicOffset(0);
+      Logger::info(str::format("[BUFMAP] addr=0x", std::hex, m_deviceAddress,
+        " end=0x", (m_deviceAddress + m_info.size), std::dec,
+        " size=", m_info.size,
+        " usage=0x", std::hex, m_info.usage, std::dec));
     }
     return m_deviceAddress;
   }
@@ -426,6 +438,15 @@ namespace dxvk {
 
   DxvkAccelStructure::~DxvkAccelStructure() {
     if (accelStructureRef != VK_NULL_HANDLE) {
+      // TDR-DIAG: log AS destruction with its device address so we can
+      // correlate with Aftermath's faulting VA.
+      VkAccelerationStructureDeviceAddressInfoKHR info {};
+      info.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
+      info.accelerationStructure = accelStructureRef;
+      VkDeviceAddress asAddr = m_device->vkd()->vkGetAccelerationStructureDeviceAddressKHR(m_device->handle(), &info);
+      Logger::info(str::format("[ASMAP-FREE] addr=0x", std::hex, asAddr,
+        " end=0x", (asAddr + m_info.size), std::dec,
+        " size=", m_info.size));
       const auto& vkd = m_device->vkd();
       vkd->vkDestroyAccelerationStructureKHR(m_device->handle(), accelStructureRef, nullptr);
     }
@@ -437,6 +458,13 @@ namespace dxvk {
     deviceAddressInfo.accelerationStructure = accelStructureRef;
     VkDeviceAddress deviceAddress = m_device->vkd()->vkGetAccelerationStructureDeviceAddressKHR(m_device->handle(), &deviceAddressInfo);
     deviceAddress += getDynamicOffset(0);
+    // TDR-DIAG: log AS address resolution.
+    static std::unordered_set<VkDeviceAddress> sLoggedAS;
+    if (sLoggedAS.insert(deviceAddress).second) {
+      Logger::info(str::format("[ASMAP] addr=0x", std::hex, deviceAddress,
+        " end=0x", (deviceAddress + m_info.size), std::dec,
+        " size=", m_info.size));
+    }
     return deviceAddress;
   }
   // NV-DXVK end

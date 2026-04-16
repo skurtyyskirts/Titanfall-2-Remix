@@ -376,6 +376,23 @@ namespace dxvk {
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(blasEntry->modifiedGeometryData.positionBuffer.buffer());
     ctx->getCommandList()->trackResource<DxvkAccess::Read>(blasEntry->modifiedGeometryData.indexBuffer.buffer());
 
+    // TDR-DIAG: log the source buffer info for each BLAS build's geometry
+    static uint32_t sBlasTrackLog = 0;
+    if (sBlasTrackLog < 100) {
+      ++sBlasTrackLog;
+      const auto& pb = blasEntry->modifiedGeometryData.positionBuffer;
+      const auto& ib = blasEntry->modifiedGeometryData.indexBuffer;
+      Logger::info(str::format("[BLAS-TRACK] #", sBlasTrackLog,
+        " posBuf=0x", std::hex, (uintptr_t)(pb.buffer() != nullptr ? pb.buffer().ptr() : nullptr),
+        " posMF=0x", (pb.buffer() != nullptr ? pb.buffer()->memFlags() : 0),
+        " posUsage=0x", (pb.buffer() != nullptr ? pb.buffer()->info().usage : 0u),
+        " posSize=", std::dec, (pb.buffer() != nullptr ? pb.buffer()->info().size : 0),
+        " | idxBuf=0x", std::hex, (uintptr_t)(ib.buffer() != nullptr ? ib.buffer().ptr() : nullptr),
+        " idxMF=0x", (ib.buffer() != nullptr ? ib.buffer()->memFlags() : 0),
+        " idxUsage=0x", (ib.buffer() != nullptr ? ib.buffer()->info().usage : 0u),
+        " idxSize=", std::dec, (ib.buffer() != nullptr ? ib.buffer()->info().size : 0)));
+    }
+
     execBarriers.accessBuffer(
       blasEntry->modifiedGeometryData.positionBuffer.getSliceHandle(),
       blasEntry->modifiedGeometryData.positionBuffer.buffer()->info().stages,
@@ -1801,6 +1818,37 @@ namespace dxvk {
         desc.scratchData.deviceAddress += m_scratchBuffer->getDeviceAddress();
       }
       assert(blasToBuild.size() == blasRangesToBuild.size());
+
+      // TDR-DIAG: log ALL BLAS builds for Aftermath correlation.
+      // ppBuildRangeInfos[bi] is an array of `geometryCount` range infos,
+      // one per geo. Fix from earlier version that only read [0].
+      for (size_t bi = 0; bi < blasToBuild.size(); ++bi) {
+        const auto& g = blasToBuild[bi];
+        const auto* ranges = blasRangesToBuild[bi];
+        for (uint32_t gi = 0; gi < g.geometryCount; ++gi) {
+          const auto& tri = g.pGeometries[gi].geometry.triangles;
+          const auto& r = ranges[gi];
+          const uint32_t iTypeBytes = (tri.indexType == VK_INDEX_TYPE_UINT32) ? 4u
+                                    : (tri.indexType == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
+          const VkDeviceSize vtxEnd = tri.vertexData.deviceAddress
+            + VkDeviceSize(tri.maxVertex + 1) * tri.vertexStride;
+          const VkDeviceSize idxEnd = tri.indexData.deviceAddress
+            + VkDeviceSize(r.primitiveCount) * 3u * iTypeBytes
+            + VkDeviceSize(r.primitiveOffset);
+          Logger::info(str::format(
+            "[BLAS-BUILD] blas=", bi, " geo=", gi, "/", g.geometryCount,
+            " vtxAddr=0x", std::hex, tri.vertexData.deviceAddress,
+            " vtxEnd=0x", vtxEnd,
+            " idxAddr=0x", tri.indexData.deviceAddress,
+            " idxEnd=0x", idxEnd, std::dec,
+            " maxVtx=", tri.maxVertex,
+            " primCnt=", r.primitiveCount,
+            " primOff=", r.primitiveOffset,
+            " vStride=", tri.vertexStride,
+            " iType=", uint32_t(tri.indexType)));
+        }
+      }
+
       ctx->vkCmdBuildAccelerationStructuresKHR(blasToBuild.size(), blasToBuild.data(), blasRangesToBuild.data());
 
       execBarriers.accessBuffer(

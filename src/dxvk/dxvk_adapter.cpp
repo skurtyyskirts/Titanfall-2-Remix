@@ -692,10 +692,16 @@ namespace dxvk {
     VkDeviceDiagnosticsConfigCreateInfoNV deviceDiag;
     deviceDiag.sType = VK_STRUCTURE_TYPE_DEVICE_DIAGNOSTICS_CONFIG_CREATE_INFO_NV;
     deviceDiag.pNext = nullptr;
-    deviceDiag.flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV;
-    if (instance->options().enableAftermathResourceTracking) {
-      deviceDiag.flags |= VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV;
-    }
+    // All four diagnostic features — gives Aftermath maximum info at crash:
+    // - SHADER_DEBUG_INFO: decompile faulted shader
+    // - SHADER_ERROR_REPORTING: shader-level error details
+    // - RESOURCE_TRACKING: named resources at fault site
+    // - AUTOMATIC_CHECKPOINTS: auto execution markers between draws/dispatches
+    //   so Aftermath can tell us WHICH draw was faulting.
+    deviceDiag.flags = VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_DEBUG_INFO_BIT_NV
+                     | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_SHADER_ERROR_REPORTING_BIT_NV
+                     | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_AUTOMATIC_CHECKPOINTS_BIT_NV
+                     | VK_DEVICE_DIAGNOSTICS_CONFIG_ENABLE_RESOURCE_TRACKING_BIT_NV;
     // NV-DXVK end
 
     // NV-DXVK begin: DLFG integration + RTXIO + General Queue Searching/Allocation Improvements

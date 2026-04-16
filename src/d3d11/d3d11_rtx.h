@@ -20,10 +20,11 @@ namespace dxvk {
     explicit D3D11Rtx(D3D11DeviceContext* pContext);
 
     void Initialize();
-    void OnDraw(UINT vertexCount, UINT startVertex);
-    void OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
-    void OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
-    void OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
+    // Returns true if the draw was captured for RT (caller should skip rasterization).
+    bool OnDraw(UINT vertexCount, UINT startVertex);
+    bool OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex);
+    bool OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance);
+    bool OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance);
 
     // NV-DXVK: Intercept UpdateSubresource to cache bone matrix data from t30.
     // Called from D3D11DeviceContext::UpdateSubresource before the data goes to GPU.
@@ -55,6 +56,16 @@ namespace dxvk {
     D3D11DeviceContext*                  m_context;
     std::unique_ptr<GeometryProcessor>   m_pGeometryWorkers;
     uint32_t                             m_drawCallID = 0;
+    // True when SubmitDraw successfully committed a draw to the RT pipeline.
+    // Checked by OnDraw* return value to suppress redundant D3D11 rasterization.
+    bool                                 m_lastDrawCaptured = false;
+    // True once ANY draw in the current frame was captured for RT.
+    // Once Remix is active, ALL D3D11 rasterization is suppressed (including
+    // filtered draws) because the game's native rasterization shares render
+    // targets with Remix output → write hazards → corruption → TDR.
+    // Reset to false each EndFrame. During menus (no RT captures), this stays
+    // false and all draws rasterize normally.
+    bool                                 m_remixActiveThisFrame = false;
     // NV-DXVK: Raw draw counter incremented on every OnDraw* call BEFORE
     // any filtering.  Used purely for diagnostics so the EndFrame log can
     // distinguish "game issued no draws" from "game issued N draws but all

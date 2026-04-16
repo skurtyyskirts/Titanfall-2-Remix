@@ -132,6 +132,82 @@ namespace dxvk {
       if (!toInsert.empty()) {
         code.insert(code.begin() + capabilityInsertPos, toInsert.begin(), toInsert.end());
       }
+
+      // NV-DXVK: Deduplicate OpTypeImage declarations that became identical
+      // after stripping their Format operand to Unknown. Two types that
+      // previously differed only in format (e.g. Rgba16f vs R32ui) are now
+      // byte-identical, violating SPIR-V's unique-type requirement. The
+      // NVIDIA driver may compile the resulting invalid SPIR-V into a broken
+      // pipeline that hangs the GPU during execution → TDR / DEVICE_LOST.
+      //
+      // Fix: collect all OpTypeImage instructions, detect duplicates by
+      // comparing their operand words, keep the first occurrence and rewrite
+      // all references to removed duplicates throughout the module.
+      {
+        // Collect OpTypeImage entries: (offset, resultId, signature)
+        struct TypeImageEntry {
+          size_t   offset;
+          uint32_t resultId;
+          std::vector<uint32_t> signature; // operands after result ID
+        };
+        std::vector<TypeImageEntry> typeImages;
+
+        for (size_t i = 5; i < code.size(); ) {
+          const uint32_t w = code[i];
+          const uint16_t op = uint16_t(w & 0xFFFFu);
+          const uint16_t wc = uint16_t(w >> 16);
+          if (wc == 0) break;
+          if (op == 25u /* OpTypeImage */ && wc >= 9) {
+            TypeImageEntry e;
+            e.offset   = i;
+            e.resultId = code[i + 1];
+            e.signature.assign(code.begin() + i + 2, code.begin() + i + wc);
+            typeImages.push_back(std::move(e));
+          }
+          i += wc;
+        }
+
+        // Build remapping table: duplicate resultId → canonical resultId
+        std::unordered_map<uint32_t, uint32_t> remap;
+        std::vector<size_t> removeOffsets;
+
+        for (size_t a = 0; a < typeImages.size(); ++a) {
+          if (remap.count(typeImages[a].resultId)) continue; // already a dup
+          for (size_t b = a + 1; b < typeImages.size(); ++b) {
+            if (remap.count(typeImages[b].resultId)) continue;
+            if (typeImages[a].signature == typeImages[b].signature) {
+              remap[typeImages[b].resultId] = typeImages[a].resultId;
+              removeOffsets.push_back(typeImages[b].offset);
+            }
+          }
+        }
+
+        if (!remap.empty()) {
+          // Rewrite all ID references in the module
+          // Skip magic (word 0-4), then scan every instruction's operands
+          for (size_t i = 5; i < code.size(); ) {
+            const uint32_t w = code[i];
+            const uint16_t wc = uint16_t(w >> 16);
+            if (wc == 0) break;
+            // Operands start at i+1; rewrite any that match a remapped ID.
+            // (Word 0 of each instruction is opcode+length, never an ID.)
+            for (uint16_t k = 1; k < wc && (i + k) < code.size(); ++k) {
+              auto it = remap.find(code[i + k]);
+              if (it != remap.end())
+                code[i + k] = it->second;
+            }
+            i += wc;
+          }
+
+          // Remove duplicate OpTypeImage instructions (iterate in reverse
+          // so earlier offsets aren't invalidated by later erasures).
+          std::sort(removeOffsets.begin(), removeOffsets.end(), std::greater<size_t>());
+          for (size_t off : removeOffsets) {
+            const uint16_t wc = uint16_t(code[off] >> 16);
+            code.erase(code.begin() + off, code.begin() + off + wc);
+          }
+        }
+      }
     }
     return code;
   }

@@ -384,6 +384,19 @@ namespace dxvk {
 
     switch (result) {
       case ObjectCacheState::KBuildBVH: {
+        // TDR-DIAG: log every BUILD. We need per-object visibility to
+        // correlate with BLAS-BUILD and Aftermath fault VAs.
+        Logger::info(str::format("[BVH-BUILD]",
+          " hasIdxSnap=", (input.indexDataSnapshot ? 1 : 0),
+          " snapBytes=", (input.indexDataSnapshot ? input.indexDataSnapshot->size() : 0),
+          " idxCount=", input.indexCount,
+          " vtxCount=", input.vertexCount,
+          " idxBuf=0x", std::hex,
+          (uintptr_t)(input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
+            ? input.indexBuffer.buffer().ptr() : nullptr),
+          " idxMF=0x",
+          (input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
+            ? input.indexBuffer.buffer()->memFlags() : 0), std::dec));
         // Set up the ideal vertex params, if input vertices are interleaved, it's safe to assume the positionBuffer stride is the vertex stride
         output.vertexCount = input.vertexCount;
 
@@ -421,6 +434,14 @@ namespace dxvk {
         break;
       }
       case ObjectCacheState::kUpdateBVH: {
+        // TDR-DIAG: log every UPDATE to see if stale index caches are the issue.
+        Logger::info(str::format("[BVH-UPDATE]",
+          " hasIdxSnap=", (input.indexDataSnapshot ? 1 : 0),
+          " idxCount=", input.indexCount,
+          " vtxCount=", input.vertexCount,
+          " idxBuf=0x", std::hex,
+          (uintptr_t)(input.indexBuffer.defined() && input.indexBuffer.buffer() != nullptr
+            ? input.indexBuffer.buffer().ptr() : nullptr), std::dec));
         bool invalidateHistory = false;
 
         // Stride changed, so we must recreate the previous buffer and use identical data
@@ -445,6 +466,51 @@ namespace dxvk {
         } 
 
         RtxGeometryUtils::cacheVertexDataOnGPU(ctx, input, output, forceNormals);
+
+        // NV-DXVK: Refresh the index cache from our CPU snapshot if the
+        // source D3D11 buffer was DYNAMIC. The update path assumes identical
+        // index hashes imply identical content, but two different dynamic
+        // buffers can hash the same (collision or reused content). Safer to
+        // re-upload from the per-draw snapshot we captured at SubmitDraw.
+        if (input.indexDataSnapshot && !input.indexDataSnapshot->empty()
+            && output.indexCacheBuffer != nullptr
+            && input.indexDataSnapshot->size() <= output.indexCacheBuffer->info().size) {
+          // TDR-DIAG: OOB index scan (same as cacheIndexDataOnGPU).
+          const auto& data = *input.indexDataSnapshot;
+          const uint32_t stride = input.indexBuffer.stride();
+          const uint32_t vtxCount = output.vertexCount;  // The cached vtx count
+          uint32_t maxIdx = 0, oobCount = 0, oobFirstIdx = 0, oobFirstVal = 0;
+          if (stride == 2) {
+            const uint16_t* p = reinterpret_cast<const uint16_t*>(data.data());
+            const size_t n = data.size() / 2;
+            for (size_t i = 0; i < n; ++i) {
+              if (p[i] > maxIdx) maxIdx = p[i];
+              if (p[i] >= vtxCount) {
+                if (oobCount == 0) { oobFirstIdx = uint32_t(i); oobFirstVal = p[i]; }
+                ++oobCount;
+              }
+            }
+          } else if (stride == 4) {
+            const uint32_t* p = reinterpret_cast<const uint32_t*>(data.data());
+            const size_t n = data.size() / 4;
+            for (size_t i = 0; i < n; ++i) {
+              if (p[i] > maxIdx) maxIdx = p[i];
+              if (p[i] >= vtxCount) {
+                if (oobCount == 0) { oobFirstIdx = uint32_t(i); oobFirstVal = p[i]; }
+                ++oobCount;
+              }
+            }
+          }
+          if (oobCount > 0) {
+            Logger::err(str::format("[IDX-OOB-UPD] vtxCount=", vtxCount,
+              " maxSeenIdx=", maxIdx, " oobCount=", oobCount,
+              " firstOOB[", oobFirstIdx, "]=", oobFirstVal,
+              " idxCount=", input.indexCount, " stride=", stride));
+          }
+          ctx->writeToBuffer(output.indexCacheBuffer, 0,
+                             input.indexDataSnapshot->size(),
+                             input.indexDataSnapshot->data());
+        }
 
         // Sometimes, we need to invalidate history, do that here by copying the current buffer to the previous..
         if (invalidateHistory) {

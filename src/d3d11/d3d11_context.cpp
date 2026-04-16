@@ -1105,13 +1105,15 @@ namespace dxvk {
           UINT            StartVertexLocation) {
     D3D11DeviceLock lock = LockContext();
 
-    m_rtx.OnDraw(VertexCount, StartVertexLocation);
-
-    EmitCs([=] (DxvkContext* ctx) {
-      ctx->draw(
-        VertexCount, 1,
-        StartVertexLocation, 0);
-    });
+    // NV-DXVK: If the draw was captured for RT, skip D3D11 rasterization.
+    // Filtered draws (UI, depth-only, etc.) still rasterize so menus work.
+    if (!m_rtx.OnDraw(VertexCount, StartVertexLocation)) {
+      EmitCs([=] (DxvkContext* ctx) {
+        ctx->draw(
+          VertexCount, 1,
+          StartVertexLocation, 0);
+      });
+    }
   }
   
   
@@ -1121,14 +1123,14 @@ namespace dxvk {
           INT             BaseVertexLocation) {
     D3D11DeviceLock lock = LockContext();
 
-    m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation);
-
-    EmitCs([=] (DxvkContext* ctx) {
-      ctx->drawIndexed(
-        IndexCount, 1,
-        StartIndexLocation,
-        BaseVertexLocation, 0);
-    });
+    if (!m_rtx.OnDrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation)) {
+      EmitCs([=] (DxvkContext* ctx) {
+        ctx->drawIndexed(
+          IndexCount, 1,
+          StartIndexLocation,
+          BaseVertexLocation, 0);
+      });
+    }
   }
   
   
@@ -1139,18 +1141,18 @@ namespace dxvk {
           UINT            StartInstanceLocation) {
     D3D11DeviceLock lock = LockContext();
     
-    m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
-
-    EmitCs([=] (DxvkContext* ctx) {
-      ctx->draw(
-        VertexCountPerInstance,
-        InstanceCount,
-        StartVertexLocation,
-        StartInstanceLocation);
-    });
+    if (!m_rtx.OnDrawInstanced(VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation)) {
+      EmitCs([=] (DxvkContext* ctx) {
+        ctx->draw(
+          VertexCountPerInstance,
+          InstanceCount,
+          StartVertexLocation,
+          StartInstanceLocation);
+      });
+    }
   }
-  
-  
+
+
   void STDMETHODCALLTYPE D3D11DeviceContext::DrawIndexedInstanced(
           UINT            IndexCountPerInstance,
           UINT            InstanceCount,
@@ -1158,17 +1160,17 @@ namespace dxvk {
           INT             BaseVertexLocation,
           UINT            StartInstanceLocation) {
     D3D11DeviceLock lock = LockContext();
-    
-    m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 
-    EmitCs([=] (DxvkContext* ctx) {
-      ctx->drawIndexed(
-        IndexCountPerInstance,
-        InstanceCount,
-        StartIndexLocation,
-        BaseVertexLocation,
-        StartInstanceLocation);
-    });
+    if (!m_rtx.OnDrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation)) {
+      EmitCs([=] (DxvkContext* ctx) {
+        ctx->drawIndexed(
+          IndexCountPerInstance,
+          InstanceCount,
+          StartIndexLocation,
+          BaseVertexLocation,
+          StartInstanceLocation);
+      });
+    }
   }
   
   

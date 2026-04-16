@@ -3,6 +3,7 @@
 #include <chrono>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
 
 // Include dxvk_device.h before any rtx headers so that dxvk_buffer.h and
 // sibling headers (included bare by rtx_utils.h) are already in the TU.
@@ -232,24 +233,36 @@ namespace dxvk {
     RtxOptions::showUIObject().setDeferred(UIType::Advanced, defaults);
   }
 
-  void D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
+  bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
+    m_lastDrawCaptured = false;
     SubmitDraw(false, vertexCount, startVertex, 0);
+    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    return m_remixActiveThisFrame;
   }
 
-  void D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
+  bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
     ++m_rawDrawCount;
+    m_lastDrawCaptured = false;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
+    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    return m_remixActiveThisFrame;
   }
 
-  void D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
+  bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
     ++m_rawDrawCount;
+    m_lastDrawCaptured = false;
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
+    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    return m_remixActiveThisFrame;
   }
 
-  void D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
+  bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
     ++m_rawDrawCount;
+    m_lastDrawCaptured = false;
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
+    if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    return m_remixActiveThisFrame;
   }
 
   void D3D11Rtx::SubmitInstancedDraw(bool indexed, UINT count, UINT start, INT base,
@@ -4036,7 +4049,14 @@ namespace dxvk {
                           ? VK_INDEX_TYPE_UINT32
                           : VK_INDEX_TYPE_UINT16;
       uint32_t idxStride = (idxType == VK_INDEX_TYPE_UINT32) ? 4 : 2;
-      idxBuffer = RasterBuffer(ib.buffer->GetBufferSlice(ib.offset), 0, idxStride, idxType);
+      // NV-DXVK: Bake startIndex into the slice offset. The BLAS builder and
+      // the cacheIndexDataOnGPU copy both read from `slice.offset + 0`, not
+      // `slice.offset + startIndex*stride`. Without this, draws with startIndex>0
+      // get the wrong index range cached → BLAS sees stale indices from the
+      // top of the IB → OOB vertex reads → MMU fault.
+      idxBuffer = RasterBuffer(
+        ib.buffer->GetBufferSlice(ib.offset + size_t(start) * idxStride),
+        0, idxStride, idxType);
     }
 
     VkPrimitiveTopology vkTopology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -4058,6 +4078,59 @@ namespace dxvk {
     geo.color0Buffer   = colBuffer;
     geo.indexBuffer    = idxBuffer;
     geo.indexCount     = indexed ? count : 0;
+
+    // NV-DXVK: Snapshot index bytes NOW from the game's currently mapped slice.
+    // Runs on the thread that owns the D3D11 state (deferred context replay on
+    // CS thread, or immediate context) before any subsequent Map/DISCARD can
+    // rename the physical slice. Without this, the deferred cacheIndexDataOnGPU
+    // copy (later on CS thread) reads the renamed slice → garbage indices →
+    // BLAS build OOB → MMU fault → TDR.
+    //
+    // Only snapshot DYNAMIC buffers (the only ones subject to renaming).
+    // Static/immutable buffers have stable physical addresses — zero overhead.
+    if (indexed) {
+      static uint32_t sIdxSnapStats[4] = {0, 0, 0, 0};  // dyn_snapped, dyn_no_mapptr, static_skipped, null_buf
+      static uint32_t sIdxSnapLog = 0;
+      const auto& ib2 = m_context->m_state.ia.indexBuffer;
+      bool snapped = false;
+      if (ib2.buffer == nullptr) {
+        ++sIdxSnapStats[3];
+      } else if (ib2.buffer->Desc()->Usage != D3D11_USAGE_DYNAMIC) {
+        ++sIdxSnapStats[2];
+      } else {
+        const auto mapped = ib2.buffer->GetMappedSlice();
+        if (mapped.mapPtr == nullptr) {
+          ++sIdxSnapStats[1];
+        } else {
+          const uint32_t idxStride2 = (ib2.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+          const size_t snapLen = size_t(count) * idxStride2;
+          // Draw reads indices [start, start+count) — snapshot must start at
+          // start*stride, not 0, or cacheIndexDataOnGPU uploads the wrong range.
+          const size_t snapOff = size_t(ib2.offset) + size_t(start) * idxStride2;
+          const size_t bufLen  = ib2.buffer->Desc()->ByteWidth;
+          if (snapLen > 0 && snapOff + snapLen <= bufLen) {
+            geo.indexDataSnapshot = std::make_shared<std::vector<uint8_t>>(snapLen);
+            std::memcpy(geo.indexDataSnapshot->data(),
+                        reinterpret_cast<const uint8_t*>(mapped.mapPtr) + snapOff,
+                        snapLen);
+            ++sIdxSnapStats[0];
+            snapped = true;
+          }
+        }
+      }
+      // Log first 30 draws + stats every 500 draws
+      if (sIdxSnapLog < 30 || (sIdxSnapLog % 500) == 0) {
+        Logger::info(str::format("[IDX-SNAP] snap=", snapped ? 1 : 0,
+          " count=", count,
+          " usage=", (ib2.buffer != nullptr ? uint32_t(ib2.buffer->Desc()->Usage) : 0u),
+          " off=", ib2.offset,
+          " stats: dynSnap=", sIdxSnapStats[0],
+          " dynNoMap=", sIdxSnapStats[1],
+          " static=", sIdxSnapStats[2],
+          " null=", sIdxSnapStats[3]));
+      }
+      ++sIdxSnapLog;
+    }
 
     // NV-DXVK start: Per-vertex skinning — populate blend buffers and bone count
     if (bwBuffer.defined() && biBuffer.defined()) {
@@ -4175,6 +4248,13 @@ namespace dxvk {
       }
       if (!xformSrv) {
         // Last-resort blind probe (no RDEF / unknown shader).
+        // NOTE: stride investigation showed t30=8192, t31=2-48 for all 13
+        // BLIND-PROBE VS hashes — these are NOT g_modelInst/g_boneMatrix SRVs.
+        // These VS hashes don't use either transform buffer. Attaching either
+        // as a bone/BSP transform is wrong but doesn't cause the TDR
+        // (confirmed: rerouting all 13 to BSP didn't fix the hang).
+        // Leaving original logic for now — skip attachment entirely for these
+        // since neither t30 nor t31 is a valid transform buffer.
         constexpr uint32_t kBoneSrvSlot = 30;
         constexpr uint32_t kModelInstSrvSlot = 31;
         if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
@@ -4319,12 +4399,83 @@ namespace dxvk {
       hashCount = std::min(count, maxVBVertices - hashStart);
     } else {
       // Indexed DrawIndexed(indexCount, startIndex, base): vertex = index + base.
-      // Without scanning the IB we don't know max(index), so use base + indexCount
-      // as a conservative upper bound.
+      // The OLD comment said we couldn't know max(index) without scanning the IB,
+      // so it fell back to base + indexCount — which is wrong. BSP/static geometry
+      // shares a large vertex buffer across many draws, and draws with few indices
+      // frequently reference vertices far above `base + indexCount`. That caused
+      // Remix to report vertexCount far smaller than the real range, the BLAS
+      // builder saw "valid" primitiveCount but indices ≥ maxVertex → MMU fault
+      // reading beyond the vertex buffer → VK_ERROR_DEVICE_LOST on frame 3+.
+      //
+      // FIX: scan the index buffer CPU-side to find the actual max index.
+      // For DYNAMIC source, read mapped slice directly. For STATIC source,
+      // try mapPtr (often host-visible for small buffers). If scan isn't
+      // possible, fall back to full buffer capacity (safe: over-reports).
       const uint32_t baseU = static_cast<uint32_t>(std::max(base, 0));
-      drawVertexCount = std::min(baseU + count, maxVBVertices);
-      hashStart = std::min(baseU, maxVBVertices);
-      hashCount = std::min(count, maxVBVertices - hashStart);
+      uint32_t maxIdxSeen = 0;
+      bool scanned = false;
+      if (indexed) {
+        const auto& ib = m_context->m_state.ia.indexBuffer;
+        if (ib.buffer != nullptr) {
+          const uint32_t idxStride = (ib.format == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+          const void* src = nullptr;
+          // DYNAMIC: use current mapped slice (race-safe on our thread).
+          if (ib.buffer->Desc()->Usage == D3D11_USAGE_DYNAMIC) {
+            const auto mapped = ib.buffer->GetMappedSlice();
+            src = mapped.mapPtr;
+          }
+          // STATIC: some immutable buffers are host-visible for staging.
+          if (src == nullptr) {
+            src = ib.buffer->GetBuffer()->mapPtr(0);
+          }
+          if (src != nullptr) {
+            const size_t bufSize = ib.buffer->Desc()->ByteWidth;
+            const size_t startOff = ib.offset + size_t(start) * idxStride;
+            const size_t readLen = size_t(count) * idxStride;
+            if (startOff + readLen <= bufSize) {
+              const uint8_t* p = reinterpret_cast<const uint8_t*>(src) + startOff;
+              if (idxStride == 2) {
+                const uint16_t* q = reinterpret_cast<const uint16_t*>(p);
+                for (uint32_t i = 0; i < count; ++i)
+                  if (q[i] > maxIdxSeen) maxIdxSeen = q[i];
+              } else {
+                const uint32_t* q = reinterpret_cast<const uint32_t*>(p);
+                for (uint32_t i = 0; i < count; ++i)
+                  if (q[i] > maxIdxSeen) maxIdxSeen = q[i];
+              }
+              scanned = true;
+            }
+          }
+        }
+      }
+      if (scanned) {
+        // BLAS builder needs maxVertex = highest index + 1 (inclusive range).
+        // Add base offset since BLAS input vertices are [base, base + maxVtx].
+        drawVertexCount = std::min(baseU + maxIdxSeen + 1u, maxVBVertices);
+        hashStart = std::min(baseU, maxVBVertices);
+        hashCount = std::min(maxIdxSeen + 1u, maxVBVertices - hashStart);
+      } else {
+        // Couldn't scan — fall back to the FULL vertex buffer capacity
+        // (over-reports but safe: BLAS builder can't read past buffer).
+        drawVertexCount = maxVBVertices;
+        hashStart = std::min(baseU, maxVBVertices);
+        hashCount = std::min(count, maxVBVertices - hashStart);
+        // Log fallbacks so we know if static idx buffers aren't mappable.
+        static uint32_t sFallbackLog = 0, sFallbackCount = 0;
+        ++sFallbackCount;
+        if (sFallbackLog < 20 || (sFallbackCount % 500) == 0) {
+          ++sFallbackLog;
+          const auto& ib = m_context->m_state.ia.indexBuffer;
+          Logger::warn(str::format("[IDX-SCAN-FALLBACK] #", sFallbackCount,
+            " idxBuf=0x", std::hex,
+            (uintptr_t)(ib.buffer != nullptr ? ib.buffer.ptr() : nullptr),
+            std::dec,
+            " usage=", (ib.buffer != nullptr ? uint32_t(ib.buffer->Desc()->Usage) : 0u),
+            " count=", count, " start=", start, " base=", base,
+            " maxVBVertices=", maxVBVertices,
+            " → drawVertexCount=full buffer (over-reporting)"));
+        }
+      }
     }
     if (drawVertexCount == 0)
       drawVertexCount = count;
@@ -4829,6 +4980,7 @@ namespace dxvk {
     dcs.zEnable          = zEnable;
     dcs.stencilEnabled   = stencilEnabled;
     dcs.drawCallID       = m_drawCallID++;
+    m_lastDrawCaptured   = true;  // Signal caller to skip D3D11 rasterization
     // NV-DXVK: record the successful submit against the current VS hash.
     if (!m_currentVsHashCache.empty())
       ++m_vsFrameStats[m_currentVsHashCache].submitted;
@@ -5332,6 +5484,7 @@ namespace dxvk {
 
     m_drawCallID = 0;
     m_rawDrawCount = 0;
+    m_remixActiveThisFrame = false;
     m_foundRealProjThisFrame = false;
     // Projection cache (m_projSlot, m_projOffset, m_projStage, m_columnMajor)
     // is NOT reset for pure projections (cls 1/2) — the validation path at

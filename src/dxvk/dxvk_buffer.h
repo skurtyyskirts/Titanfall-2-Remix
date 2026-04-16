@@ -524,7 +524,7 @@ namespace dxvk {
 
     /**
      * \brief Retrieves sub slice handle
-     * 
+     *
      * \param [in] offset Offset into buffer
      * \param [in] length Sub slice length
      * \returns Buffer slice handle
@@ -610,7 +610,7 @@ namespace dxvk {
     }
 
   private:
-    
+
     Rc<DxvkBuffer> m_buffer = nullptr;
     VkDeviceSize   m_offset = 0;
     VkDeviceSize   m_length = 0;

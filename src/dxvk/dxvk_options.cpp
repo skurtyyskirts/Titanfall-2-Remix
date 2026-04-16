@@ -33,8 +33,8 @@ namespace dxvk {
     hud                   = config.getOption<std::string>("dxvk.hud", "");
 
     // NV-DXVK start: Integrate Aftermath
-    enableAftermath = config.getOption<bool>("dxvk.enableAftermath", false);
-    enableAftermathResourceTracking = config.getOption<bool>("dxvk.enableAftermathResourceTracking", false);
+    enableAftermath = true;  // hardcoded for diagnosis
+    enableAftermathResourceTracking = true;
     // NV-DXVK end
 
     // NV-DXVK start: early submit heuristics for memcpy work

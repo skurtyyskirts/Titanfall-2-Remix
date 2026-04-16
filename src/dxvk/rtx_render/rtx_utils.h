@@ -130,7 +130,7 @@ class GeometryBuffer : public DxvkBufferSlice {
        && m_stride == rhs.m_stride
        && m_format.vertex == rhs.m_format.vertex;
   }
-  
+
   bool operator!=(GeometryBuffer const& rhs) const {
     return !(*this == rhs);
   }

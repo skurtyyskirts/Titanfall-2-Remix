@@ -573,7 +573,7 @@ namespace dxvk {
 
       // Update all the GPU buffers needed to describe the scene
       getSceneManager().prepareSceneData(this, m_execBarriers);
-      
+
       // If we really don't have any RT to do, just bail early (could be UI/menus rendering)
       // Also guard against a null Opaque TLAS: this can happen on the first frame(s) with geometry
       // if BLAS build hasn't completed yet, or when objectToWorld extraction was wrong and produced
@@ -604,7 +604,7 @@ namespace dxvk {
 
         // Volumetric Lighting
         dispatchVolumetrics(rtOutput);
-        
+
         // Path Tracing
         dispatchPathTracing(rtOutput);
 
@@ -646,7 +646,7 @@ namespace dxvk {
 
         // Post composite Debug View that may overwrite Composite output
         dispatchReplaceCompositeWithDebugView(rtOutput);
-        
+
         if (captureScreenImage && captureDebugImage) {
           takeScreenshot("rtxImagePostComposite", rtOutput.m_compositeOutput.resource(Resources::AccessType::Read).image);
         }
@@ -718,7 +718,7 @@ namespace dxvk {
         // Blit to the game target
         {
           ScopedGpuProfileZone(this, "Blit to Game");
-          
+
           // Note: the resolution between srcImage and dstImage always matches
           // so we can use the same blit with nearest neighbor filtering
           assert(srcImage->info().extent == targetImage->info().extent);
@@ -865,6 +865,7 @@ namespace dxvk {
 
     assert(geoData.futureGeometryHashes.valid());
     assert(geoData.positionBuffer.defined());
+
 
     const auto fusedMode = RtxOptions::fusedWorldViewMode();
     if (unlikely(fusedMode != FusedWorldViewMode::None)) {

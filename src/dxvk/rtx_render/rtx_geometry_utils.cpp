@@ -692,8 +692,106 @@ namespace dxvk {
 
   bool RtxGeometryUtils::cacheIndexDataOnGPU(const Rc<DxvkContext>& ctx, const RasterGeometry& input, RaytraceGeometry& output) {
     ScopedCpuProfileZone();
+    // NV-DXVK: If a CPU snapshot of the index data was captured at SubmitDraw
+    // time (for DYNAMIC D3D11 buffers — see d3d11_rtx.cpp), upload from that
+    // instead of a racy GPU→GPU copy from the potentially-renamed source.
+    // The snapshot is race-safe: captured on the thread owning D3D11 state.
+    if (input.indexDataSnapshot && !input.indexDataSnapshot->empty()
+        && input.isTopologyRaytraceReady()) {
+      // TDR-DIAG: scan the snapshotted indices for OOB values that would
+      // cause the BLAS builder to read past the vertex buffer → MMU fault.
+      // If indexValue >= vertexCount, the AS build will read garbage memory.
+      const auto& data = *input.indexDataSnapshot;
+      const uint32_t stride = input.indexBuffer.stride();
+      const uint32_t vtxCount = input.vertexCount;
+      uint32_t maxIdx = 0;
+      uint32_t oobCount = 0;
+      uint32_t oobFirstIdx = 0;
+      uint32_t oobFirstVal = 0;
+      if (stride == 2) {
+        const uint16_t* p = reinterpret_cast<const uint16_t*>(data.data());
+        const size_t n = data.size() / 2;
+        for (size_t i = 0; i < n; ++i) {
+          if (p[i] > maxIdx) maxIdx = p[i];
+          if (p[i] >= vtxCount) {
+            if (oobCount == 0) { oobFirstIdx = uint32_t(i); oobFirstVal = p[i]; }
+            ++oobCount;
+          }
+        }
+      } else if (stride == 4) {
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(data.data());
+        const size_t n = data.size() / 4;
+        for (size_t i = 0; i < n; ++i) {
+          if (p[i] > maxIdx) maxIdx = p[i];
+          if (p[i] >= vtxCount) {
+            if (oobCount == 0) { oobFirstIdx = uint32_t(i); oobFirstVal = p[i]; }
+            ++oobCount;
+          }
+        }
+      }
+      if (oobCount > 0) {
+        Logger::err(str::format("[IDX-OOB] OOB indices in snapshot! vtxCount=",
+          vtxCount, " maxSeenIdx=", maxIdx, " oobCount=", oobCount,
+          " firstOOB[", oobFirstIdx, "]=", oobFirstVal,
+          " idxCount=", input.indexCount, " stride=", stride,
+          " snapBytes=", data.size()));
+      } else {
+        static uint32_t sOkLog = 0;
+        if (sOkLog < 5) {
+          ++sOkLog;
+          Logger::info(str::format("[IDX-OK] vtxCount=", vtxCount,
+            " maxSeenIdx=", maxIdx, " idxCount=", input.indexCount, " stride=", stride));
+        }
+      }
+      ctx->writeToBuffer(output.indexCacheBuffer, 0,
+                         input.indexDataSnapshot->size(),
+                         input.indexDataSnapshot->data());
+      return true;
+    }
     // Handle index buffer replacement - since the BVH builder does not support legacy primitive topology
     if (input.isTopologyRaytraceReady()) {
+      // TDR-DIAG: try to scan static source index buffer via host mapPtr if available.
+      // Many DXVK immutable buffers are host-visible for staging.
+      if (input.indexBuffer.buffer() != nullptr) {
+        const void* mp = input.indexBuffer.buffer()->mapPtr(0);
+        if (mp != nullptr) {
+          const uint32_t stride = input.indexBuffer.stride();
+          const uint32_t vtxCount = input.vertexCount;
+          const size_t baseOff = input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice();
+          const size_t byteCount = size_t(input.indexCount) * stride;
+          const size_t bufSize = input.indexBuffer.buffer()->info().size;
+          if (baseOff + byteCount <= bufSize) {
+            const uint8_t* base = reinterpret_cast<const uint8_t*>(mp) + baseOff;
+            uint32_t maxIdx = 0, oobCount = 0, oobFirstVal = 0, oobFirstIdx = 0;
+            if (stride == 2) {
+              const uint16_t* p = reinterpret_cast<const uint16_t*>(base);
+              for (uint32_t i = 0; i < input.indexCount; ++i) {
+                if (p[i] > maxIdx) maxIdx = p[i];
+                if (p[i] >= vtxCount) {
+                  if (oobCount == 0) { oobFirstIdx = i; oobFirstVal = p[i]; }
+                  ++oobCount;
+                }
+              }
+            } else if (stride == 4) {
+              const uint32_t* p = reinterpret_cast<const uint32_t*>(base);
+              for (uint32_t i = 0; i < input.indexCount; ++i) {
+                if (p[i] > maxIdx) maxIdx = p[i];
+                if (p[i] >= vtxCount) {
+                  if (oobCount == 0) { oobFirstIdx = i; oobFirstVal = p[i]; }
+                  ++oobCount;
+                }
+              }
+            }
+            if (oobCount > 0) {
+              Logger::err(str::format("[IDX-OOB-STATIC] vtxCount=", vtxCount,
+                " maxSeenIdx=", maxIdx, " oobCount=", oobCount,
+                " firstOOB[", oobFirstIdx, "]=", oobFirstVal,
+                " idxCount=", input.indexCount, " stride=", stride,
+                " memFlags=0x", std::hex, input.indexBuffer.buffer()->memFlags(), std::dec));
+            }
+          }
+        }
+      }
       ctx->copyBuffer(output.indexCacheBuffer, 0, input.indexBuffer.buffer(), input.indexBuffer.offset() + input.indexBuffer.offsetFromSlice(), input.indexCount * input.indexBuffer.stride());
     } else {
       return RtxGeometryUtils::generateTriangleList(ctx, input, output.indexCacheBuffer);

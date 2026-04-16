@@ -224,15 +224,29 @@ namespace dxvk {
         DxvkContextFlag::RpDirtyDescriptorBinding);
     }
 
-    // DEBUG: catch any misaligned slice at bind time, log caller
+    // DEBUG: catch slice offsets that violate UBO alignment (64B on NVIDIA).
+    // SSBO/texel-buffer alignment is only 4-16B, so a slice that's 32B-aligned
+    // is perfectly legal when the slot is bound as a storage buffer. The
+    // descriptor type isn't known here (set at descriptor-write time from the
+    // pipeline layout), so we use the buffer's usage flags as a proxy: only
+    // warn when the buffer can ONLY be used as a UBO (no STORAGE_BUFFER bit),
+    // which is the only case where a misaligned offset is guaranteed to be a
+    // spec violation. This silences the NRC false positive where SSBO
+    // sub-allocations land at NRC's internal 32B alignment in a buffer that
+    // also carries UBO usage for unrelated bind sites.
     if (buffer.defined() && (buffer.offset() & 63u) != 0) {
       const auto& ubuf = buffer.buffer();
-      void* ret0 = _ReturnAddress();
-      Logger::err(str::format("[BIND-MISALIGNED] slot=", slot,
-        " sliceOff=", buffer.offset(), " mod64=", buffer.offset() & 63u,
-        " usage=0x", std::hex, (ubuf != nullptr ? ubuf->info().usage : 0u), std::dec,
-        " bufSize=", (ubuf != nullptr ? ubuf->info().size : 0u),
-        " caller=", ret0));
+      const VkBufferUsageFlags usage = (ubuf != nullptr) ? ubuf->info().usage : 0u;
+      const bool isUboOnly = (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) != 0
+                          && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) == 0;
+      if (isUboOnly) {
+        void* ret0 = _ReturnAddress();
+        Logger::err(str::format("[BIND-MISALIGNED] slot=", slot,
+          " sliceOff=", buffer.offset(), " mod64=", buffer.offset() & 63u,
+          " usage=0x", std::hex, usage, std::dec,
+          " bufSize=", (ubuf != nullptr ? ubuf->info().size : 0u),
+          " caller=", ret0));
+      }
     }
     m_rc[slot].bufferSlice = buffer;
   }
@@ -248,15 +262,25 @@ namespace dxvk {
     m_rc[slot].bufferSlice = bufferView != nullptr
       ? bufferView->slice()
       : DxvkBufferSlice();
-    // DEBUG: SRV/UAV path — log misaligned slices, any usage, with caller
+    // DEBUG: SRV/UAV path — same UBO-only filter as bindResourceBuffer.
+    // Buffer-view (texel buffer) bindings only need minTexelBufferOffsetAlignment
+    // (16B on NVIDIA), and storage buffers need even less, so 64B-aligned was
+    // far too strict and produced noise on NRC's 32B-aligned SSBO sub-slices.
     if (m_rc[slot].bufferSlice.defined() && (m_rc[slot].bufferSlice.offset() & 63u) != 0) {
       const auto& ubuf = m_rc[slot].bufferSlice.buffer();
-      void* ret0 = _ReturnAddress();
-      Logger::err(str::format("[VIEW-MISALIGNED] slot=", slot,
-        " sliceOff=", m_rc[slot].bufferSlice.offset(),
-        " mod64=", m_rc[slot].bufferSlice.offset() & 63u,
-        " usage=0x", std::hex, (ubuf != nullptr ? ubuf->info().usage : 0u), std::dec,
-        " caller=", ret0));
+      const VkBufferUsageFlags usage = (ubuf != nullptr) ? ubuf->info().usage : 0u;
+      const bool isUboOnly = (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) != 0
+                          && (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) == 0
+                          && (usage & VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT) == 0
+                          && (usage & VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT) == 0;
+      if (isUboOnly) {
+        void* ret0 = _ReturnAddress();
+        Logger::err(str::format("[VIEW-MISALIGNED] slot=", slot,
+          " sliceOff=", m_rc[slot].bufferSlice.offset(),
+          " mod64=", m_rc[slot].bufferSlice.offset() & 63u,
+          " usage=0x", std::hex, usage, std::dec,
+          " caller=", ret0));
+      }
     }
     m_rcTracked.clr(slot);
 
