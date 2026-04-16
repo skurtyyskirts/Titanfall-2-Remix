@@ -2367,16 +2367,30 @@ namespace dxvk {
                   if (!std::isfinite(m[j])) { valid = false; break; }
                 }
                 if (valid) {
-                  // Bone matrix is objectToWorld (float3x4, row-major).
-                  // Row 0: [r00 r01 r02 tx], Row 1: [r10 r11 r12 ty], Row 2: [r20 r21 r22 tz]
-                  // Translation is in world space.  worldToView (from VP
-                  // decomposition, already set above) handles world → view.
-                  // objectToView = worldToView * objectToWorld.
+                  // NV-DXVK: the bone matrix translation in TF2 is the
+                  // "move-to-camera-relative" offset (≈ -cameraOrigin for the
+                  // BSP's bone[0]), because Source's vertex shader multiplies
+                  // by it to produce camera-relative vertices. After Remix's
+                  // dispatchSkinning applies the bone, BLAS vertices are in
+                  // camera-relative space (world - cameraOrigin). To render
+                  // at correct world positions we must translate BLAS back by
+                  // +cameraOrigin via o2w, NOT re-apply the bone's -camera
+                  // translation. Using the bone matrix as o2w directly double-
+                  // applies the negative cam offset and puts geometry at
+                  // world - 2·cam (entirely behind the player).
+                  //
+                  // Keep the bone's rotation (for characters / dynamic bones
+                  // where rotation is meaningful) but override the translation
+                  // with +fanoutCameraOrigin — matching the non-bone path at
+                  // ~line 3005 which already does the right thing.
+                  const float tx = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.x : 0.0f;
+                  const float ty = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.y : 0.0f;
+                  const float tz = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.z : 0.0f;
                   transforms.objectToWorld = Matrix4(
                     Vector4(m[0], m[1], m[2],  0.0f),
                     Vector4(m[4], m[5], m[6],  0.0f),
                     Vector4(m[8], m[9], m[10], 0.0f),
-                    Vector4(m[3], m[7], m[11], 1.0f));
+                    Vector4(tx,   ty,   tz,    1.0f));
                   // worldToView already set to m_lastGoodTransforms.worldToView above
                   gotBoneTransform = true;
 
@@ -2387,7 +2401,8 @@ namespace dxvk {
                       "[D3D11Rtx] CPU Bone: raw=", m_rawDrawCount,
                       " inst=", m_currentInstanceIndex,
                       " boneIdx=", boneIdx,
-                      " T=(", m[3], ",", m[7], ",", m[11], ")",
+                      " boneT=(", m[3], ",", m[7], ",", m[11], ")",
+                      " o2wT=(", tx, ",", ty, ",", tz, ")",
                       " R0=(", m[0], ",", m[1], ",", m[2], ")"));
                   }
                 }
@@ -2426,11 +2441,17 @@ namespace dxvk {
                 for (int j = 0; j < 12; ++j)
                   if (!std::isfinite(bm[j])) { valid = false; break; }
                 if (valid) {
+                  // NV-DXVK: same fix as the CPU Bone path above — bone
+                  // translation is -cameraOrigin, so o2w.T must be
+                  // +cameraOrigin to land geometry in world space.
+                  const float tx = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.x : 0.0f;
+                  const float ty = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.y : 0.0f;
+                  const float tz = m_hasFanoutCamOrigin ? m_lastFanoutCamOrigin.z : 0.0f;
                   transforms.objectToWorld = Matrix4(
                     Vector4(bm[0], bm[1], bm[2],  0.0f),
                     Vector4(bm[4], bm[5], bm[6],  0.0f),
                     Vector4(bm[8], bm[9], bm[10], 0.0f),
-                    Vector4(bm[3], bm[7], bm[11], 1.0f));
+                    Vector4(tx,    ty,    tz,     1.0f));
                   gotBoneTransform = true;
                   static uint32_t sBoneDiag2 = 0;
                   if (sBoneDiag2 < 10) {
@@ -2797,7 +2818,40 @@ namespace dxvk {
     // NV-DXVK: For R32G32_UINT draws, read cb3 directly from its mapped memory.
     // cb3 is updated via Map/WRITE_DISCARD (not UpdateSubresource).
     // GetMappedSlice() returns the CPU-mapped pointer with current data.
-    if (m_skipViewMatrixScan) {
+    //
+    // NV-DXVK: UNCONDITIONAL +fanoutCam for R32G32_UINT (BSP world) draws.
+    // Regardless of whether bone path or cb3 read succeeds, every BSP vertex
+    // in the BLAS is in camera-relative space (BLAS vertex = world - cam),
+    // so o2w.T MUST translate by +cam to produce absolute world positions.
+    // cb3 is not used by BSP shaders — the cb3 contents we'd read here are
+    // stale per-draw data left over from a previous non-BSP submission, and
+    // using them (even adjusted) corrupts o2w. Skip the cb3 read entirely
+    // when the bone path already set a valid o2w; if bone also failed, fall
+    // through to the cb3 block as a secondary source.
+    const bool o2wAlreadySetByBonePath = !isIdentityExact(transforms.objectToWorld);
+    // If bone path didn't set o2w but fanout is available, seed o2w with
+    // +fanoutCam now — this is the correct translation for any R32G32_UINT
+    // camera-relative draw. cb3 override below is gated out in that case.
+    if (m_skipViewMatrixScan && !o2wAlreadySetByBonePath && m_hasFanoutCamOrigin) {
+      transforms.objectToWorld = Matrix4(
+        Vector4(1.0f, 0.0f, 0.0f, 0.0f),
+        Vector4(0.0f, 1.0f, 0.0f, 0.0f),
+        Vector4(0.0f, 0.0f, 1.0f, 0.0f),
+        Vector4(m_lastFanoutCamOrigin.x,
+                m_lastFanoutCamOrigin.y,
+                m_lastFanoutCamOrigin.z, 1.0f));
+      static uint32_t sSeedLog = 0;
+      if (sSeedLog < 10) {
+        ++sSeedLog;
+        Logger::info(str::format(
+          "[D3D11Rtx] o2w seeded from fanoutCam (bone path empty): T=(",
+          m_lastFanoutCamOrigin.x, ",",
+          m_lastFanoutCamOrigin.y, ",",
+          m_lastFanoutCamOrigin.z, ")"));
+      }
+    }
+    const bool o2wNowSet = !isIdentityExact(transforms.objectToWorld);
+    if (m_skipViewMatrixScan && !o2wNowSet) {
       const auto& vsCbs = m_context->m_state.vs.constantBuffers;
       const auto& cb3 = vsCbs[3];
       const float* bm = nullptr;
@@ -2829,6 +2883,18 @@ namespace dxvk {
         // objectToWorld = inverse(fullViewMatrix) × cb3
         Matrix4 invView = inverse(transforms.worldToView);
         transforms.objectToWorld = invView * cb3Mat;
+        // NV-DXVK: TF2's cb3 is objectToCameraRelative — its translation is
+        // (mesh_world - cameraOrigin). inverse(worldToView) * cb3 rotates
+        // correctly but produces translation ≈ cb3.T in the same camera-
+        // relative frame, missing the +cameraOrigin that would land geometry
+        // at absolute world. Force the translation column to be
+        // (cb3.T + fanoutCameraOrigin) so BLAS_vert ends up at world.
+        if (m_hasFanoutCamOrigin) {
+          transforms.objectToWorld[3][0] = cb3Mat[3][0] + m_lastFanoutCamOrigin.x;
+          transforms.objectToWorld[3][1] = cb3Mat[3][1] + m_lastFanoutCamOrigin.y;
+          transforms.objectToWorld[3][2] = cb3Mat[3][2] + m_lastFanoutCamOrigin.z;
+          transforms.objectToWorld[3][3] = 1.0f;
+        }
         static uint32_t sO2wLog = 0;
         if (sO2wLog < 10) {
           ++sO2wLog;
@@ -2838,7 +2904,8 @@ namespace dxvk {
             "[D3D11Rtx] CB3→O2W: cb3T=(", c[3][0], ",", c[3][1], ",", c[3][2], ")",
             " cb3R0=(", c[0][0], ",", c[0][1], ",", c[0][2], ")",
             " o2wT=(", o[3][0], ",", o[3][1], ",", o[3][2], ")",
-            " o2wR0=(", o[0][0], ",", o[0][1], ",", o[0][2], ")"));
+            " o2wR0=(", o[0][0], ",", o[0][1], ",", o[0][2], ")",
+            " fanoutCam=", m_hasFanoutCamOrigin ? 1 : 0));
         }
       }
     }
@@ -2916,11 +2983,21 @@ namespace dxvk {
             && std::abs(Tx) < 1e-6f && std::abs(Ty) < 1e-6f && std::abs(Tz) < 1e-6f)
           return false;
         // Row-major Matrix4 from row-major float3x4.
+        // NV-DXVK: if we're running on TF2 (detected by m_hasFanoutCamOrigin
+        // being set — BSP fanout only publishes for Source-engine-style
+        // camera-relative rendering), the cb3 content is in camera-relative
+        // space and its translation = (mesh_world - cameraOrigin). Add
+        // +cameraOrigin so the final o2w lands geometry at absolute world.
+        // For non-TF2 games fanout never publishes, so this branch is skipped
+        // and the legacy behavior (trust the matrix as-is) is preserved.
+        const float tX = m_hasFanoutCamOrigin ? (Tx + m_lastFanoutCamOrigin.x) : Tx;
+        const float tY = m_hasFanoutCamOrigin ? (Ty + m_lastFanoutCamOrigin.y) : Ty;
+        const float tZ = m_hasFanoutCamOrigin ? (Tz + m_lastFanoutCamOrigin.z) : Tz;
         transforms.objectToWorld = Matrix4(
           Vector4(R00, R01, R02, 0.0f),
           Vector4(R10, R11, R12, 0.0f),
           Vector4(R20, R21, R22, 0.0f),
-          Vector4(Tx,  Ty,  Tz,  1.0f));
+          Vector4(tX,  tY,  tZ,  1.0f));
         return true;
       };
 
@@ -2946,6 +3023,15 @@ namespace dxvk {
         if (std::abs(candidate[3][3] - 1.0f) > 0.01f) return false;
         if (std::abs(candidate[0][3]) > 0.01f || std::abs(candidate[1][3]) > 0.01f || std::abs(candidate[2][3]) > 0.01f)
           return false;
+        // NV-DXVK: same TF2 camera-relative adjustment as trySourceFloat3x4.
+        // If fanout has published, we know we're on TF2 — adjust translation
+        // by +fanoutCameraOrigin. Otherwise leave the matrix untouched so
+        // non-Source engines continue to work unchanged.
+        if (m_hasFanoutCamOrigin) {
+          candidate[3][0] += m_lastFanoutCamOrigin.x;
+          candidate[3][1] += m_lastFanoutCamOrigin.y;
+          candidate[3][2] += m_lastFanoutCamOrigin.z;
+        }
         transforms.objectToWorld = candidate;
         return true;
       };
@@ -2984,14 +3070,20 @@ namespace dxvk {
         //   camera_relative -> clip   : CBufCommonPerCamera.c_cameraRelativeToClip
         //                               (float4x4 at cb offset 16)
         //
-        // The engine has NO absolute-world matrix in its shader pipeline — all
-        // rendering is camera-relative. Remix's w2v is likewise camera-relative
-        // (translation column is the camera-relative camera origin, i.e. zero
-        // for the main view). BLAS should therefore hold geometry in the same
-        // camera-relative frame; objectToWorld = objectToCameraRelative directly.
+        // NV-DXVK: previous comment claimed "Remix's w2v is likewise
+        // camera-relative (translation column is zero for main view)". That
+        // was correct under kCameraAtOrigin=true, but we flipped that to
+        // false (see line ~1814) because NRC needs stable world coords and
+        // motion vectors need real camera motion. Under the world-space
+        // convention, worldToView subtracts the absolute cameraOrigin, so
+        // BLAS vertices must be in ABSOLUTE WORLD space — not camera-relative.
         //
-        // If CBufModelInstance isn't bound, the VB is already in camera-relative
-        // space (CPU-baked) and objectToWorld = identity is correct.
+        // cb3.objectToCameraRelative produces (mesh_world - cameraOrigin) in
+        // its translation. Using it directly as o2w makes BLAS land at
+        // camera-relative, then w2v subtracts cam again → world - 2·cam
+        // (geometry behind the player). Fix: add +cameraOrigin to the
+        // translation column so BLAS ends up in absolute world coords, which
+        // matches the world-space worldToView.
 
         auto modelCb = commonVS->FindCBuffer("CBufModelInstance");
         if (modelCb && modelCb->bindSlot != UINT32_MAX) {
@@ -3002,12 +3094,29 @@ namespace dxvk {
               if (!std::isfinite(m[k])) ok = false;
             if (ok) {
               // Row-major float3x4: row r = (basis_r.xyz, translation.comp_r)
+              // Add fanout cameraOrigin to the translation to undo TF2's
+              // camera-relative offset. If fanout hasn't published yet (very
+              // early boot frames), leave translation untouched — the
+              // geometry will be slightly mis-placed for those frames, but
+              // Main isn't valid then so injectRTX won't run anyway.
+              const float tx = m_hasFanoutCamOrigin ? (m[3]  + m_lastFanoutCamOrigin.x) : m[3];
+              const float ty = m_hasFanoutCamOrigin ? (m[7]  + m_lastFanoutCamOrigin.y) : m[7];
+              const float tz = m_hasFanoutCamOrigin ? (m[11] + m_lastFanoutCamOrigin.z) : m[11];
               transforms.objectToWorld = Matrix4(
                 Vector4(m[0], m[1],  m[2],  0.0f),
                 Vector4(m[4], m[5],  m[6],  0.0f),
                 Vector4(m[8], m[9],  m[10], 0.0f),
-                Vector4(m[3], m[7],  m[11], 1.0f));
+                Vector4(tx,   ty,    tz,    1.0f));
               found = true;
+              static uint32_t sRdefLog = 0;
+              if (sRdefLog < 20) {
+                ++sRdefLog;
+                Logger::info(str::format(
+                  "[D3D11Rtx] RDEF CBufModelInstance: raw cb3T=(",
+                  m[3], ",", m[7], ",", m[11], ")",
+                  " adjusted o2wT=(", tx, ",", ty, ",", tz, ")",
+                  " fanoutCam=", m_hasFanoutCamOrigin ? 1 : 0));
+              }
             }
           }
         }
@@ -3126,16 +3235,43 @@ namespace dxvk {
                     " cb2base=", base, " bufSize=", sz));
                 }
               }
-              if (std::isfinite(camX) && std::isfinite(camY) && std::isfinite(camZ)
-                  && (std::abs(camX) + std::abs(camY) + std::abs(camZ)) > 1.0f) {
+              // NV-DXVK: different VS permutations store c_cameraOrigin with
+              // different signs at cb2@4 (the fanout BSP VS sees +cam for
+              // gameplay camera, while other VS permutations — shadow,
+              // reflection, HUD — see NEGATED cam or their own pass-camera).
+              // Using the per-draw cb2@4 produces inconsistent o2w.T across
+              // draws in the same frame: BSP walls land at -cam, characters
+              // at their own pass-cam, etc. Prefer the authoritative
+              // m_lastFanoutCamOrigin (captured once per frame from the
+              // gameplay BSP fanout VS). The per-draw cb2@4 is only used as
+              // a last-resort fallback when fanout hasn't published yet.
+              float useCamX = camX, useCamY = camY, useCamZ = camZ;
+              bool camFromFanout = false;
+              if (m_hasFanoutCamOrigin) {
+                useCamX = m_lastFanoutCamOrigin.x;
+                useCamY = m_lastFanoutCamOrigin.y;
+                useCamZ = m_lastFanoutCamOrigin.z;
+                camFromFanout = true;
+              }
+              if (std::isfinite(useCamX) && std::isfinite(useCamY) && std::isfinite(useCamZ)
+                  && (std::abs(useCamX) + std::abs(useCamY) + std::abs(useCamZ)) > 1.0f) {
                 transforms.objectToWorld = Matrix4(
                   Vector4(1.0f, 0.0f, 0.0f, 0.0f),
                   Vector4(0.0f, 1.0f, 0.0f, 0.0f),
                   Vector4(0.0f, 0.0f, 1.0f, 0.0f),
-                  Vector4(camX, camY, camZ, 1.0f));
+                  Vector4(useCamX, useCamY, useCamZ, 1.0f));
                 found = true;
-                m_lastDrawCamOrigin    = Vector3(camX, camY, camZ);
+                m_lastDrawCamOrigin    = Vector3(useCamX, useCamY, useCamZ);
                 m_lastDrawCamOriginSet = true;
+                static uint32_t sCamFbLog = 0;
+                if (sCamFbLog < 20) {
+                  ++sCamFbLog;
+                  Logger::info(str::format(
+                    "[D3D11Rtx] o2w fallback (camOri): src=",
+                    camFromFanout ? "fanout" : "cb2@4",
+                    " cb2Cam=(", camX, ",", camY, ",", camZ, ")",
+                    " use=(", useCamX, ",", useCamY, ",", useCamZ, ")"));
+                }
               }
             }
           }
