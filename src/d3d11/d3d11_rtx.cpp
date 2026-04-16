@@ -233,35 +233,57 @@ namespace dxvk {
     RtxOptions::showUIObject().setDeferred(UIType::Advanced, defaults);
   }
 
+  // NV-DXVK: return-value helper. True = skip D3D11 native rasterization
+  // (RT already owns the output), false = emit native raster via EmitCs.
+  // Once Remix is active we normally suppress ALL subsequent raster to avoid
+  // the "shared RT target" write hazards documented on m_remixActiveThisFrame,
+  // BUT UI/HUD draws must rasterize natively or they never appear — the RT
+  // composite doesn't include them. So: if THIS draw was RT-captured, or
+  // the frame already had RT activity AND this draw was NOT UI-classified,
+  // return true. If this draw was filtered as UI, always return false so
+  // the native raster path runs (and the HUD shows up).
+  // NOTE: RT's final blit in rtx_context.cpp:725 currently copies the RT
+  // output OVER the backbuffer, which can still clobber the UI pixels that
+  // native raster just wrote. Full fix requires either deferring UI emits
+  // past injectRTX or a masked composite; this change is the necessary-
+  // but-not-sufficient first step.
   bool D3D11Rtx::OnDraw(UINT vertexCount, UINT startVertex) {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
+    m_lastDrawFilteredAsUI = false;
     SubmitDraw(false, vertexCount, startVertex, 0);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
   bool D3D11Rtx::OnDrawIndexed(UINT indexCount, UINT startIndex, INT baseVertex) {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
+    m_lastDrawFilteredAsUI = false;
     SubmitDraw(true, indexCount, startIndex, baseVertex);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
   bool D3D11Rtx::OnDrawInstanced(UINT vertexCountPerInstance, UINT instanceCount, UINT startVertex, UINT startInstance) {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
+    m_lastDrawFilteredAsUI = false;
     SubmitInstancedDraw(false, vertexCountPerInstance, startVertex, 0, instanceCount, startInstance);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
   bool D3D11Rtx::OnDrawIndexedInstanced(UINT indexCountPerInstance, UINT instanceCount, UINT startIndex, INT baseVertex, UINT startInstance) {
     ++m_rawDrawCount;
     m_lastDrawCaptured = false;
+    m_lastDrawFilteredAsUI = false;
     SubmitInstancedDraw(true, indexCountPerInstance, startIndex, baseVertex, instanceCount, startInstance);
     if (m_lastDrawCaptured) m_remixActiveThisFrame = true;
+    if (m_lastDrawFilteredAsUI) return false;
     return m_remixActiveThisFrame;
   }
 
@@ -634,6 +656,47 @@ namespace dxvk {
                             || std::abs(m_lastFanoutCamOrigin.z - fp[2]) > 0.5f;
                           m_lastFanoutCamOrigin = Vector3(fp[0], fp[1], fp[2]);
                           m_hasFanoutCamOrigin = true;
+                          // NV-DXVK: capture the VP rows at the SAME cb/offset
+                          // we just pulled camOrigin from. CBufCommonPerCamera
+                          // lives at camLoc->slot; c_cameraRelativeToClip is at
+                          // +16 (current frame VP) and ...PrevFrame at +96. We
+                          // prefer +16 but fall back to +96 when +16 is still
+                          // identity (very early frames). The same cb is
+                          // authoritative for "the gameplay pose" when read
+                          // from the fanout VS — path 3 should reuse this
+                          // rather than reading cb2@96 of whichever VS it
+                          // happens to be running under.
+                          {
+                            const size_t vpBaseCurr =
+                              static_cast<size_t>(cb.constantOffset) * 16 + 16;
+                            const size_t vpBasePrev =
+                              static_cast<size_t>(cb.constantOffset) * 16 + 96;
+                            const size_t bsz = cb.buffer->Desc()->ByteWidth;
+                            auto tryReadVP = [&](size_t b) -> bool {
+                              if (b + 64 > bsz) return false;
+                              const float* vp = reinterpret_cast<const float*>(p + b);
+                              for (int k = 0; k < 12; ++k)
+                                if (!std::isfinite(vp[k])) return false;
+                              Vector3 r0(vp[0], vp[1], vp[2]);
+                              Vector3 r1(vp[4], vp[5], vp[6]);
+                              Vector3 r2(vp[8], vp[9], vp[10]);
+                              // Reject identity — means VP not yet populated.
+                              if (std::abs(r0.x - 1.0f) < 1e-4f
+                                  && std::abs(r1.y - 1.0f) < 1e-4f
+                                  && std::abs(r2.z - 1.0f) < 1e-4f
+                                  && std::abs(r0.y) < 1e-4f && std::abs(r0.z) < 1e-4f)
+                                return false;
+                              // Reject zero / degenerate rows.
+                              const float l0 = length(r0), l1 = length(r1), l2 = length(r2);
+                              if (l0 < 0.1f || l1 < 0.1f || l2 < 0.001f) return false;
+                              m_lastFanoutVpRow0 = r0;
+                              m_lastFanoutVpRow1 = r1;
+                              m_lastFanoutVpRow2 = r2;
+                              m_hasFanoutVpRows = true;
+                              return true;
+                            };
+                            if (!tryReadVP(vpBaseCurr)) tryReadVP(vpBasePrev);
+                          }
                           if (changed) {
                             static uint32_t sPublishLog = 0;
                             if (sPublishLog < 30) {
@@ -641,7 +704,8 @@ namespace dxvk {
                               Logger::info(str::format(
                                 "[D3D11Rtx.fanoutOri] publish #", sPublishLog,
                                 " draw=", m_drawCallID,
-                                " cam=(", fp[0], ",", fp[1], ",", fp[2], ")"));
+                                " cam=(", fp[0], ",", fp[1], ",", fp[2], ")",
+                                " vpRows=", m_hasFanoutVpRows ? 1 : 0));
                             }
                           }
                         } else {
@@ -1604,10 +1668,18 @@ namespace dxvk {
             //   P = standard perspective from Sx, Sy, conservative near/far
             //   V = rigid-body view matrix from the normalized directions + position
             if (cls == 3 || cls == 4) {
-              // Extract camera basis vectors from VP rows (xyz only, ignoring w).
-              Vector3 vpRight(proj[0][0], proj[0][1], proj[0][2]);
-              Vector3 vpUp   (proj[1][0], proj[1][1], proj[1][2]);
-              Vector3 vpFwd  (proj[2][0], proj[2][1], proj[2][2]);
+              // NV-DXVK: prefer the fanout-cached VP rows over proj[] when
+              // available. The cached projection slot/offset may contain a
+              // DIFFERENT VS's cb2 content than the gameplay fanout VS's, so
+              // per-draw reads of proj[] can flip the basis by 90° between
+              // draws. Fanout rows are captured once per frame from the
+              // authoritative gameplay VS, so everyone sees the same pose.
+              Vector3 vpRight = m_hasFanoutVpRows ? m_lastFanoutVpRow0
+                                                  : Vector3(proj[0][0], proj[0][1], proj[0][2]);
+              Vector3 vpUp    = m_hasFanoutVpRows ? m_lastFanoutVpRow1
+                                                  : Vector3(proj[1][0], proj[1][1], proj[1][2]);
+              Vector3 vpFwd   = m_hasFanoutVpRows ? m_lastFanoutVpRow2
+                                                  : Vector3(proj[2][0], proj[2][1], proj[2][2]);
 
               const float magRight = length(vpRight);
               const float magUp    = length(vpUp);
@@ -2106,13 +2178,37 @@ namespace dxvk {
                 " cam=(", camX, ",", camY, ",", camZ, ")"));
             }
           }
-          // Read VP rotation from cb2@96. Use LIVE data if valid (non-identity
-          // VP with proper axis magnitudes), otherwise fall back to cached
-          // rotation from m_lastGoodTransforms (from a previous frame's detection).
+          // Read VP rotation. Prefer the cached fanout VP rows (captured at
+          // the same moment as m_lastFanoutCamOrigin) so every path-3 draw
+          // gets the SAME gameplay pose regardless of which VS's cb2 is
+          // bound for this specific draw. Only fall back to per-draw cb2@96
+          // when fanout hasn't published yet (very early boot frames).
           Vector3 right(0, -1, 0), up(0, 0, 1), fwd(1, 0, 0);  // defaults
           bool gotLiveRotation = false;
+          bool usedFanoutVp = false;
+          if (m_hasFanoutVpRows) {
+            const Vector3& vpRight = m_lastFanoutVpRow0;
+            const Vector3& vpUp    = m_lastFanoutVpRow1;
+            const Vector3& vpFwd   = m_lastFanoutVpRow2;
+            float magR = length(vpRight), magU = length(vpUp), magF = length(vpFwd);
+            if (magR > 0.1f && magU > 0.1f && magF > 0.001f &&
+                std::abs(magR - magU) > 0.01f) {
+              right = vpRight / magR;
+              up    = vpUp    / magU;
+              fwd   = vpFwd   / magF;
+              // Re-orthogonalize (same as path 1 and updated path 3).
+              Vector3 up2 = cross(right, fwd);
+              float upLen = length(up2);
+              if (upLen > 0.001f) up = up2 / upLen;
+              Vector3 right2 = cross(fwd, up);
+              float rightLen = length(right2);
+              if (rightLen > 0.001f) right = right2 / rightLen;
+              gotLiveRotation = true;
+              usedFanoutVp = true;
+            }
+          }
           const auto& camCb2 = m_context->m_state.vs.constantBuffers[2];
-          if (camCb2.buffer != nullptr) {
+          if (!gotLiveRotation && camCb2.buffer != nullptr) {
             const auto camMapped2 = camCb2.buffer->GetMappedSlice();
             const uint8_t* camPtr = reinterpret_cast<const uint8_t*>(camMapped2.mapPtr);
             if (camPtr && camCb2.buffer->Desc()->ByteWidth >= 160) {
@@ -2128,6 +2224,23 @@ namespace dxvk {
                 right = vpRight / magR;
                 up    = vpUp    / magU;
                 fwd   = vpFwd   / magF;
+                // NV-DXVK (fix 6): re-orthogonalize the basis the same way path 1
+                // does (VP-decomposition branch at line ~1624). TF2's combined
+                // VP rows are NOT perfectly orthonormal after TAA jitter +
+                // float rounding, and path 1 re-orthogonalizes while path 3
+                // used the raw rows verbatim. That tiny skew was enough to
+                // make the two paths produce bases that differed by a full
+                // 90° permutation across successive frames (visible in the
+                // log as the latch #1 vs latch #2 axis twist). Apply the same
+                // RH cross-product pass here so both paths end up with
+                // identical orthonormal bases and the hysteresis gate in
+                // CameraManager sees a consistent forward direction.
+                Vector3 up2 = cross(right, fwd);
+                float upLen = length(up2);
+                if (upLen > 0.001f) up = up2 / upLen;
+                Vector3 right2 = cross(fwd, up);
+                float rightLen = length(right2);
+                if (rightLen > 0.001f) right = right2 / rightLen;
                 // NO Y-flip — use raw VP rotation so inverse matches cb3
                 gotLiveRotation = true;
               }
@@ -2632,12 +2745,21 @@ namespace dxvk {
     // this without introducing visible lag. The rotation (upper 3x3) is left
     // untouched — rotation jitter is rare and smoothing it causes ghosting.
     //
+    // NV-DXVK: Smoothing is ONLY applied to VP-decomposition paths (1, 2, 3)
+    // where float rounding in the row-magnitude normalization + basis
+    // re-derivation actually produces jitter. For the cached-slot scan paths
+    // (5-10) the translation column is read verbatim from a real view matrix
+    // cbuffer — no jitter — and smoothing just introduces lag. m_lastWtvPathId
+    // lets us gate cleanly. Paths 0 and 11 are also excluded (bone-composite).
+    //
     // D3D row-major view matrix layout:
     //   [R00 R01 R02  0]    pos = -R^T * t
     //   [R10 R11 R12  0]    where t = (V[3][0], V[3][1], V[3][2])
     //   [R20 R21 R22  0]
     //   [tx  ty  tz   1]
-    if (!isIdentityExact(transforms.worldToView) && !m_skipViewMatrixScan) {
+    const bool smoothingApplies =
+      m_lastWtvPathId == 1 || m_lastWtvPathId == 2 || m_lastWtvPathId == 3;
+    if (smoothingApplies && !isIdentityExact(transforms.worldToView) && !m_skipViewMatrixScan) {
       const auto& V = transforms.worldToView;
       // Camera world position: pos = -R^T * t for view matrix V = [R | 0; t | 1]
       Vector3 t(V[3][0], V[3][1], V[3][2]);
@@ -4810,6 +4932,7 @@ namespace dxvk {
         const auto& cached = m_lastGoodTransforms.worldToView;
         if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
           BumpFilter(FilterReason::UIFallback);
+          m_lastDrawFilteredAsUI = true;
           return;
         }
         // NV-DXVK: Only reuse the CAMERA transforms (viewToProjection,
@@ -4836,6 +4959,8 @@ namespace dxvk {
           if (std::abs(o2v[3][0]) > maxT || std::abs(o2v[3][1]) > maxT || std::abs(o2v[3][2]) > maxT ||
               !std::isfinite(o2v[3][0]) || !std::isfinite(o2v[3][1]) || !std::isfinite(o2v[3][2])) {
             BumpFilter(FilterReason::UIFallback);
+            // NOTE: do NOT set m_lastDrawFilteredAsUI — this is shadow/depth
+            // rejection not actual UI. Keep native raster suppressed.
             return;
           }
         }
@@ -4851,7 +4976,11 @@ namespace dxvk {
               " w2v T=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")"));
         }
       } else {
+        // NV-DXVK: TRUE UI-class draw — no real projection has been found in
+        // any prior draw of this frame. Flag for OnDraw* to allow native
+        // rasterization so the menu/HUD at least enters the backbuffer.
         BumpFilter(FilterReason::UIFallback);
+        m_lastDrawFilteredAsUI = true;
         return;
       }
     }
@@ -5433,54 +5562,15 @@ namespace dxvk {
     m_boneInstCacheHits = 0;
     m_boneInstCacheMisses = 0;
 
-    // Safety net: if no draw set the camera this frame (all filtered, empty
-    // present, geometry-hash failures, etc.), push a viewport-derived camera
-    // so Remix doesn't reject the frame with "not detecting a valid camera".
-    // The check runs on the CS thread where the camera state is authoritative.
-    //
-    // NV-DXVK: Only fire the safety net when at least one RTX-bound draw
-    // actually passed all the pre-filters this frame (draws > 0).  On
-    // pure-UI frames (Source main menu, loading screens, video playback,
-    // etc.) every draw is filtered out by the UIFallback reason, so
-    // drawCallID stays zero and the RTX pipeline should not attempt to
-    // composite anything.  If we fire the safety net anyway, we hand
-    // injectRTX() a synthetic camera, isCameraValid becomes true, and
-    // injectRTX starts path-tracing an empty scene — which compresses the
-    // native backbuffer content into a tiny corner of the output.
-    // Keeping the camera invalid lets injectRTX early-return (see
-    // rtx_context.cpp:492) and the native raster content passes through
-    // the presenter unchanged.
-    // NV-DXVK: safety net DISABLED. It was preempting the classifier:
-    // EndFrame's EmitCs lambda runs on the CS thread NEXT frame, calls
-    // processExternalCamera with frame N's last-extracted transforms
-    // (often a UI/fallback matrix with the wrong FoV) stamped as frame N+1's
-    // frameId. The next frame's gameplay draws then saw Main valid for
-    // frame N+1 already → shouldUpdateMainCamera=false → classifier never
-    // re-latched → loop self-sustained forever, with Main pinned to a
-    // garbage UI transform.
-    //
-    // Without this safety net, frames where the classifier doesn't latch
-    // simply leave Main invalid; the RT pipeline early-returns (rtx_context.cpp
-    // injectRTX), the native raster path's content passes through the
-    // presenter unchanged. That was the original intent of the safety net,
-    // but it wasn't needed to achieve it.
-    if (false && draws > 0) {
-      DrawCallTransforms t = ExtractTransforms();
-      if (!isIdentityExact(t.viewToProjection)) {
-        Matrix4 wtv = t.worldToView;
-        Matrix4 vtp = t.viewToProjection;
-        m_context->EmitCs([wtv, vtp](DxvkContext* ctx) {
-          RtxContext* rtx = static_cast<RtxContext*>(ctx);
-          auto& camMgr = rtx->getSceneManager().getCameraManager();
-          auto& mainCam = camMgr.getCamera(CameraType::Main);
-          const uint32_t frameId = rtx->getDevice()->getCurrentFrameId();
-          if (!mainCam.isValid(frameId)) {
-            Logger::info(str::format("[D3D11Rtx] Camera safety net fired: frameId=", frameId));
-            camMgr.processExternalCamera(CameraType::Main, wtv, vtp);
-          }
-        });
-      }
-    }
+    // NV-DXVK: removed dead safety net. It was preempting the classifier:
+    // EndFrame's EmitCs lambda ran on the CS thread the NEXT frame, calling
+    // processExternalCamera with frame N's last-extracted transforms (often
+    // a UI/fallback matrix) stamped as frame N+1's frameId. The next frame's
+    // gameplay draws then saw Main valid for frame N+1 already →
+    // shouldUpdateMainCamera=false → classifier never re-latched. The
+    // current classifier + hysteresis gate leaves Main invalid on frames
+    // where no gameplay draw is found, which is correct — injectRTX
+    // early-returns and the native raster content passes through unchanged.
 
     m_drawCallID = 0;
     m_rawDrawCount = 0;

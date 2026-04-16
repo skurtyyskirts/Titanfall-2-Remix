@@ -655,6 +655,26 @@ namespace dxvk {
       ONCE(Logger::info(str::format("[RTX-Compatibility-Info] Volume Froxel Max Distance set to ", volumeArgs.froxelMaxDistance, " but current camera frustum allows only a maximum of ", cameraFrustumMaxDistance)));
     }
 
+    // NV-DXVK (fix 5): guard against an inverted/broken camera frustum. If the
+    // extracted projection produces near >= far (cameraFrustumMaxDistance <= 0),
+    // the froxel grid is constructed backwards and every downstream volumetric
+    // lookup returns black / garbage, which is what produces the "only
+    // particles, no volumetric lighting" symptom in the log. Clamp to a
+    // sensible positive distance and force a history reset so we don't carry
+    // the garbage across frames.
+    if (cameraFrustumMaxDistance <= 0.0f) {
+      ONCE(Logger::warn(str::format(
+        "[RTX] Volumetrics: invalid camera frustum (maxDistance=",
+        cameraFrustumMaxDistance,
+        ", near=", mainCamera.getNearPlane(),
+        ", far=", mainCamera.getFarPlane(),
+        "). Clamping froxelMaxDistance to a safe value and resetting volume history.")));
+      // Clamp the froxel distance to something the GPU can work with; don't
+      // try to render "meaningful" volumetrics until the camera recovers.
+      volumeArgs.froxelMaxDistance = std::min(volumeArgs.froxelMaxDistance, 100.0f);
+      volumeArgs.resetHistory = true;
+    }
+
     // Note: We need to invalidate the volumetric history buffers (radiance and age buffers) when detecting camera cut to avoid accumulating the history from different scenes
     volumeArgs.resetHistory = cameraManager.getMainCamera().isCameraCut();
 

@@ -901,6 +901,47 @@ namespace dxvk {
         drawCallState.cameraType = CameraType::Enum::Main;
       }
 
+      // NV-DXVK (fix 4): TLAS coord-space coherence gate — DIAGNOSTIC ONLY.
+      // The classifier hysteresis in CameraManager::processCameraData is the
+      // primary defense against the per-frame Main flicker. Once that's
+      // holding, a secondary rewrite here would only be useful for draws
+      // that the classifier demoted (Unknown) but the user has opted in to
+      // keeping via !skipObjectsWithUnknownCamera. Rewriting worldToView on
+      // legitimate Sky / ViewModel / RenderToTexture / Portal draws would
+      // break them, so we only LOG suspicious coord-space disagreements
+      // rather than mutating transforms. If the log shows persistent
+      // off-Main world draws coming through, the classifier's gates need to
+      // be tightened further upstream — not patched here.
+      if (drawCallState.cameraType != CameraType::Main
+          && drawCallState.cameraType != CameraType::Unknown
+          && cameraManager.isMainSetByClassifier()) {
+        const uint32_t frameIdNow = m_device->getCurrentFrameId();
+        const uint32_t latchFrame = cameraManager.getMainClassifierFrameId();
+        const bool mainFresh =
+          frameIdNow <= latchFrame || (frameIdNow - latchFrame) <= 5;
+        if (mainFresh) {
+          const RtCamera& mainCam = cameraManager.getMainCamera();
+          const Matrix4 v2w = inverse(transformData.worldToView);
+          const Vector3 drawPos(v2w[3][0], v2w[3][1], v2w[3][2]);
+          const Vector3 mainPos = mainCam.getPosition(/*freecam=*/false);
+          const float dx = drawPos.x - mainPos.x;
+          const float dy = drawPos.y - mainPos.y;
+          const float dz = drawPos.z - mainPos.z;
+          const float d2 = dx*dx + dy*dy + dz*dz;
+          constexpr float kEpsilon = 100.0f;
+          if (d2 < (kEpsilon * kEpsilon)) {
+            static uint32_t sSnapLog = 0;
+            if (sSnapLog < 20) {
+              ++sSnapLog;
+              Logger::info(str::format(
+                "[TLAS-coh] suspicious non-Main draw close to Main: cameraType=",
+                uint32_t(drawCallState.cameraType),
+                " |delta|=", std::sqrt(d2)));
+            }
+          }
+        }
+      }
+
       if (tryHandleSky(&params, &drawCallState) == TryHandleSkyResult::SkipSubmit) {
         return;
       }

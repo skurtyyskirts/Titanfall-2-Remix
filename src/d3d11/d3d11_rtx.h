@@ -59,6 +59,13 @@ namespace dxvk {
     // True when SubmitDraw successfully committed a draw to the RT pipeline.
     // Checked by OnDraw* return value to suppress redundant D3D11 rasterization.
     bool                                 m_lastDrawCaptured = false;
+    // NV-DXVK: set by SubmitDraw when the draw was filtered as UI. OnDraw*
+    // uses this to force native rasterization for UI draws even after Remix
+    // is active on the frame, so the HUD/menu stays visible. Without this
+    // flag, once m_remixActiveThisFrame flips true for a gameplay draw, every
+    // subsequent UI draw has its native raster suppressed as well and the UI
+    // never appears on screen.
+    bool                                 m_lastDrawFilteredAsUI = false;
     // True once ANY draw in the current frame was captured for RT.
     // Once Remix is active, ALL D3D11 rasterization is suppressed (including
     // filtered draws) because the game's native rasterization shares render
@@ -96,6 +103,20 @@ namespace dxvk {
     // from". Valid once any bone-fanout draw fires in the session.
     Vector3                              m_lastFanoutCamOrigin{ 0.0f, 0.0f, 0.0f };
     bool                                 m_hasFanoutCamOrigin = false;
+    // NV-DXVK: VP rotation rows captured at the SAME fanout moment as
+    // m_lastFanoutCamOrigin. Different VS permutations bind different cb2
+    // contents (reflection, shadow, cubemap, mech cockpit …) with different
+    // VP rotations; reading cb2@96 per-draw picks up whatever rotation was
+    // bound for that particular draw, causing path 3 to produce 90°-flipped
+    // bases between frames. Caching the row vectors from the authoritative
+    // gameplay fanout VS gives every subsequent path-3 draw the same
+    // orientation and stops the latch flicker. Each row is the raw float3
+    // from cb2@96 rows 0/1/2 (right/up/fwd × projection scale) — normalize
+    // and re-orthogonalize at use site, same as path 1.
+    Vector3                              m_lastFanoutVpRow0{ 0.0f, 0.0f, 0.0f };
+    Vector3                              m_lastFanoutVpRow1{ 0.0f, 0.0f, 0.0f };
+    Vector3                              m_lastFanoutVpRow2{ 0.0f, 0.0f, 0.0f };
+    bool                                 m_hasFanoutVpRows = false;
 
     // NV-DXVK: Per-frame bone instancing stats
     uint32_t                             m_boneInstBatches = 0;

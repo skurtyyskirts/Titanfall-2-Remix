@@ -71,6 +71,20 @@ namespace dxvk {
     uint32_t getMainClassifierFrameId() const { return m_mainSetByClassifierFrameId; }
     void noteMainSetByClassifier(uint32_t frameId) { m_mainSetByClassifierFrameId = frameId; }
 
+    // NV-DXVK: hysteresis state used by the Main classifier to reject
+    // frame-to-frame flicker between shadow/reflection/cubemap candidates and
+    // the real gameplay view. See processCameraData.
+    struct MainLatchSnapshot {
+      float fovRad       = 0.0f;
+      float viewportW    = 0.0f;
+      float viewportH    = 0.0f;
+      Vector3 fwd        = Vector3(0.0f, 0.0f, 0.0f);
+      Vector3 pos        = Vector3(0.0f, 0.0f, 0.0f);
+      bool   valid       = false;
+      uint32_t frameId   = UINT32_MAX;
+    };
+    const MainLatchSnapshot& getMainLatchSnapshot() const { return m_mainLatchSnapshot; }
+
   private:
     template<
       typename T,
@@ -95,6 +109,13 @@ namespace dxvk {
     // NV-DXVK: last frame where Main was latched by the classifier (vs. safety
     // net). UINT32_MAX means never. See isMainSetByClassifier() doc above.
     uint32_t m_mainSetByClassifierFrameId = UINT32_MAX;
+    // NV-DXVK: snapshot of the last accepted Main latch — used for hysteresis
+    // on subsequent candidates. See processCameraData.
+    MainLatchSnapshot m_mainLatchSnapshot;
+    // NV-DXVK: count of consecutive frames where a candidate disagreed with
+    // the latched Main. Reset on agreement. Once it exceeds kCutStreakThreshold
+    // the classifier accepts a re-latch (assumed camera cut).
+    uint32_t m_disagreeStreak = 0;
     fast_unordered_cache<DecomposeProjectionParams> m_decompositionCache;
 
     DecomposeProjectionParams getOrDecomposeProjection(const Matrix4& viewToProjection);

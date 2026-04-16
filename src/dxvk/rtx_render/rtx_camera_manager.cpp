@@ -200,8 +200,16 @@ namespace dxvk {
       // because volume rendering downstream expects a sane frustum.
       const float fovDeg = decomposeProjectionParams.fov * (180.0f / 3.14159265f);
       const bool isReasonableFov = fovDeg > 30.0f && fovDeg < 120.0f;
+      // NV-DXVK (fix 2): minimum viewport size gate. isNonSquare above already
+      // rejects the 1024×1024 / 128×128 / 16×16 / 1×1 shadow & probe viewports
+      // whose aspect is exactly 1, but TF2 also issues 640×360 / 1280×720 /
+      // 80×360 / 160×360 viewports with ~16:9 aspect — HUD compositing,
+      // thumbnails, minimaps — that were previously latching as Main and
+      // causing the flick. Require a minimum pixel count; the true backbuffer
+      // is always at least 720p.
+      const bool isLargeEnough = vw >= 1200.0f && vh >= 600.0f;
       const bool keepAsMain =
-        isInWorld && isNonSquare && isReasonableDepth && isReasonableFov;
+        isInWorld && isNonSquare && isReasonableDepth && isReasonableFov && isLargeEnough;
       if (!keepAsMain) {
         static uint32_t sVpLog = 0;
         if (sVpLog < 40) {
@@ -219,9 +227,84 @@ namespace dxvk {
             " isInWorld=", isInWorld ? 1 : 0,
             " isNonSquare=", isNonSquare ? 1 : 0,
             " isReasonableDepth=", isReasonableDepth ? 1 : 0,
-            " isReasonableFov=", isReasonableFov ? 1 : 0));
+            " isReasonableFov=", isReasonableFov ? 1 : 0,
+            " isLargeEnough=", isLargeEnough ? 1 : 0));
         }
         cameraType = CameraType::Unknown;
+      } else {
+        // NV-DXVK (fixes 1 + 3): latch hysteresis. Once Main is latched by the
+        // classifier, subsequent candidates that pass the physical gates must
+        // also look CONSISTENT with the existing latch — same FoV (±3°), same
+        // viewport (±4 px), same forward direction (dot > 0.5, i.e. within
+        // ~60° — accommodates normal mouse look but rejects the 90° axis
+        // twists seen in the log between wtvPathId=1 and wtvPathId=3). On
+        // kCutStreakThreshold consecutive disagreements we assume a real cut
+        // and allow the re-latch. Without this, every draw that passes the
+        // gates overwrites Main — and multiple draws per frame pass, so Main
+        // flickers between shadow/reflection/gameplay poses.
+        const uint32_t curFrameId = m_device->getCurrentFrameId();
+        const auto& snap = m_mainLatchSnapshot;
+        // Snapshot counts as fresh if it was set within the last couple of
+        // frames. Older than that, we assume the view was paused/stale and
+        // allow a fresh latch unconditionally.
+        const bool snapFresh =
+          snap.valid
+          && (curFrameId <= snap.frameId || (curFrameId - snap.frameId) <= 3);
+        if (snapFresh) {
+          const float fovDiff = std::abs(decomposeProjectionParams.fov - snap.fovRad);
+          const bool fovClose = fovDiff < 0.052f; // ~3 degrees
+          const bool vpMatches =
+            std::abs(vw - snap.viewportW) < 4.0f && std::abs(vh - snap.viewportH) < 4.0f;
+          // Forward from this draw's worldToView row-major convention: col 2.
+          const Vector3 newFwd(w2v[0][2], w2v[1][2], w2v[2][2]);
+          const float newFwdLen2 =
+            newFwd.x*newFwd.x + newFwd.y*newFwd.y + newFwd.z*newFwd.z;
+          const float dot =
+            (newFwdLen2 > 0.001f)
+              ? (newFwd.x*snap.fwd.x + newFwd.y*snap.fwd.y + newFwd.z*snap.fwd.z)
+              : 0.0f;
+          const bool basisClose = dot > 0.5f;
+          // NV-DXVK: differentiate hard and soft rejects. A viewport mismatch
+          // is a DIFFERENT RENDER PASS (HUD compositing, scope zoom, minimap
+          // preview, thumbnail) — not a camera cut. Accepting it as a "cut"
+          // after N tries just means the wrong render pass steals Main. So
+          // viewport-wrong candidates are HARD-rejected and never contribute
+          // to the cut streak. Only FoV-change + basis-change count, because
+          // those are real camera cuts (level change, teleport, cinematic).
+          if (!vpMatches) {
+            static uint32_t sHystLog = 0;
+            if (sHystLog < 40) {
+              ++sHystLog;
+              Logger::info(str::format(
+                "[CamMgr.hyst] HARD reject (wrong viewport)",
+                " vp=(", int(vw), "x", int(vh), ")",
+                " snapVp=(", int(snap.viewportW), "x", int(snap.viewportH), ")"));
+            }
+            cameraType = CameraType::Unknown;
+          } else if (!fovClose || !basisClose) {
+            ++m_disagreeStreak;
+            constexpr uint32_t kCutStreakThreshold = 8;
+            if (m_disagreeStreak < kCutStreakThreshold) {
+              static uint32_t sHystLog = 0;
+              if (sHystLog < 40) {
+                ++sHystLog;
+                Logger::info(str::format(
+                  "[CamMgr.hyst] reject streak=", m_disagreeStreak,
+                  " fovClose=", fovClose ? 1 : 0,
+                  " basisClose=", basisClose ? 1 : 0,
+                  " dot=", dot,
+                  " fovDelta=", fovDiff * (180.0f / 3.14159265f), "deg"));
+              }
+              cameraType = CameraType::Unknown;
+            } else {
+              // Consistent disagreement for many frames — accept as cut.
+              m_disagreeStreak = 0;
+              Logger::info("[CamMgr.hyst] accepting re-latch (cut)");
+            }
+          } else {
+            m_disagreeStreak = 0;
+          }
+        }
       }
     }
     
@@ -363,6 +446,27 @@ namespace dxvk {
     // this flag so it only rejects draws when Main's position is reliable.
     if (shouldUpdateMainCamera && cameraType == CameraType::Main) {
       noteMainSetByClassifier(frameId);
+      // NV-DXVK: record the snapshot used by the hysteresis gate on future
+      // candidates. Must happen AFTER camera.update so getPosition/getForward
+      // reflect the new latch.
+      {
+        MainLatchSnapshot& snap = m_mainLatchSnapshot;
+        snap.fovRad      = decomposeProjectionParams.fov;
+        snap.viewportW   = input.getTransformData().viewportWidth;
+        snap.viewportH   = input.getTransformData().viewportHeight;
+        // Forward from row-major worldToView col 2.
+        const Matrix4& w = worldToView;
+        snap.fwd         = Vector3(w[0][2], w[1][2], w[2][2]);
+        // Normalize (input may not be perfectly unit).
+        const float len2 = snap.fwd.x*snap.fwd.x + snap.fwd.y*snap.fwd.y + snap.fwd.z*snap.fwd.z;
+        if (len2 > 0.001f) {
+          const float invLen = 1.0f / std::sqrt(len2);
+          snap.fwd = Vector3(snap.fwd.x * invLen, snap.fwd.y * invLen, snap.fwd.z * invLen);
+        }
+        snap.pos         = camera.getPosition(/*freecam=*/false);
+        snap.frameId     = frameId;
+        snap.valid       = true;
+      }
       static uint32_t sMainLatchLog = 0;
       if (sMainLatchLog < 40) {
         ++sMainLatchLog;
