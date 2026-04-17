@@ -269,6 +269,17 @@ namespace dxvk {
       std::vector<std::future<void>>  asyncTasks = {};
     } m_objectPickingReadback {};
 
+    // NV-DXVK: per-frame log of unique surface indices visible at primary hit.
+    // Gated by env var RTX_LOG_VISIBLE_SURFACES=1. Reads m_sharedSurfaceIndex.
+    struct {
+      std::atomic<uint64_t>           signalValue = 1;
+      Rc<sync::Fence>                 signal = new sync::Fence{};
+      std::vector<std::future<void>>  asyncTasks = {};
+      bool                            envChecked = false;
+      bool                            enabled = false;
+    } m_visibleSurfacesReadback {};
+    void recordVisibleSurfacesReadback(const Resources::RaytracingOutput& rtOutput);
+
     std::vector<DrawCallState> m_delayedRayTracedSky;
 
 #ifdef REMIX_DEVELOPMENT

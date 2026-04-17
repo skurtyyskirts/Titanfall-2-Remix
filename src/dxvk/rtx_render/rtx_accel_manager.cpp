@@ -28,6 +28,7 @@
 #include "rtx_opacity_micromap_manager.h"
 #include "rtx_scene_manager.h"
 #include "rtx_accel_manager.h"
+#include "rtx_debug_probes.h"
 #include "rtx_point_instancer_system.h"
 
 #include "rtx_cb_types.h"
@@ -447,6 +448,10 @@ namespace dxvk {
     m_reorderedSurfacesFirstIndexOffset.clear();
     m_pointInstancerBatches.clear();
     memset(m_pointInstancerSlotsPerType, 0, sizeof(m_pointInstancerSlotsPerType));
+    // NV-DXVK debug: BLAS-BUILD-INPUT side tables cleared here (before pushes in this
+    // function), not in buildBlases (which runs after pushes and would wipe them).
+    m_debugBlasBuildEntries.clear();
+    m_debugBlasBuildDstBlas.clear();
 
     // NV-DXVK (debug probe B): emit previous frame's addBlas vs addPI routing counts,
     // then reset. Logs every frame so we see BSP-fanout survival across the session.
@@ -506,13 +511,24 @@ namespace dxvk {
     // NOTE: Would like to use the BLAS Linked instances here, but that misses viewmodel and virtual instances
     std::unordered_map<BlasEntry*, std::vector<RtInstance*>> uniqueBlas;
 
+    // NV-DXVK debug: routing stats per frame for PI vs non-PI instances.
+    struct RoutingStats {
+      uint32_t total = 0;        uint32_t hidden = 0;       uint32_t mask0 = 0;
+      uint32_t routedDynamic = 0; uint32_t routedMerged = 0; uint32_t earlyContinue = 0;
+    } piStats {}, normStats {};
+
     for (RtInstance* instance : instances) {
+      const bool isPi = (instance->surface.instancesToObject != nullptr);
+      RoutingStats& s = isPi ? piStats : normStats;
+      ++s.total;
       if (instance->isHidden()) {
+        ++s.hidden;
         continue;
       }
 
       // If the instance has zero mask, do not build BLAS for it: no ray can intersect this instance.
       if (instance->getVkInstance().mask == 0) {
+        ++s.mask0;
         
         bool needsOpacityMicromap = instance->isViewModelReference() && opacityMicromapManager;
         bool hasBillboards = instance->getBillboardCount() > 0;
@@ -564,9 +580,11 @@ namespace dxvk {
                                       blasEntry->getLinkedInstances().size() <= 1;                                 // NV-DXVK: Don't force merge if BlasEntry has multiple instances (avoids dynamic/merged conflict)
 
       if (requestDynamicBlas && !forceMergedBlas) {
+        ++s.routedDynamic;
         // Since this loop is iterating over instances, and instances can share BLAS, we will build these later after identifying unique ones.
         uniqueBlas[blasEntry].push_back(instance);
       } else {
+        ++s.routedMerged;
 
         if (blasEntry->dynamicBlas != nullptr) {
           // Move the BLAS used by this geometry to the common pool.
@@ -578,6 +596,17 @@ namespace dxvk {
         // Calculate the device address for the current instance's transform and write the transform data
         // TODO: only do this for non-identity transforms
         VkDeviceAddress transformDeviceAddress = m_transformBuffer->getDeviceAddress() + instanceTransforms.size() * sizeof(VkTransformMatrixKHR);
+
+        // NV-DXVK (TF2 BSP fix): Source-engine BSP world vertex buffers are in
+        // camera-relative space (world - cameraOrigin). The fanout path at
+        // d3d11_rtx.cpp adds camOrigin to the per-instance translation to shift
+        // to absolute world; non-fanout BSP draws that reach this merged-bucket
+        // path end up with objectToWorld=identity because the upstream didn't
+        // detect them. We fix that here: if the source instance transform is
+        // exactly identity (the tell-tale for a cam-relative BSP draw), replace
+        // it with translate-by-camOrigin. Non-identity transforms (small props
+        // with their own placement) are left alone so their placement is
+        // preserved.
         instanceTransforms.push_back(instance->getVkInstance().transform);
 
         for (auto& geometry : blasEntry->buildGeometries) {
@@ -668,7 +697,11 @@ namespace dxvk {
       // Try to reuse our dynamic BLAS if it exists
       Rc<PooledBlas>& selectedBlas = blasEntry->dynamicBlas;
 
+      // NV-DXVK debug: force rebuild every frame (destructive, off by default).
       bool build = forceRebuild || !selectedBlas.ptr() || selectedBlas->accelStructure->info().size != sizeInfo.accelerationStructureSize;
+      if constexpr (kEnableRtxDebugDestructiveProbes) {
+        build = true;
+      }
 
       // Validate that the selected blas is compatible with the current build info for update purposes
       bool update = blasEntry->frameLastUpdated == currentFrame;
@@ -713,6 +746,9 @@ namespace dxvk {
         // Put the merged BLAS into the build queue
         blasToBuild.push_back(buildInfo);
         blasRangesToBuild.push_back(&blasEntry->buildRanges[0]);
+        // NV-DXVK debug: stash blasEntry + selectedBlas so we can read source buffers later.
+        m_debugBlasBuildEntries.push_back(blasEntry);
+        m_debugBlasBuildDstBlas.push_back(selectedBlas.ptr());
 
         copyAccelerationStructureBuildGeometryInfo(buildInfo, selectedBlas->buildInfo);
       }
@@ -756,6 +792,20 @@ namespace dxvk {
 
       // Track the lifetime and states of the source geometry buffers
       trackBlasBuildResources(ctx, execBarriers, blasEntry);
+    }
+
+    // NV-DXVK debug: dump routing stats. Throttled to every ~10 RT-active frames.
+    if constexpr (kEnableRtxDebugProbes) {
+      static uint32_t s_routingStatsFrame = 0;
+      if ((s_routingStatsFrame++ % 10u) == 0) {
+        Logger::info(str::format(
+          "[PI-routing] frame=", s_routingStatsFrame,
+          " PI: total=", piStats.total, " hidden=", piStats.hidden, " mask0=", piStats.mask0,
+          " →dynamic=", piStats.routedDynamic, " →merged=", piStats.routedMerged,
+          " | NORM: total=", normStats.total, " hidden=", normStats.hidden, " mask0=", normStats.mask0,
+          " →dynamic=", normStats.routedDynamic, " →merged=", normStats.routedMerged,
+          " uniqueBlasSize=", uniqueBlas.size()));
+      }
     }
 
     // Copy the instance transform data to the device
@@ -934,6 +984,9 @@ namespace dxvk {
       // Put the merged BLAS into the build queue
       blasToBuild.push_back(buildInfo);
       blasRangesToBuild.push_back(bucket->ranges.data());
+      // NV-DXVK debug: merged-bucket BLASes don't have a single owning blasEntry, push nullptr.
+      m_debugBlasBuildEntries.push_back(nullptr);
+      m_debugBlasBuildDstBlas.push_back(selectedBlas);
 
       static float identityTransform[3][4] = {
         { 1.f, 0.f, 0.f, 0.f },
@@ -1147,9 +1200,23 @@ namespace dxvk {
 
     system.dispatchCulling(ctx, m_vkInstanceBuffer, m_surfaceBuffer, surfaceMaterialBuffer, m_pointInstancerBatches, cameraPos);
 
-    // NV-DXVK (debug probe D): DISABLED — readback served its purpose. Enable
-    // by flipping the `if (false)` below. Source buffers now have TRANSFER_SRC_BIT.
-    if (false) {
+    // NV-DXVK debug: definitive test. Overwrite the FIRST PI batch's first slot in
+    // m_vkInstanceBuffer with a copy of a known-working merged-Opaque instance entry,
+    // but keep the original surface index so we can detect it in [VisibleSurf].
+    // If VisibleSurf shows the PI surface index after this, the PI region IS reachable
+    // and the bug is in the bytes written by the compute shader.
+    // If VisibleSurf still doesn't show the PI surface index, the PI region of the TLAS
+    // instance buffer is unreachable (offset/alignment/build-range issue).
+    {
+      static uint32_t s_overrideFrame = 0;
+      const bool fire = ((s_overrideFrame++ % 60u) == 0)
+                       && !m_pointInstancerBatches.empty()
+                       && !m_mergedInstances[Tlas::Opaque].empty();
+      (void)fire;
+    }
+
+    // NV-DXVK (debug probe D): GPU readback of TLAS instance bytes. Gated.
+    if constexpr (kEnableRtxDebugProbes) {
       static constexpr uint32_t kRingSize = 3;
       static constexpr uint32_t kProbeBytesPerEntry = sizeof(VkAccelerationStructureInstanceKHR); // 64
       static constexpr uint32_t kProbeEntries = 4;
@@ -1211,9 +1278,15 @@ namespace dxvk {
       }
 
       // Issue a GPU copy from m_vkInstanceBuffer into this frame's write slot.
-      // We capture the first PI batch's region (first kProbeEntries entries of it).
+      // Capture the LARGEST batch's region — that's most likely BSP world geometry.
       if (!m_pointInstancerBatches.empty()) {
-        const PointInstancerBatch& b0 = m_pointInstancerBatches.front();
+        size_t largestIdx = 0;
+        for (size_t i = 1; i < m_pointInstancerBatches.size(); ++i) {
+          if (m_pointInstancerBatches[i].instanceCount > m_pointInstancerBatches[largestIdx].instanceCount) {
+            largestIdx = i;
+          }
+        }
+        const PointInstancerBatch& b0 = m_pointInstancerBatches[largestIdx];
         const uint32_t byteOff = b0.instanceBufferByteOffset;
         if (byteOff + kProbeSize <= m_vkInstanceBuffer->info().size) {
           // Barrier: GPU culling writes (shader write) → transfer read.
@@ -1231,9 +1304,8 @@ namespace dxvk {
       ++sProbeDFrame;
     }
 
-    // NV-DXVK (debug probe E): DISABLED — BLAS position buffer likely lacks
-    // TRANSFER_SRC_BIT. Readback served its purpose.
-    if (false && s_probeE_posBuffer.ptr() != nullptr && s_probeE_vertexCount > 0) {
+    // NV-DXVK (debug probe E): BLAS position buffer readback. Gated.
+    if (kEnableRtxDebugProbes && s_probeE_posBuffer.ptr() != nullptr && s_probeE_vertexCount > 0) {
       static constexpr uint32_t kProbeERingSize = 3;
       static constexpr uint32_t kProbeEVerts    = 8;
       static Rc<DxvkBuffer> sStagingE[kProbeERingSize];
@@ -1819,33 +1891,229 @@ namespace dxvk {
       }
       assert(blasToBuild.size() == blasRangesToBuild.size());
 
-      // TDR-DIAG: log ALL BLAS builds for Aftermath correlation.
-      // ppBuildRangeInfos[bi] is an array of `geometryCount` range infos,
-      // one per geo. Fix from earlier version that only read [0].
-      for (size_t bi = 0; bi < blasToBuild.size(); ++bi) {
-        const auto& g = blasToBuild[bi];
-        const auto* ranges = blasRangesToBuild[bi];
-        for (uint32_t gi = 0; gi < g.geometryCount; ++gi) {
-          const auto& tri = g.pGeometries[gi].geometry.triangles;
-          const auto& r = ranges[gi];
-          const uint32_t iTypeBytes = (tri.indexType == VK_INDEX_TYPE_UINT32) ? 4u
-                                    : (tri.indexType == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
-          const VkDeviceSize vtxEnd = tri.vertexData.deviceAddress
-            + VkDeviceSize(tri.maxVertex + 1) * tri.vertexStride;
-          const VkDeviceSize idxEnd = tri.indexData.deviceAddress
-            + VkDeviceSize(r.primitiveCount) * 3u * iTypeBytes
-            + VkDeviceSize(r.primitiveOffset);
-          Logger::info(str::format(
-            "[BLAS-BUILD] blas=", bi, " geo=", gi, "/", g.geometryCount,
-            " vtxAddr=0x", std::hex, tri.vertexData.deviceAddress,
-            " vtxEnd=0x", vtxEnd,
-            " idxAddr=0x", tri.indexData.deviceAddress,
-            " idxEnd=0x", idxEnd, std::dec,
-            " maxVtx=", tri.maxVertex,
-            " primCnt=", r.primitiveCount,
-            " primOff=", r.primitiveOffset,
-            " vStride=", tri.vertexStride,
-            " iType=", uint32_t(tri.indexType)));
+      // NV-DXVK BLAS-BUILD-INPUT probe: comprehensive per-BLAS dump RIGHT before
+      // vkCmdBuildAccelerationStructuresKHR — logs build inputs + schedules async
+      // readback of first 64 vertex bytes + 24 index bytes so we can verify the
+      // GPU actually sees real geometry at the device addresses being built.
+      static uint32_t s_bbiFrame = 0;
+      const uint32_t bbiFireIdx = s_bbiFrame++;
+      const bool bbiFire = kEnableRtxDebugProbes && ((bbiFireIdx % 10u) == 0);
+      // Hoisted so the post-build serialize-size probe block can reuse it.
+      std::set<uint64_t> piRefs;
+      if (bbiFire) {
+        for (const auto& b : m_pointInstancerBatches) {
+          piRefs.insert(b.blasReference);
+        }
+      }
+      if (bbiFire) {
+
+        // Static ring of staging buffers for async readback.
+        constexpr uint32_t kMaxReadbacks = 16;        // log first 16 BLAS builds per fire
+        constexpr uint32_t kVtxBytes = 96;            // 4 full vertices worth (24-byte stride typical)
+        constexpr uint32_t kIdxBytes = 48;            // 16 indices worth (16-bit) or 12 (32-bit)
+        constexpr uint32_t kReadbackSlotBytes = kVtxBytes + kIdxBytes;
+        constexpr uint32_t kRingSize = 3;
+        static Rc<DxvkBuffer> sBbiStaging[kRingSize];
+        static bool           sBbiValid[kRingSize]    = {};
+        static uint32_t       sBbiCount[kRingSize]    = {};
+        // Per-BLAS meta captured at write-time, consumed at read-time.
+        struct BbiMeta {
+          uint64_t dstAsAddr;
+          uint64_t vtxAddr;
+          uint64_t idxAddr;
+          uint32_t vtxStride;
+          uint32_t vtxFormat;
+          uint32_t iType;
+          uint32_t maxVtx;
+          uint32_t primCnt;
+          uint32_t primOff;
+          uint32_t geoFlags;
+          uint64_t vtxBufDevAddr;
+          uint64_t vtxBufSize;
+          uint32_t vtxBufUsage;
+          uint32_t vtxBufMemFlags;
+          uint32_t vtxOffsetFromSlice;
+          bool     isPi;
+          bool     hasEntry;
+          bool     addrWithinVtxBuf;
+        };
+        static BbiMeta sBbiMetas[kRingSize][kMaxReadbacks];
+
+        const uint32_t writeSlot = s_bbiFrame % kRingSize;
+        const uint32_t readSlot  = (s_bbiFrame + 1) % kRingSize;
+
+        // Lazily create staging buffers.
+        for (uint32_t i = 0; i < kRingSize; ++i) {
+          if (sBbiStaging[i].ptr() == nullptr) {
+            DxvkBufferCreateInfo info;
+            info.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            info.stages = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            info.access = VK_ACCESS_TRANSFER_WRITE_BIT;
+            info.size   = kReadbackSlotBytes * kMaxReadbacks;
+            sBbiStaging[i] = m_device->createBuffer(info,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              DxvkMemoryStats::Category::RTXBuffer,
+              "BLAS-BUILD-INPUT Staging");
+          }
+        }
+
+        // Barrier: any prior writer (interleaver compute, CPU transfer) of the source
+        // vertex/index buffers → our transfer read.
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,
+          VK_ACCESS_TRANSFER_READ_BIT);
+
+        // Log + schedule readback for each BLAS we're about to build.
+        const size_t nBlas = std::min<size_t>(blasToBuild.size(), size_t(kMaxReadbacks));
+        for (size_t bi = 0; bi < blasToBuild.size(); ++bi) {
+          const auto& g = blasToBuild[bi];
+          const auto* ranges = blasRangesToBuild[bi];
+          BlasEntry*  entry = (bi < m_debugBlasBuildEntries.size()) ? m_debugBlasBuildEntries[bi] : nullptr;
+          PooledBlas* dstBl = (bi < m_debugBlasBuildDstBlas.size()) ? m_debugBlasBuildDstBlas[bi] : nullptr;
+          const uint64_t dstAsAddr = (dstBl != nullptr) ? dstBl->accelerationStructureReference : 0;
+          const bool isPi = piRefs.count(dstAsAddr) > 0;
+
+          for (uint32_t gi = 0; gi < g.geometryCount; ++gi) {
+            const auto& tri = g.pGeometries[gi].geometry.triangles;
+            const auto& r   = ranges[gi];
+            const uint32_t iTypeBytes = (tri.indexType == VK_INDEX_TYPE_UINT32) ? 4u
+                                       : (tri.indexType == VK_INDEX_TYPE_UINT16) ? 2u : 0u;
+            const VkDeviceSize vtxEnd = tri.vertexData.deviceAddress
+              + VkDeviceSize(tri.maxVertex + 1) * tri.vertexStride;
+            const VkDeviceSize idxEnd = tri.indexData.deviceAddress
+              + VkDeviceSize(r.primitiveCount) * 3u * iTypeBytes
+              + VkDeviceSize(r.primitiveOffset);
+
+            // Buffer-level state (only available for dynamic BLAS path via entry).
+            uint64_t vtxBufAddr = 0, vtxBufSize = 0; uint32_t vtxBufUsage = 0, vtxBufMemFlags = 0, vtxOffsetFromSlice = 0;
+            uint64_t idxBufAddr = 0, idxBufSize = 0; uint32_t idxBufUsage = 0, idxBufMemFlags = 0, idxOffsetFromSlice = 0;
+            bool addrWithinVtxBuf = false, addrWithinIdxBuf = false;
+            if (entry != nullptr) {
+              const auto& pb = entry->modifiedGeometryData.positionBuffer;
+              const auto& ib = entry->modifiedGeometryData.indexBuffer;
+              if (pb.buffer() != nullptr) {
+                vtxBufAddr         = pb.buffer()->getDeviceAddress();
+                vtxBufSize         = pb.buffer()->info().size;
+                vtxBufUsage        = pb.buffer()->info().usage;
+                vtxBufMemFlags     = pb.buffer()->memFlags();
+                vtxOffsetFromSlice = pb.offsetFromSlice();
+                addrWithinVtxBuf   = (tri.vertexData.deviceAddress >= vtxBufAddr)
+                                    && (tri.vertexData.deviceAddress + (tri.maxVertex + 1u) * tri.vertexStride <= vtxBufAddr + vtxBufSize);
+              }
+              if (ib.buffer() != nullptr) {
+                idxBufAddr         = ib.buffer()->getDeviceAddress();
+                idxBufSize         = ib.buffer()->info().size;
+                idxBufUsage        = ib.buffer()->info().usage;
+                idxBufMemFlags     = ib.buffer()->memFlags();
+                idxOffsetFromSlice = ib.offsetFromSlice();
+                addrWithinIdxBuf   = (tri.indexData.deviceAddress >= idxBufAddr)
+                                    && (idxEnd <= idxBufAddr + idxBufSize);
+              }
+            }
+
+            Logger::info(str::format(
+              "[BBI] bi=", bi, " gi=", gi, "/", g.geometryCount,
+              " isPI=", (isPi ? 1 : 0), " hasEntry=", (entry != nullptr ? 1 : 0),
+              " dstAsAddr=0x", std::hex, dstAsAddr, std::dec,
+              " vtxAddr=0x", std::hex, tri.vertexData.deviceAddress,
+              " vtxEnd=0x", vtxEnd,
+              " idxAddr=0x", tri.indexData.deviceAddress,
+              " idxEnd=0x", idxEnd, std::dec,
+              " maxVtx=", tri.maxVertex, " primCnt=", r.primitiveCount, " primOff=", r.primitiveOffset,
+              " vStride=", tri.vertexStride,
+              " vFmt=", uint32_t(tri.vertexFormat),
+              " iType=", uint32_t(tri.indexType),
+              " geoFlags=0x", std::hex, uint32_t(g.pGeometries[gi].flags), std::dec,
+              " | vtxBuf addr=0x", std::hex, vtxBufAddr,
+              " size=", std::dec, vtxBufSize,
+              " usage=0x", std::hex, vtxBufUsage,
+              " memF=0x", vtxBufMemFlags, std::dec,
+              " offFromSlice=", vtxOffsetFromSlice,
+              " addrInBuf=", (addrWithinVtxBuf ? 1 : 0),
+              " | idxBuf addr=0x", std::hex, idxBufAddr,
+              " size=", std::dec, idxBufSize,
+              " usage=0x", std::hex, idxBufUsage,
+              " memF=0x", idxBufMemFlags, std::dec,
+              " offFromSlice=", idxOffsetFromSlice,
+              " addrInBuf=", (addrWithinIdxBuf ? 1 : 0)));
+
+            // Schedule readback only on geo 0, and only if we have the owning buffers,
+            // and only for first kMaxReadbacks BLASes.
+            if (gi == 0 && bi < nBlas && entry != nullptr) {
+              const auto& pb = entry->modifiedGeometryData.positionBuffer;
+              const auto& ib = entry->modifiedGeometryData.indexBuffer;
+              if (pb.buffer() != nullptr && addrWithinVtxBuf
+                  && (pb.buffer()->info().usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0) {
+                const VkDeviceSize pbBaseOff = tri.vertexData.deviceAddress - vtxBufAddr;
+                const VkDeviceSize dstOff = bi * kReadbackSlotBytes;
+                if (pbBaseOff + kVtxBytes <= vtxBufSize && dstOff + kVtxBytes <= sBbiStaging[writeSlot]->info().size) {
+                  ctx->copyBuffer(sBbiStaging[writeSlot], dstOff, pb.buffer(), pbBaseOff, kVtxBytes);
+                }
+              }
+              if (ib.buffer() != nullptr && addrWithinIdxBuf
+                  && (ib.buffer()->info().usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) != 0) {
+                const VkDeviceSize ibBaseOff = tri.indexData.deviceAddress - idxBufAddr;
+                const VkDeviceSize dstOff = bi * kReadbackSlotBytes + kVtxBytes;
+                if (ibBaseOff + kIdxBytes <= idxBufSize && dstOff + kIdxBytes <= sBbiStaging[writeSlot]->info().size) {
+                  ctx->copyBuffer(sBbiStaging[writeSlot], dstOff, ib.buffer(), ibBaseOff, kIdxBytes);
+                }
+              }
+            }
+            if (bi < kMaxReadbacks && gi == 0) {
+              sBbiMetas[writeSlot][bi] = BbiMeta {
+                dstAsAddr, tri.vertexData.deviceAddress, tri.indexData.deviceAddress,
+                uint32_t(tri.vertexStride), uint32_t(tri.vertexFormat), uint32_t(tri.indexType),
+                tri.maxVertex, r.primitiveCount, r.primitiveOffset,
+                uint32_t(g.pGeometries[gi].flags),
+                vtxBufAddr, vtxBufSize, vtxBufUsage, vtxBufMemFlags, vtxOffsetFromSlice,
+                isPi, (entry != nullptr), addrWithinVtxBuf
+              };
+            }
+          }
+        }
+        sBbiValid[writeSlot] = true;
+        sBbiCount[writeSlot] = uint32_t(nBlas);
+
+        // Read back the OLDEST slot (written kRingSize-1 fires ago). Barrier the transfer first.
+        if (sBbiValid[readSlot]) {
+          // Need a transfer barrier so previous-fire's copies are visible to HOST.
+          // The ring lag already covers in-flight GPU work, but emit for safety.
+          const uint8_t* data = reinterpret_cast<const uint8_t*>(sBbiStaging[readSlot]->mapPtr(0));
+          if (data != nullptr) {
+            for (uint32_t i = 0; i < sBbiCount[readSlot]; ++i) {
+              const auto& m = sBbiMetas[readSlot][i];
+              const uint8_t* vp = data + i * kReadbackSlotBytes;
+              const uint8_t* ip = vp + kVtxBytes;
+              float vx0, vy0, vz0, vx1, vy1, vz1;
+              memcpy(&vx0, vp + 0,  4); memcpy(&vy0, vp + 4,  4); memcpy(&vz0, vp + 8,  4);
+              // Second vertex starts at stride bytes in (but we only captured kVtxBytes total; stride may skip UV/color).
+              const uint32_t s = std::min<uint32_t>(m.vtxStride, kVtxBytes - 12);
+              memcpy(&vx1, vp + s + 0, 4); memcpy(&vy1, vp + s + 4, 4); memcpy(&vz1, vp + s + 8, 4);
+              uint32_t i0 = 0, i1 = 0, i2 = 0;
+              if (m.iType == VK_INDEX_TYPE_UINT16) {
+                uint16_t tmp[3] = {};
+                memcpy(tmp, ip, 6);
+                i0 = tmp[0]; i1 = tmp[1]; i2 = tmp[2];
+              } else if (m.iType == VK_INDEX_TYPE_UINT32) {
+                memcpy(&i0, ip + 0, 4); memcpy(&i1, ip + 4, 4); memcpy(&i2, ip + 8, 4);
+              }
+              Logger::info(str::format(
+                "[BBI-readback] bi=", i,
+                " isPI=", (m.isPi ? 1 : 0),
+                " dstAs=0x", std::hex, m.dstAsAddr, std::dec,
+                " vtxAddr=0x", std::hex, m.vtxAddr, std::dec,
+                " v0=(", vx0, ",", vy0, ",", vz0, ")",
+                " v1=(", vx1, ",", vy1, ",", vz1, ")",
+                " tri0=[", i0, ",", i1, ",", i2, "]",
+                " maxVtx=", m.maxVtx, " primCnt=", m.primCnt,
+                " vtxBufUsage=0x", std::hex, m.vtxBufUsage, std::dec,
+                " addrInVtxBuf=", (m.addrWithinVtxBuf ? 1 : 0)));
+            }
+          }
+          sBbiValid[readSlot] = false;
+          sBbiCount[readSlot] = 0;
         }
       }
 
@@ -1859,6 +2127,103 @@ namespace dxvk {
        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_NV);
 
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(m_scratchBuffer);
+
+      // NV-DXVK BBI-SERIALSIZE probe: right after the build, query
+      // VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR for each PI BLAS.
+      // Tiny size (~48..64 bytes of header-only) indicates the build produced an empty AS
+      // despite valid inputs. Large size confirms the AS has real geometry.
+      if (bbiFire) {
+        constexpr uint32_t kSerMaxQueries = 16;
+        constexpr uint32_t kSerRing       = 3;
+        static VkQueryPool sSerPool = VK_NULL_HANDLE;
+        static bool        sSerValid[kSerRing] = {};
+        static uint32_t    sSerCount[kSerRing] = {};
+        struct SerMeta {
+          uint64_t dstAsAddr;
+          uint32_t primCnt;
+          uint32_t maxVtx;
+          uint32_t vStride;
+        };
+        static SerMeta     sSerMetas[kSerRing][kSerMaxQueries] = {};
+
+        if (sSerPool == VK_NULL_HANDLE) {
+          VkQueryPoolCreateInfo qpCI { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+          qpCI.queryType  = VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR;
+          qpCI.queryCount = kSerMaxQueries * kSerRing;
+          m_device->vkd()->vkCreateQueryPool(m_device->handle(), &qpCI, nullptr, &sSerPool);
+        }
+
+        const uint32_t serWrite = bbiFireIdx % kSerRing;
+        const uint32_t serRead  = (bbiFireIdx + 1) % kSerRing;
+        const uint32_t queryBase = serWrite * kSerMaxQueries;
+
+        // Read OLDEST slot first (results from kSerRing-1 fires ago — should be ready).
+        if (sSerValid[serRead]) {
+          const uint32_t readBase = serRead * kSerMaxQueries;
+          uint64_t results[kSerMaxQueries] = {};
+          const VkResult qres = m_device->vkd()->vkGetQueryPoolResults(
+            m_device->handle(), sSerPool, readBase, sSerCount[serRead],
+            sizeof(results), results, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+          if (qres == VK_SUCCESS) {
+            for (uint32_t i = 0; i < sSerCount[serRead]; ++i) {
+              const auto& m = sSerMetas[serRead][i];
+              // Header is ~VK_UUID_SIZE*2 + 16 = 48 bytes typically.
+              // Empty AS ≈ 56 bytes (header only). Real AS >> header + vertex+tri data.
+              Logger::info(str::format(
+                "[BBI-serialsize] i=", i,
+                " dstAs=0x", std::hex, m.dstAsAddr, std::dec,
+                " serBytes=", results[i],
+                " primCnt=", m.primCnt,
+                " maxVtx=", m.maxVtx,
+                " vStride=", m.vStride,
+                " (tiny=empty AS, large=real geom)"));
+            }
+          } else {
+            Logger::warn(str::format("[BBI-serialsize] vkGetQueryPoolResults failed: ", int(qres)));
+          }
+          sSerValid[serRead] = false;
+          sSerCount[serRead] = 0;
+        }
+
+        // Reset the WRITE slot's queries (must happen before issuing new queries).
+        ctx->getCommandList()->cmdResetQueryPool(sSerPool, queryBase, kSerMaxQueries);
+
+        // Gather AS handles for PI BLASes (limit to kSerMaxQueries).
+        std::vector<VkAccelerationStructureKHR> asHandles;
+        asHandles.reserve(kSerMaxQueries);
+        for (size_t bi = 0; bi < blasToBuild.size() && asHandles.size() < kSerMaxQueries; ++bi) {
+          PooledBlas* dstBl = (bi < m_debugBlasBuildDstBlas.size()) ? m_debugBlasBuildDstBlas[bi] : nullptr;
+          if (dstBl == nullptr) continue;
+          if (piRefs.count(dstBl->accelerationStructureReference) == 0) continue;
+          asHandles.push_back(dstBl->accelStructure->getAccelStructure());
+          const uint32_t mi = uint32_t(asHandles.size() - 1);
+          const auto& g = blasToBuild[bi];
+          const auto* ranges = blasRangesToBuild[bi];
+          sSerMetas[serWrite][mi] = SerMeta {
+            dstBl->accelerationStructureReference,
+            (g.geometryCount > 0 && ranges != nullptr) ? ranges[0].primitiveCount : 0u,
+            (g.geometryCount > 0) ? g.pGeometries[0].geometry.triangles.maxVertex : 0u,
+            (g.geometryCount > 0) ? uint32_t(g.pGeometries[0].geometry.triangles.vertexStride) : 0u
+          };
+        }
+
+        if (!asHandles.empty()) {
+          // The build's AS_WRITE writes are made visible to AS_READ (the query reads) by the
+          // scratch-buffer execBarrier above, but emit an explicit memory barrier to be safe.
+          ctx->emitMemoryBarrier(0,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+            VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+            VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+          ctx->vkCmdWriteAccelerationStructuresPropertiesKHR(
+            uint32_t(asHandles.size()), asHandles.data(),
+            VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR,
+            sSerPool, queryBase);
+          sSerValid[serWrite] = true;
+          sSerCount[serWrite] = uint32_t(asHandles.size());
+        }
+      }
     }
   }
 
@@ -1868,6 +2233,187 @@ namespace dxvk {
     }
 
     ScopedGpuProfileZone(ctx, "buildTLAS");
+
+    // NV-DXVK debug: validate that every PI batch's blasReference points to a
+    // BLAS that's actually in m_blasPool right now. Stale refs => the BLAS got
+    // freed/replaced between addPointInstancerBlas and buildTlas → primary rays
+    // dereference dead AS handles → zero hits.
+    {
+      static uint32_t s_blasValidateFrame = 0;
+      if (kEnableRtxDebugProbes && (s_blasValidateFrame++ % 60u) == 0) {
+        std::set<uint64_t> poolRefs;
+        for (const auto& blas : m_blasPool) {
+          if (blas != nullptr && blas->accelerationStructureReference != 0) {
+            poolRefs.insert(blas->accelerationStructureReference);
+          }
+        }
+        Logger::info(str::format(
+          "[PI-blas-validate] frame=", s_blasValidateFrame,
+          " poolSize=", m_blasPool.size(),
+          " uniqueRefsInPool=", poolRefs.size(),
+          " piBatches=", m_pointInstancerBatches.size(),
+          " mergedOpaque=", m_mergedInstances[Tlas::Opaque].size()));
+
+        // PI batches: validate the ref against the strong-ref'd BLAS we captured.
+        // - refMatches: captured ref still equals the live BLAS's ref (i.e. AS handle didn't move)
+        // - asNonNull: the underlying VkAccelerationStructure is non-null right now
+        // - builtAtCapture: was non-null when addPointInstancerBlas captured it
+        uint32_t piRefMatches = 0, piRefMismatch = 0, piAsNull = 0, piNotBuiltAtCapture = 0;
+        uint32_t logged = 0;
+        for (size_t i = 0; i < m_pointInstancerBatches.size(); ++i) {
+          const auto& b = m_pointInstancerBatches[i];
+          const bool hasRc = b.debugBlasRef != nullptr;
+          const uint64_t liveRef = hasRc ? b.debugBlasRef->accelerationStructureReference : 0;
+          const bool refMatch = hasRc && liveRef == b.blasReference;
+          const bool asLive = hasRc && b.debugBlasRef->accelStructure != nullptr;
+          if (refMatch) ++piRefMatches; else ++piRefMismatch;
+          if (!asLive) ++piAsNull;
+          if (!b.debugAsBuiltAtCapture) ++piNotBuiltAtCapture;
+          if (logged < 8) {
+            ++logged;
+            const uint32_t frameLastTouched = hasRc ? b.debugBlasRef->frameLastTouched : 0xFFFFFFFFu;
+            const uint32_t curFrame = m_device->getCurrentFrameId();
+            const auto& binfo = b.debugBlasRef->buildInfo;
+            uint32_t geoMaxVtx = 0;
+            uint32_t geoPrimCnt = 0;
+            uint64_t geoVtxAddr = 0;
+            uint64_t geoIdxAddr = 0;
+            uint32_t geoVtxStride = 0;
+            if (hasRc && binfo.geometryCount > 0 && binfo.pGeometries != nullptr) {
+              const auto& tri = binfo.pGeometries[0].geometry.triangles;
+              geoMaxVtx = tri.maxVertex;
+              geoVtxStride = uint32_t(tri.vertexStride);
+              geoVtxAddr = tri.vertexData.deviceAddress;
+              geoIdxAddr = tri.indexData.deviceAddress;
+              if (i < b.debugBlasRef->primitiveCounts.size()) {
+                // primitiveCounts is per-geometry; first geo is at [0]
+              }
+              if (!b.debugBlasRef->primitiveCounts.empty()) {
+                geoPrimCnt = b.debugBlasRef->primitiveCounts[0];
+              }
+            }
+            Logger::info(str::format(
+              "[PI-blas-validate]  PI batch=", i,
+              " surfRange=[", b.baseSurfaceIndex, "..",
+              b.baseSurfaceIndex + b.instanceCount - 1, "] count=", b.instanceCount,
+              " ref=0x", std::hex, b.blasReference, std::dec,
+              " refMatch=", (refMatch ? 1 : 0),
+              " frameLastTouched=", frameLastTouched, "/", curFrame,
+              " maxVtx=", geoMaxVtx,
+              " primCnt=", geoPrimCnt,
+              " vStride=", geoVtxStride,
+              " vtxAddr=0x", std::hex, geoVtxAddr,
+              " idxAddr=0x", geoIdxAddr, std::dec));
+          }
+        }
+        // addBlas / merged Opaque sanity: check first 6 entries
+        uint32_t mergedStale = 0, mergedValid = 0;
+        const size_t mergedShow = std::min<size_t>(m_mergedInstances[Tlas::Opaque].size(), 6);
+        for (size_t i = 0; i < m_mergedInstances[Tlas::Opaque].size(); ++i) {
+          const uint64_t ref = m_mergedInstances[Tlas::Opaque][i].accelerationStructureReference;
+          const bool inPool = poolRefs.count(ref) > 0;
+          if (inPool) ++mergedValid; else ++mergedStale;
+          if (i < mergedShow) {
+            Logger::info(str::format(
+              "[PI-blas-validate]  Merged[Opaque][", i, "]",
+              " blasRef=0x", std::hex, ref, std::dec,
+              " inPool=", (inPool ? "YES" : "NO"),
+              " surfIdx=", (m_mergedInstances[Tlas::Opaque][i].instanceCustomIndex & CUSTOM_INDEX_SURFACE_MASK),
+              " mask=0x", std::hex, uint32_t(m_mergedInstances[Tlas::Opaque][i].mask), std::dec));
+
+            // NV-DXVK: dump WHICH RtInstance/BlasEntry owns this merged bucket.
+            // The bucket's first surface index is the start offset into m_reorderedSurfaces.
+            // Use that to pull the source RtInstance*, then its BlasEntry info.
+            const uint32_t bucketStartSurf = m_mergedInstances[Tlas::Opaque][i].instanceCustomIndex & CUSTOM_INDEX_SURFACE_MASK;
+            if (bucketStartSurf < m_reorderedSurfaces.size()) {
+              RtInstance* srcInst = m_reorderedSurfaces[bucketStartSurf];
+              BlasEntry* srcBlas = (srcInst != nullptr) ? srcInst->getBlas() : nullptr;
+              const uint32_t srcVtxCount = (srcBlas != nullptr) ? srcBlas->modifiedGeometryData.vertexCount : 0;
+              const uint32_t srcPrimCount = (srcBlas != nullptr) ? srcBlas->modifiedGeometryData.calculatePrimitiveCount() : 0;
+              // Dump the source VS hash from the BlasEntry's input hashes.
+              // input.getHash(HashComponents::VertexShader) would be ideal; fall back to
+              // the full geometry hash if that accessor isn't available.
+              uint64_t vsHash = 0;
+              uint64_t geomHash = 0;
+              if (srcBlas != nullptr) {
+                geomHash = srcBlas->input.getHash(RtxOptions::geometryAssetHashRule());
+                vsHash = srcBlas->input.getTransformData().vertexShaderHash;
+              }
+              // Dump the raw instance transform for big (BSP-scale) merged buckets so
+              // we can see whether upstream already added camOrigin or not.
+              if (srcBlas != nullptr && srcVtxCount > 10000) {
+                const auto& t = m_mergedInstances[Tlas::Opaque][i].transform;
+                Logger::info(str::format(
+                  "[MergedBspXform] Merged[", i, "] vtx=", srcVtxCount,
+                  " VS=0x", std::hex, vsHash, std::dec,
+                  " r0=(", t.matrix[0][0], ",", t.matrix[0][1], ",", t.matrix[0][2], ") T0=", t.matrix[0][3],
+                  " r1=(", t.matrix[1][0], ",", t.matrix[1][1], ",", t.matrix[1][2], ") T1=", t.matrix[1][3],
+                  " r2=(", t.matrix[2][0], ",", t.matrix[2][1], ",", t.matrix[2][2], ") T2=", t.matrix[2][3]));
+                // Also dump the source's surface.objectToWorld — what came from d3d11_rtx.cpp.
+                const Matrix4& o2w = srcInst->surface.objectToWorld;
+                Logger::info(str::format(
+                  "[MergedBspXform] Merged[", i, "] surface.o2w",
+                  " col0=(", o2w.data[0].x, ",", o2w.data[0].y, ",", o2w.data[0].z, ")",
+                  " col1=(", o2w.data[1].x, ",", o2w.data[1].y, ",", o2w.data[1].z, ")",
+                  " col2=(", o2w.data[2].x, ",", o2w.data[2].y, ",", o2w.data[2].z, ")",
+                  " col3=(", o2w.data[3].x, ",", o2w.data[3].y, ",", o2w.data[3].z, ")"));
+              }
+              Logger::info(str::format(
+                "[PI-blas-validate]  Merged[Opaque][", i, "] ownerInst=0x",
+                std::hex, reinterpret_cast<uintptr_t>(srcInst),
+                " blasEntry=0x", reinterpret_cast<uintptr_t>(srcBlas), std::dec,
+                " vtxCount=", srcVtxCount,
+                " primCount=", srcPrimCount,
+                " firstSurf=", bucketStartSurf,
+                " VS=0x", std::hex, vsHash,
+                " geom=0x", geomHash, std::dec));
+            }
+          }
+        }
+        Logger::info(str::format(
+          "[PI-blas-validate] SUMMARY piRefMatches=", piRefMatches,
+          " piRefMismatch=", piRefMismatch,
+          " piAsNull=", piAsNull,
+          " piNotBuiltAtCapture=", piNotBuiltAtCapture,
+          " mergedValid=", mergedValid, " mergedStale=", mergedStale));
+
+        // NV-DXVK: at TLAS build time, recompute what the PI region offset SHOULD
+        // be based on current m_mergedInstances size, and compare against what
+        // dispatchCulling stored on each batch. If these mismatch the PI bytes
+        // landed at the wrong location and TLAS will read merged data instead.
+        const size_t kInstSize = sizeof(VkAccelerationStructureInstanceKHR);
+        const VkDeviceSize bufSize = (m_vkInstanceBuffer != nullptr) ? m_vkInstanceBuffer->info().size : 0;
+        const VkDeviceAddress bufAddr = (m_vkInstanceBuffer != nullptr) ? m_vkInstanceBuffer->getDeviceAddress() : 0;
+        Logger::info(str::format(
+          "[PI-blas-validate] BUF size=", bufSize,
+          " addr=0x", std::hex, bufAddr, std::dec,
+          " mergedSize[Opaque]=", m_mergedInstances[Tlas::Opaque].size(),
+          " piSlots[Opaque]=", m_pointInstancerSlotsPerType[Tlas::Opaque],
+          " mergedSize[Unord]=", m_mergedInstances[Tlas::Unordered].size(),
+          " piSlots[Unord]=", m_pointInstancerSlotsPerType[Tlas::Unordered]));
+
+        size_t typeBaseAtBuild[Tlas::Count] = {};
+        for (size_t n = 1; n < Tlas::Count; ++n) {
+          typeBaseAtBuild[n] = typeBaseAtBuild[n - 1]
+            + (m_mergedInstances[n - 1].size() + m_pointInstancerSlotsPerType[n - 1]) * kInstSize;
+        }
+        uint32_t offsetMismatches = 0;
+        for (size_t i = 0; i < std::min<size_t>(m_pointInstancerBatches.size(), 4); ++i) {
+          const auto& b = m_pointInstancerBatches[i];
+          const uint32_t expectedOff = uint32_t(typeBaseAtBuild[b.tlasType]
+            + m_mergedInstances[b.tlasType].size() * kInstSize
+            + b.firstIndexInType * kInstSize);
+          if (expectedOff != b.instanceBufferByteOffset) ++offsetMismatches;
+          Logger::info(str::format(
+            "[PI-blas-validate] OFFSET batch=", i,
+            " stored=", b.instanceBufferByteOffset,
+            " expectedNow=", expectedOff,
+            " match=", (expectedOff == b.instanceBufferByteOffset ? "YES" : "NO"),
+            " withinBuf=", ((expectedOff + kInstSize) <= bufSize ? "YES" : "NO")));
+        }
+        Logger::info(str::format("[PI-blas-validate] offsetMismatches=", offsetMismatches));
+      }
+    }
 
     // Four barriers in one:
     // Accel build bit - to protect from BLAS builds
@@ -1882,6 +2428,63 @@ namespace dxvk {
 
     for (auto&& blas : m_blasPool) {
       ctx->getCommandList()->trackResource<DxvkAccess::Read>(blas->accelStructure);
+    }
+
+    // NV-DXVK debug: write override RIGHT BEFORE TLAS build so nothing can clobber it.
+    {
+      static uint32_t s_lateOverrideFrame = 0;
+      const bool fire = kEnableRtxDebugDestructiveProbes
+                       && ((s_lateOverrideFrame++ % 3u) == 0)
+                       && !m_pointInstancerBatches.empty();
+      if (fire && !m_mergedInstances[Tlas::Opaque].empty() && m_pointInstancerBatches.size() >= 2) {
+        const PointInstancerBatch& slotA = m_pointInstancerBatches[0];
+        const PointInstancerBatch& slotB = m_pointInstancerBatches[1];
+        // Use merged[0]'s world-space translation — merged[0] is the viewmodel and is
+        // confirmed in-view every frame (its surfaces 412-415 dominate VisibleSurf).
+        // Placing our test instances there guarantees they're in the camera FOV.
+        const auto& mergedXform = m_mergedInstances[Tlas::Opaque].front().transform;
+        const float tx = mergedXform.matrix[0][3];
+        const float ty = mergedXform.matrix[1][3];
+        const float tz = mergedXform.matrix[2][3];
+        // Identity side-by-side comparison, written into the PI REGION (does NOT touch
+        // merged slots, so normal viewmodel keeps rendering). Two PI slots, same position,
+        // both at identity rotation, different blasRefs + surface markers.
+        //   PI batch[0] slot 0  → surf 777, PI's OWN blasRef          (tests PI BLAS geom)
+        //   PI batch[1] slot 0  → surf 888, merged[0]'s blasRef       (tests known-good BLAS)
+        // If 888 visible but 777 not → PI BLAS geom is broken at this position.
+        // If both visible → PI BLAS works; normal-path transforms in compute are the bug.
+        // If neither → position not in current view.
+        auto makeIdentityInst = [&](uint64_t blasRef, uint32_t surfIdx) {
+          VkAccelerationStructureInstanceKHR inst {};
+          inst.transform.matrix[0][0] = 1.f; inst.transform.matrix[0][3] = tx;
+          inst.transform.matrix[1][1] = 1.f; inst.transform.matrix[1][3] = ty;
+          inst.transform.matrix[2][2] = 1.f; inst.transform.matrix[2][3] = tz;
+          inst.accelerationStructureReference = blasRef;
+          inst.instanceCustomIndex = (surfIdx & uint32_t(CUSTOM_INDEX_SURFACE_MASK));
+          inst.mask = 0xFFu;
+          inst.instanceShaderBindingTableRecordOffset = 0;
+          inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+          return inst;
+        };
+        VkAccelerationStructureInstanceKHR overrideA = makeIdentityInst(slotA.blasReference, 777);
+        const uint64_t mergedBlasRef = m_mergedInstances[Tlas::Opaque].front().accelerationStructureReference;
+        VkAccelerationStructureInstanceKHR overrideB = makeIdentityInst(mergedBlasRef, 888);
+        ctx->writeToBuffer(m_vkInstanceBuffer, slotA.instanceBufferByteOffset,
+                           sizeof(VkAccelerationStructureInstanceKHR), &overrideA);
+        ctx->writeToBuffer(m_vkInstanceBuffer, slotB.instanceBufferByteOffset,
+                           sizeof(VkAccelerationStructureInstanceKHR), &overrideB);
+        ctx->emitMemoryBarrier(0,
+          VK_PIPELINE_STAGE_TRANSFER_BIT,                       VK_ACCESS_TRANSFER_WRITE_BIT,
+          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
+        Logger::info(str::format(
+          "[PI-override-late] IDENTITY side-by-side frame=", s_lateOverrideFrame,
+          " xlat=(", tx, ",", ty, ",", tz, ")",
+          " PIblas=0x", std::hex, slotA.blasReference,
+          " mergedBlas=0x", mergedBlasRef, std::dec,
+          " slotA byteOff=", slotA.instanceBufferByteOffset,
+          " slotB byteOff=", slotB.instanceBufferByteOffset,
+          " (777=PI blas, 888=merged blas, both in PI region, merged untouched)"));
+      }
     }
 
     size_t totalScratchSize = 0;
@@ -2105,6 +2708,9 @@ namespace dxvk {
     batch.firstIndexInType = firstIndexInType;
     batch.tlasType = primaryType;
     batch.instanceBufferByteOffset = 0; // resolved before dispatch
+    // NV-DXVK debug: hold a strong ref to the BLAS for validation at TLAS-build time
+    batch.debugBlasRef = blasEntry->dynamicBlas;
+    batch.debugAsBuiltAtCapture = (blasEntry->dynamicBlas->accelStructure != nullptr);
     m_pointInstancerBatches.push_back(batch);
 
     // NV-DXVK (debug probe E): capture the interleaved BLAS position buffer ref

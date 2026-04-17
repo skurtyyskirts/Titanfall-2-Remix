@@ -31,6 +31,7 @@ namespace dxvk {
   class RtxContext;
   class DxvkContext;
   class InstanceManager;
+  struct PooledBlas;
 
   /**
     * GPU-driven radius culling system for USD PointInstancer replacements.
@@ -72,6 +73,10 @@ namespace dxvk {
     uint32_t firstIndexInType;                     // Index of first placeholder within its TLAS type array
     uint32_t tlasType;                             // Tlas::Type (Opaque, Unordered, SSS)
     uint32_t instanceBufferByteOffset;             // Absolute byte offset in m_vkInstanceBuffer (resolved before dispatch)
+    // NV-DXVK debug: hold a strong ref to the BLAS so we can validate at TLAS build
+    // that the captured `blasReference` still matches a live AS handle.
+    Rc<PooledBlas> debugBlasRef;
+    bool debugAsBuiltAtCapture;                    // was scheduled in blasToBuild before addPI?
   };
 
   class RtxPointInstancerSystem : public CommonDeviceObject {

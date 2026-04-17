@@ -2368,9 +2368,62 @@ namespace dxvk {
               if (modelInstSlot != UINT32_MAX) rdefFound = true;
             }
           }
-          if (modelInstSlot == UINT32_MAX) modelInstSlot = 31u;  // common default
-          if (modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+          // NV-DXVK principled routing: the t31 path reads g_modelInst[idx]
+          // where idx comes from a per-instance COLOR1/I:R16G16B16A16_UINT
+          // semantic declared by the VS. That semantic is the authoritative
+          // signal the shader is genuinely instanced against t31 — when it's
+          // absent AND RDEF didn't name g_modelInst, the VS is a static mesh
+          // and its transform lives in cb3.CBufModelInstance (PIX-confirmed
+          // for VS_6e3e6f28). Previously we fell back to slot 31 blindly,
+          // reading t31[0] from an unrelated buffer and corrupting cb3's
+          // correct matrix on later frames.
+          //
+          // Semantic-based gate (no hardcoded hashes):
+          //   - hasInstanceIdx: VS declares per-instance R16G16B16A16_UINT
+          //     (COLOR1/I per the Source 2 convention) → real t31 indexing
+          //   - rdefFound: shader self-declared g_modelInst → real t31
+          // If neither, skip t31 path and let cb3/identity handle it.
+          bool hasInstanceIdxSemantic = false;
+          if (il != nullptr) {
+            for (const auto& s : il->GetRtxSemantics()) {
+              if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT) {
+                hasInstanceIdxSemantic = true;
+                break;
+              }
+            }
+          }
+          const bool t31PathEligible = rdefFound || hasInstanceIdxSemantic;
+          // Also check if this VS has a cb3 CBufModelInstance — if so, the
+          // downstream RDEF cb3 path will own the transform and we must NOT
+          // let the "no bone transform → fallback" flag at line ~2806 fire.
+          bool cb3OwnsTransform = false;
+          {
+            auto vsPtrCb3 = m_context->m_state.vs.shader;
+            if (vsPtrCb3 != nullptr && vsPtrCb3->GetCommonShader() != nullptr) {
+              auto cbInfo = vsPtrCb3->GetCommonShader()->FindCBuffer("CBufModelInstance");
+              if (cbInfo && cbInfo->bindSlot != UINT32_MAX) cb3OwnsTransform = true;
+            }
+          }
+          if (t31PathEligible && modelInstSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
             modelInstSrv = m_context->m_state.vs.shaderResources.views[modelInstSlot].ptr();
+          } else if (!t31PathEligible) {
+            // Skip the t31 fetch. If cb3 will provide the transform, pre-claim
+            // gotBoneTransform so the end-of-block "no bone matrix" check
+            // (line ~2806) doesn't set m_lastExtractUsedFallback=true and
+            // cause SubmitDraw to filter this as UIFallback. The cb3 RDEF
+            // path further down will write the real objectToWorld.
+            if (cb3OwnsTransform) {
+              gotBoneTransform = true;
+            }
+            static std::unordered_set<std::string> sT31SkipLogged;
+            const std::string vkeyMiss = getVsHashShort();
+            if (sT31SkipLogged.insert(vkeyMiss).second) {
+              Logger::info(str::format(
+                "[D3D11Rtx.o2w.t31.skip] vs=", vkeyMiss,
+                " reason=no_rdef_g_modelInst_and_no_perinstance_uint4_idx",
+                " cb3OwnsTransform=", cb3OwnsTransform ? 1 : 0,
+                " (cb3 CBufModelInstance RDEF path owns this draw)"));
+            }
           }
           // NV-DXVK: skinned-character discrimination. TF2 has TWO shader
           // families that both bind g_modelInst on t31:
@@ -2580,7 +2633,43 @@ namespace dxvk {
 
         // Legacy t30 bone path — only used when the t31 path above didn't
         // produce a transform (skinned characters / non-BSP draws).
-        if (!gotBoneTransform) {
+        //
+        // NV-DXVK principled gate: only enter this block when the VS actually
+        // skins against t30. Signals (any of):
+        //   - RDEF declares g_boneMatrix on the VS
+        //   - VS has per-vertex BLENDINDICES semantic (skinned)
+        // Without these, t30 being bound is coincidental app-state leftover;
+        // reading bone[0] and using it as objectToWorld would displace static
+        // meshes to whatever vestigial bone is at slot 0 (observed on
+        // VS_6e3e6f28 — mesh translated to (-5223,835,32) instead of cb3's
+        // correct (-5246,410,43)).
+        bool t30PathEligible = false;
+        {
+          auto vsPtrBone = m_context->m_state.vs.shader;
+          if (vsPtrBone != nullptr && vsPtrBone->GetCommonShader() != nullptr) {
+            if (vsPtrBone->GetCommonShader()->FindResourceSlot("g_boneMatrix") != UINT32_MAX)
+              t30PathEligible = true;
+          }
+          if (!t30PathEligible && il != nullptr) {
+            for (const auto& s : il->GetRtxSemantics()) {
+              if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0) {
+                t30PathEligible = true;
+                break;
+              }
+            }
+          }
+        }
+        if (!t30PathEligible && !gotBoneTransform) {
+          static std::unordered_set<std::string> sT30GateLogged;
+          const std::string vkey = getVsHashShort();
+          if (sT30GateLogged.insert(vkey).second) {
+            Logger::info(str::format(
+              "[D3D11Rtx.o2w.t30.skip] vs=", vkey,
+              " reason=no_rdef_g_boneMatrix_and_no_blendindices",
+              " (static mesh — cb3 CBufModelInstance path owns this draw)"));
+          }
+        }
+        if (!gotBoneTransform && t30PathEligible) {
           const uint32_t kBoneSrvSlot = 30;
           ID3D11ShaderResourceView* boneSrv = nullptr;
           if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
@@ -3296,6 +3385,75 @@ namespace dxvk {
         // use the g_modelInst SRV (t31); those are handled upstream in the
         // fanout path and the non-instanced t31 read at ~line 2342.
         auto modelCb = commonVS->FindCBuffer("CBufModelInstance");
+
+        // NV-DXVK DIAG: PIX confirmed VS 0x298e12b3d5bcd082 (merged[Opaque][0]
+        // warped-mesh VS, SHA1 6e3e6f28...) binds a valid 3x4 row-major
+        // objectToCameraRelative at cb slot 3 with uniform scale 0.3. If
+        // FindCBuffer("CBufModelInstance") misses for this VS, the merged
+        // variant uses a different HLSL cbuffer name. Dump all declared
+        // cbuffers + raw cb3 bytes so we can identify the correct name.
+        {
+          // One-shot per VS-match; safe to leave ungated.
+          const std::string vsKeyDiag = getVsHashShort();
+          const bool isWarpedMeshVs = vsKeyDiag.find("VS_6e3e6f28f2156ea2") != std::string::npos;
+          if (isWarpedMeshVs) {
+            static bool sLoggedOnce = false;
+            if (!sLoggedOnce) {
+              sLoggedOnce = true;
+              auto names = commonVS->GetCBufferNamesAndSlots();
+              std::string cbList;
+              for (const auto& p : names) {
+                cbList += p.first + "@slot" + std::to_string(p.second) + " ";
+              }
+              Logger::info(str::format(
+                "[D3D11Rtx.o2w.warpedMesh.rdefDump] vs=", vsKeyDiag,
+                " cbufferCount=", names.size(),
+                " cbuffers={ ", cbList, "}",
+                " modelCbFound=", (modelCb != nullptr) ? 1 : 0,
+                " modelCbSlot=", modelCb ? modelCb->bindSlot : UINT32_MAX));
+
+              // Dump raw cb3 bytes as 12 floats (the objectToCameraRelative we
+              // know PIX has for this draw). Bypasses RDEF to confirm the raw
+              // binding has the matrix.
+              const uint32_t kRawSlot = 3;
+              if (kRawSlot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                const auto& cb = vsCbs[kRawSlot];
+                if (cb.buffer != nullptr) {
+                  const auto mapped = cb.buffer->GetMappedSlice();
+                  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+                  if (ptr) {
+                    const size_t base = static_cast<size_t>(cb.constantOffset) * 16;
+                    if (base + 48 <= cb.buffer->Desc()->ByteWidth) {
+                      float raw[12];
+                      std::memcpy(raw, ptr + base, 48);
+                      Logger::info(str::format(
+                        "[D3D11Rtx.o2w.warpedMesh.rawCb3] vs=", vsKeyDiag,
+                        " bufSize=", cb.buffer->Desc()->ByteWidth,
+                        " constOff=", cb.constantOffset,
+                        " r0=(", raw[0], ",", raw[1], ",", raw[2], ",", raw[3], ")",
+                        " r1=(", raw[4], ",", raw[5], ",", raw[6], ",", raw[7], ")",
+                        " r2=(", raw[8], ",", raw[9], ",", raw[10], ",", raw[11], ")"));
+                    } else {
+                      Logger::info(str::format(
+                        "[D3D11Rtx.o2w.warpedMesh.rawCb3] vs=", vsKeyDiag,
+                        " base+48 exceeds bufSize=", cb.buffer->Desc()->ByteWidth,
+                        " constOff=", cb.constantOffset));
+                    }
+                  } else {
+                    Logger::info(str::format(
+                      "[D3D11Rtx.o2w.warpedMesh.rawCb3] vs=", vsKeyDiag,
+                      " slot3 buffer has no mapPtr"));
+                  }
+                } else {
+                  Logger::info(str::format(
+                    "[D3D11Rtx.o2w.warpedMesh.rawCb3] vs=", vsKeyDiag,
+                    " slot3 has NO buffer bound"));
+                }
+              }
+            }
+          }
+        }
+
         if (modelCb && modelCb->bindSlot != UINT32_MAX) {
           float m[12];
           if (rdefReadFloats(vsCbs, modelCb->bindSlot, 0, 48, m)) {
@@ -3303,19 +3461,106 @@ namespace dxvk {
             for (int k = 0; k < 12 && ok; ++k)
               if (!std::isfinite(m[k])) ok = false;
             if (ok) {
-              // Row-major float3x4: row r = (basis_r.xyz, translation.comp_r)
-              transforms.objectToWorld = Matrix4(
-                Vector4(m[0], m[1],  m[2],  0.0f),
-                Vector4(m[4], m[5],  m[6],  0.0f),
-                Vector4(m[8], m[9],  m[10], 0.0f),
-                Vector4(m[3], m[7],  m[11], 1.0f));
+              // Also fetch c_cameraOrigin from CBufCommonPerCamera (offset 4, 3 floats).
+              float camO[3] = { 0.f, 0.f, 0.f };
+              bool haveCamO = false;
+              if (auto camLoc = commonVS->FindCBField("CBufCommonPerCamera", "c_cameraOrigin")) {
+                if (camLoc->size >= 12 && camLoc->slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT) {
+                  if (rdefReadFloats(vsCbs, camLoc->slot, camLoc->offset, 12, camO)) {
+                    if (std::isfinite(camO[0]) && std::isfinite(camO[1]) && std::isfinite(camO[2])) {
+                      haveCamO = true;
+                    }
+                  }
+                }
+              }
+
+              // Detect "cb3 is identity-with-zero-translation": the BSP world render pass
+              // uses cb3 = { I | 0 } because its vertex buffer is already in cam-relative
+              // world space — the VS matmul passes vertices through unchanged to cam-relative.
+              // For Remix RT we need objectToWorld = translate(+cameraOrigin) so those
+              // cam-relative vertices land at absolute world in the BLAS.
+              constexpr float kEps = 1e-4f;
+              auto near_ = [&](float a, float b) { return std::abs(a - b) < kEps; };
+              const bool cb3IsIdentityZeroT =
+                   near_(m[0], 1.f) && near_(m[1], 0.f) && near_(m[2],  0.f) && near_(m[3],  0.f)
+                && near_(m[4], 0.f) && near_(m[5], 1.f) && near_(m[6],  0.f) && near_(m[7],  0.f)
+                && near_(m[8], 0.f) && near_(m[9], 0.f) && near_(m[10], 1.f) && near_(m[11], 0.f);
+              const bool cb3IsAllZero =
+                   m[0]==0.f && m[1]==0.f && m[2]==0.f && m[3]==0.f
+                && m[4]==0.f && m[5]==0.f && m[6]==0.f && m[7]==0.f
+                && m[8]==0.f && m[9]==0.f && m[10]==0.f && m[11]==0.f;
+              const bool cb3IsZero = cb3IsIdentityZeroT || cb3IsAllZero;
+
+              // c_cameraOrigin may be zero for this specific draw's cb2 binding
+              // (BSP world pass). For the zeroCb3 path only, fall back to the
+              // fanout-captured authoritative gameplay camera origin.
+              // IMPORTANT: do NOT apply this fallback to the non-zero-cb3 path,
+              // since those draws have their own real translation and adding
+              // camOrigin on top would double-shift and displace them.
+              float camOforZeroCb3[3] = { camO[0], camO[1], camO[2] };
+              bool haveCamOforZeroCb3 = haveCamO;
+              const bool rdefCamOValid = haveCamO
+                && (camO[0] != 0.f || camO[1] != 0.f || camO[2] != 0.f);
+              if (!rdefCamOValid && m_hasFanoutCamOrigin) {
+                camOforZeroCb3[0] = m_lastFanoutCamOrigin.x;
+                camOforZeroCb3[1] = m_lastFanoutCamOrigin.y;
+                camOforZeroCb3[2] = m_lastFanoutCamOrigin.z;
+                haveCamOforZeroCb3 = true;
+              }
+
+              // BSP world VS (VS_bb30826b) fanout path already puts absolute-world
+              // translations in i2o (via adjTx = m[3]+camOrigin in the fanout code).
+              // For that specific VS + fanout, leave objectToWorld=identity to avoid
+              // double-shifting by camOrigin. Every other zeroCb3 case (including
+              // fanout particles) gets translate(+camOrigin) as before.
+              const bool isFanoutDraw = (m_currentInstancesToObject != nullptr);
+              // Short VS key = "VS_" + first 16 hex of SHA1. VS_bb30826b's SHA1 starts
+              // with "bb30826b03dc9a8b". Compare by SHA1 prefix string.
+              std::string vsKey = getVsHashShort();
+              const bool isBspWorldVsFanout = isFanoutDraw
+                && vsKey.find("VS_bb30826b03dc9a8b") != std::string::npos;
+              if (cb3IsZero && isBspWorldVsFanout) {
+                transforms.objectToWorld = Matrix4();  // identity
+                m_lastO2wPathId = 7;
+                Logger::info(str::format(
+                  "[D3D11Rtx.o2w.rdef.zeroCb3.bspFanout] vs=", vsKey,
+                  " drawID=", m_drawCallID,
+                  " → identity (i2o already has +camOrigin from fanout)"));
+              } else if (cb3IsZero && haveCamOforZeroCb3) {
+                transforms.objectToWorld = Matrix4(
+                  Vector4(1.f, 0.f, 0.f, 0.f),
+                  Vector4(0.f, 1.f, 0.f, 0.f),
+                  Vector4(0.f, 0.f, 1.f, 0.f),
+                  Vector4(camOforZeroCb3[0], camOforZeroCb3[1], camOforZeroCb3[2], 1.f));
+                m_lastO2wPathId = 6;
+                Logger::info(str::format(
+                  "[D3D11Rtx.o2w.rdef.zeroCb3] vs=", vsKey,
+                  " drawID=", m_drawCallID,
+                  " isFanout=", isFanoutDraw ? 1 : 0,
+                  " camO=(", camOforZeroCb3[0], ",", camOforZeroCb3[1], ",", camOforZeroCb3[2], ")"));
+              } else {
+                const float tx = haveCamO ? (m[3]  + camO[0]) : m[3];
+                const float ty = haveCamO ? (m[7]  + camO[1]) : m[7];
+                const float tz = haveCamO ? (m[11] + camO[2]) : m[11];
+                // Row-major float3x4: col c of rotation = (m[c], m[4+c], m[8+c]).
+                transforms.objectToWorld = Matrix4(
+                  Vector4(m[0], m[4], m[8],  0.f),
+                  Vector4(m[1], m[5], m[9],  0.f),
+                  Vector4(m[2], m[6], m[10], 0.f),
+                  Vector4(tx,   ty,   tz,    1.f));
+                m_lastO2wPathId = 5;
+                Logger::info(str::format(
+                  "[D3D11Rtx.o2w.rdef] vs=", getVsHashShort(),
+                  " drawID=", m_drawCallID,
+                  " slot=", modelCb->bindSlot,
+                  " r0=(", m[0], ",", m[1], ",", m[2], ") Tx=", m[3],
+                  " r1=(", m[4], ",", m[5], ",", m[6], ") Ty=", m[7],
+                  " r2=(", m[8], ",", m[9], ",", m[10], ") Tz=", m[11],
+                  " camO=(", camO[0], ",", camO[1], ",", camO[2], ")",
+                  " T_abs=(", tx, ",", ty, ",", tz, ")",
+                  " haveCamO=", haveCamO ? 1 : 0));
+              }
               found = true;
-              m_lastO2wPathId = 5;
-              Logger::info(str::format(
-                "[D3D11Rtx.o2w.rdef] vs=", getVsHashShort(),
-                " drawID=", m_drawCallID,
-                " slot=", modelCb->bindSlot,
-                " T=(", m[3], ",", m[7], ",", m[11], ")"));
             }
           }
         }
@@ -4755,37 +5000,52 @@ namespace dxvk {
         xformSrv = m_context->m_state.vs.shaderResources.views[boneMatrixSlot].ptr();
       }
       if (!xformSrv) {
-        // Last-resort blind probe (no RDEF / unknown shader).
-        // NOTE: stride investigation showed t30=8192, t31=2-48 for all 13
-        // BLIND-PROBE VS hashes — these are NOT g_modelInst/g_boneMatrix SRVs.
-        // These VS hashes don't use either transform buffer. Attaching either
-        // as a bone/BSP transform is wrong but doesn't cause the TDR
-        // (confirmed: rerouting all 13 to BSP didn't fix the hang).
-        // Leaving original logic for now — skip attachment entirely for these
-        // since neither t30 nor t31 is a valid transform buffer.
-        constexpr uint32_t kBoneSrvSlot = 30;
-        constexpr uint32_t kModelInstSrvSlot = 31;
-        if (kBoneSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
-          xformSrv = m_context->m_state.vs.shaderResources.views[kBoneSrvSlot].ptr();
-        if (!xformSrv && kModelInstSrvSlot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
-          xformSrv = m_context->m_state.vs.shaderResources.views[kModelInstSrvSlot].ptr();
-          isModelInst = (xformSrv != nullptr);
+        // NV-DXVK semantic-based blind probe.
+        // RDEF missed both g_modelInst and g_boneMatrix. Use the VS's declared
+        // input semantics to classify the shader and attach only when the
+        // semantics prove t31 is needed:
+        //   - BLENDINDICES per-vertex → skinned character; t31 = bone palette.
+        //     Attach as bone buffer (xformSrv path below with !isModelInst).
+        //   - COLOR1/I R16G16B16A16_UINT per-instance → instanced BSP/prop;
+        //     t31 = g_modelInst. Attach with isModelInst=true.
+        //   - Neither → static cb3-only mesh (e.g. VS_6e3e6f28). Skip — the
+        //     cb3 RDEF path upstream already wrote the correct objectToWorld.
+        //     Attaching t30/t31 here would route vertices through skinning or
+        //     per-instance fanout and warp the mesh around the camera.
+        auto* ilProbe = m_context->m_state.ia.inputLayout.ptr();
+        bool semBlendIdx = false;
+        bool semPerInstIdx = false;
+        if (ilProbe != nullptr) {
+          for (const auto& s : ilProbe->GetRtxSemantics()) {
+            if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0)
+              semBlendIdx = true;
+            if (s.perInstance && s.format == VK_FORMAT_R16G16B16A16_UINT)
+              semPerInstIdx = true;
+          }
         }
-        if (xformSrv) {
-          static std::unordered_set<uintptr_t> sBlindAttachLogged;
-          auto vsPtr = m_context->m_state.vs.shader;
-          uintptr_t key = (vsPtr != nullptr) ? reinterpret_cast<uintptr_t>(vsPtr.ptr()) : 0;
-          if (key && sBlindAttachLogged.insert(key).second) {
+        constexpr uint32_t kT31Slot = 31;
+        if ((semBlendIdx || semPerInstIdx) && kT31Slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) {
+          xformSrv = m_context->m_state.vs.shaderResources.views[kT31Slot].ptr();
+          if (xformSrv && semPerInstIdx) isModelInst = true;
+        }
+        auto vsPtr = m_context->m_state.vs.shader;
+        if (vsPtr != nullptr) {
+          static std::unordered_set<uintptr_t> sBlindClassifyLogged;
+          uintptr_t key = reinterpret_cast<uintptr_t>(vsPtr.ptr());
+          if (sBlindClassifyLogged.insert(key).second) {
             std::string vsHash = "?";
             if (vsPtr->GetCommonShader() != nullptr) {
               auto& s = vsPtr->GetCommonShader()->GetShader();
               if (s != nullptr) vsHash = s->getShaderKey().toString();
             }
-            Logger::err(str::format(
-              "[D3D11Rtx] BLIND-PROBE attach for VS=", vsHash,
-              " (RDEF lookup missed g_modelInst/g_boneMatrix)",
-              " — guessed isModelInst=", isModelInst ? 1 : 0,
-              ". Mis-routing risk: BSP geo may go through bone-skinning path."));
+            const char* cls = semBlendIdx ? "skinned_char_t31_bone_palette"
+                            : semPerInstIdx ? "instanced_bsp_t31_modelInst"
+                            : "static_mesh_cb3_owns_transform_skip_attach";
+            Logger::info(str::format(
+              "[D3D11Rtx] BLIND-PROBE classify VS=", vsHash,
+              " class=", cls,
+              " attached=", xformSrv ? 1 : 0,
+              " isModelInst=", isModelInst ? 1 : 0));
           }
         }
       }

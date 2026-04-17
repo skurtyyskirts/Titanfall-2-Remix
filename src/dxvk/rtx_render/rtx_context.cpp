@@ -23,6 +23,9 @@
 #include <cmath>
 #include <cassert>
 #include <array>
+#include <set>
+#include <map>
+#include <cstdlib>
 
 #include "dxvk_device.h"
 #include "dxvk_scoped_annotation.h"
@@ -43,6 +46,7 @@
 #include "rtx_restir_gi_rayquery.h"
 #include "rtx_composite.h"
 #include "rtx_debug_view.h"
+#include "rtx_debug_probes.h"
 
 #include "rtx/pass/common_binding_indices.h"
 #include "rtx/pass/raytrace_args.h"
@@ -766,6 +770,118 @@ namespace dxvk {
     updateMetrics(gpuIdleTimeMilliseconds);
 
     m_resetHistory = false;
+  }
+
+  void RtxContext::recordVisibleSurfacesReadback(const Resources::RaytracingOutput& rtOutput) {
+    if constexpr (!kEnableRtxDebugProbes) {
+      return;
+    }
+    const uint32_t curFrame = m_device->getCurrentFrameId();
+
+    // Gate: only run during actual gameplay frames.
+    //  - camera must be valid
+    //  - throttle to one readback per kReadbackPeriod frames (avoids 14 MB/frame staging churn)
+    constexpr uint32_t kReadbackPeriod = 3;
+    if ((curFrame % kReadbackPeriod) != 0) {
+      return;
+    }
+    if (!getSceneManager().getCamera().isValid(curFrame)) {
+      // Diag: surface why we skipped, throttled to once per ~17s
+      static uint32_t s_lastDiag = 0;
+      if (curFrame - s_lastDiag > 1000 || curFrame < s_lastDiag) {
+        s_lastDiag = curFrame;
+        Logger::info(str::format("[VisibleSurf] frame=", curFrame, " skipped: camera invalid"));
+      }
+      return;
+    }
+
+    Rc<DxvkImage> srcImage = rtOutput.m_sharedSurfaceIndex.image(Resources::AccessType::Read);
+    if (srcImage == nullptr) {
+      return;
+    }
+
+    // Reap completed async tasks
+    {
+      auto& tasks = m_visibleSurfacesReadback.asyncTasks;
+      tasks.erase(std::remove_if(tasks.begin(), tasks.end(), [](std::future<void>& f) {
+        return !f.valid() || f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+      }), tasks.end());
+    }
+
+    const VkExtent3D extent = srcImage->info().extent;
+    constexpr VkDeviceSize kBytesPerPixel = sizeof(uint32_t);
+    const VkDeviceSize totalBytes = kBytesPerPixel * extent.width * extent.height;
+
+    DxvkBufferCreateInfo bufInfo {};
+    bufInfo.size    = totalBytes;
+    bufInfo.usage   = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    bufInfo.stages  = VK_PIPELINE_STAGE_TRANSFER_BIT  | VK_PIPELINE_STAGE_HOST_BIT;
+    bufInfo.access  = VK_ACCESS_TRANSFER_WRITE_BIT    | VK_ACCESS_HOST_READ_BIT;
+    const VkMemoryPropertyFlags memType =
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    Rc<DxvkBuffer> readbackDst = m_device->createBuffer(
+      bufInfo, memType, DxvkMemoryStats::Category::RTXBuffer, "Visible Surfaces Readback");
+
+    VkImageSubresourceLayers subres {};
+    subres.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    subres.mipLevel       = 0;
+    subres.baseArrayLayer = 0;
+    subres.layerCount     = 1;
+
+    copyImageToBuffer(
+      readbackDst, 0, kBytesPerPixel, kBytesPerPixel * extent.width,
+      srcImage, subres, VkOffset3D { 0, 0, 0 }, extent);
+
+    this->emitMemoryBarrier(0,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_HOST_BIT,     VK_ACCESS_HOST_READ_BIT);
+
+    const uint64_t syncValue = ++m_visibleSurfacesReadback.signalValue;
+    this->signal(m_visibleSurfacesReadback.signal, syncValue);
+
+    const uint32_t frameIdx   = m_device->getCurrentFrameId();
+    const uint32_t pixelCount = extent.width * extent.height;
+    Rc<sync::Fence> signalRef = m_visibleSurfacesReadback.signal;
+
+    m_visibleSurfacesReadback.asyncTasks.push_back(std::async(std::launch::async,
+      [cReadbackDst = std::move(readbackDst), syncValue, signalRef, frameIdx, pixelCount,
+       w = extent.width, h = extent.height]() mutable {
+        signalRef->wait(syncValue);
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(cReadbackDst->mapPtr(0));
+        if (p == nullptr) {
+          return;
+        }
+        std::map<uint32_t, uint32_t> counts;
+        uint32_t invalidPixels = 0;
+        for (uint32_t i = 0; i < pixelCount; ++i) {
+          const uint32_t v = p[i];
+          if (v == SURFACE_INDEX_INVALID) { ++invalidPixels; continue; }
+          counts[v]++;
+        }
+        // Build "id:count" pairs sorted by count desc, top 32
+        std::vector<std::pair<uint32_t, uint32_t>> sorted(counts.begin(), counts.end());
+        std::sort(sorted.begin(), sorted.end(),
+          [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string ids;
+        ids.reserve(sorted.size() * 12);
+        size_t shown = 0;
+        for (auto& kv : sorted) {
+          if (shown++ >= 32) { ids += "..."; break; }
+          ids += std::to_string(kv.first);
+          ids += ':';
+          ids += std::to_string(kv.second);
+          ids += ' ';
+        }
+        Logger::info(str::format(
+          "[VisibleSurf] frame=", frameIdx,
+          " res=", w, "x", h,
+          " unique=", counts.size(),
+          " invalidPx=", invalidPixels,
+          " top=[", ids, "]"));
+      }));
   }
 
   void RtxContext::endFrame(std::uint64_t cachedReflexFrameId, Rc<DxvkImage> targetImage, bool callInjectRtx) {
@@ -1514,6 +1630,10 @@ namespace dxvk {
 
     // Gbuffer Raytracing
     m_common->metaPathtracerGbuffer().dispatch(this, rtOutput);
+
+    // NV-DXVK: visible-surface readback. Must run before any later pass aliases
+    // m_sharedSurfaceIndex storage (e.g. m_primaryDisocclusionMaskForRR).
+    recordVisibleSurfacesReadback(rtOutput);
 
     // RTXDI
     m_common->metaRtxdiRayQuery().dispatch(this, rtOutput);

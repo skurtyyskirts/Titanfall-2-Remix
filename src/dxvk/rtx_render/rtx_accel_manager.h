@@ -177,6 +177,13 @@ private:
   // the GPU culling shader fills them directly in the instance buffer.
   uint32_t m_pointInstancerSlotsPerType[Tlas::Count] = {};
 
+  // NV-DXVK debug (BLAS-BUILD-INPUT probe): parallel arrays to blasToBuild/blasRangesToBuild,
+  // populated at each push_back. Used by the inline dump right before vkCmdBuildAccelerationStructuresKHR
+  // so we can look up the source vertex/index DxvkBuffer and the owning PooledBlas per BLAS entry.
+  // Cleared at start of buildBlases. nullptr entry means "no side info available" (e.g. merged bucket path).
+  std::vector<struct BlasEntry*>  m_debugBlasBuildEntries;
+  std::vector<struct PooledBlas*> m_debugBlasBuildDstBlas;
+
   // NV-DXVK (debug probe B): per-frame routing counters, reset at frame start.
   static inline uint32_t s_probeB_addBlasCount = 0;
   static inline uint32_t s_probeB_addPICount = 0;

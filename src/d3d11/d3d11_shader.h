@@ -4,6 +4,8 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "../dxbc/dxbc_module.h"
 #include "../dxvk/dxvk_device.h"
@@ -87,6 +89,15 @@ namespace dxvk {
       auto it = cb->fields.find(fieldName);
       if (it == cb->fields.end()) return std::nullopt;
       return CBFieldLoc{ cb->bindSlot, it->second.offset, it->second.size };
+    }
+    // NV-DXVK: RDEF diagnostic — list all cbuffer names the shader declares,
+    // plus their bind slot. Used to identify merged-bucket VS variants where
+    // the objectToCameraRelative cbuffer uses a non-default HLSL name.
+    std::vector<std::pair<std::string, uint32_t>> GetCBufferNamesAndSlots() const {
+      std::vector<std::pair<std::string, uint32_t>> out;
+      out.reserve(m_cbuffers.size());
+      for (const auto& kv : m_cbuffers) out.emplace_back(kv.first, kv.second.bindSlot);
+      return out;
     }
 
   private:

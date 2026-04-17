@@ -46,6 +46,10 @@ namespace dxvk {
       ? module.compilePassthroughShader(*pDxbcModuleInfo, name)
       : module.compile                 (*pDxbcModuleInfo, name);
     m_shader->setShaderKey(*pShaderKey);
+    // NV-DXVK: log the (m_hash → SHA1-name) mapping so logs that reference
+    // shaders by getHash() (uint64 fold) can be correlated with the SHA1-named
+    // .dxbc files dumped by DXVK_SHADER_DUMP_PATH.
+    Logger::info(str::format("[ShaderHashMap] ", name, " getHash=0x", std::hex, m_shader->getHash(), std::dec));
     
     if (dumpPath.size() != 0) {
       std::ofstream dumpStream(

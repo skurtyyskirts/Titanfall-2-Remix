@@ -20,6 +20,7 @@
 * DEALINGS IN THE SOFTWARE.
 */
 #include "rtx_point_instancer_system.h"
+#include "rtx_debug_probes.h"
 
 #include "dxvk_device.h"
 #include "rtx_render/rtx_shader_manager.h"
@@ -78,6 +79,43 @@ namespace dxvk {
 
     if (batches.empty()) {
       return;
+    }
+
+    // NV-DXVK debug: throttled per-batch dump of CB inputs + first-instance transform.
+    // Helps diagnose why most PI instances are invisible — see what the shader is actually reading.
+    static uint32_t s_dumpFrame = 0;
+    const bool doDump = kEnableRtxDebugProbes && ((s_dumpFrame++ % 60u) == 0);
+    if (doDump) {
+      Logger::info(str::format(
+        "[PI-dump] frame=", s_dumpFrame,
+        " batches=", batches.size(),
+        " camPos=(", cameraPosition.x, ",", cameraPosition.y, ",", cameraPosition.z, ")"));
+      for (size_t bi = 0; bi < batches.size(); ++bi) {
+        const PointInstancerBatch& b = batches[bi];
+        const auto& m = b.objectToWorld;
+        const Vector3 t  = m.data[3].xyz();
+        // First source instance-to-object transform (sample for sanity)
+        Vector3 i0t(0.f, 0.f, 0.f);
+        if (b.transforms && !b.transforms->empty()) {
+          i0t = (*b.transforms)[0].data[3].xyz();
+        }
+        // Surface-ID range covered by this batch
+        const uint32_t surfFirst = b.baseSurfaceIndex;
+        const uint32_t surfLast  = b.baseSurfaceIndex + b.instanceCount - 1;
+        Logger::info(str::format(
+          "[PI-dump]  batch=", bi,
+          " surfRange=[", surfFirst, "..", surfLast, "]",
+          " count=", b.instanceCount,
+          " firstIdxInType=", b.firstIndexInType,
+          " bufByteOff=", b.instanceBufferByteOffset,
+          " tlas=", uint32_t(b.tlasType),
+          " mask=0x", std::hex, b.instanceMask,
+          " ciFlags=0x", b.customIndexFlags,
+          " sbt=0x", b.sbtOffsetAndFlags, std::dec,
+          " o2w.T=(", t.x, ",", t.y, ",", t.z, ")",
+          " i2o[0].T=(", i0t.x, ",", i0t.y, ",", i0t.z, ")",
+          " blasRef=0x", std::hex, b.blasReference, std::dec));
+      }
     }
 
     const Rc<DxvkDevice>& dev = ctx->getDevice();
