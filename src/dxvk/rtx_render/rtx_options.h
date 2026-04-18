@@ -411,7 +411,7 @@ namespace dxvk {
       RTX_OPTION("rtx.viewModel", float, scale, 1.0f, "Scale for view models. Minimize to prevent clipping.");
       RTX_OPTION("rtx.viewModel", bool, enableVirtualInstances, true, "If true, virtual instances are created to render the view models behind a portal.");
       RTX_OPTION("rtx.viewModel", bool, perspectiveCorrection, true, "If true, apply correction to view models (e.g. different FOV is used for view models).");
-      RTX_OPTION("rtx.viewModel", float, maxZThreshold, 0.0f, "If a draw call's viewport has max depth less than or equal to this threshold, then assume that it's a view model.");
+      RTX_OPTION("rtx.viewModel", float, maxZThreshold, 0.08f, "If a draw call's viewport has max depth less than or equal to this threshold, then assume that it's a view model. Default 0.08 catches Source-engine style viewmodel passes (MaxDepth=0.05) without touching the main world pass (MaxDepth=0.1).");
     } viewModel;
 
     struct PlayerModel {

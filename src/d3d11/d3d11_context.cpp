@@ -1289,7 +1289,49 @@ namespace dxvk {
           UINT            ThreadGroupCountY,
           UINT            ThreadGroupCountZ) {
     D3D11DeviceLock lock = LockContext();
-    
+
+    // NV-DXVK [Dispatch.diag]: log compute dispatches with UAV buffer
+    // sizes so we can see if any dispatch writes to bone-matrix-sized
+    // (393216) buffers. If none do, bone data is NOT authored by
+    // compute — some other CPU/GPU path writes the upper halves (or
+    // they really are zero).
+    {
+      static uint32_t sDispatchLog = 0;
+      if (sDispatchLog < 40) {
+        std::string uavLine;
+        bool any393k = false;
+        for (uint32_t slot = 0; slot < D3D11_1_UAV_SLOT_COUNT; ++slot) {
+          auto* uav = m_state.cs.unorderedAccessViews[slot].ptr();
+          if (uav == nullptr) continue;
+          Com<ID3D11Resource> res;
+          uav->GetResource(&res);
+          D3D11_RESOURCE_DIMENSION dim;
+          res->GetType(&dim);
+          if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            auto* b = static_cast<D3D11Buffer*>(res.ptr());
+            uint32_t sz = b->Desc()->ByteWidth;
+            uavLine += str::format(" u", slot, "=", sz);
+            if (sz == 393216) any393k = true;
+          }
+        }
+        // Only log if SOMETHING is bound OR this is a t30-sized target.
+        if (!uavLine.empty() && (any393k || sDispatchLog < 10)) {
+          ++sDispatchLog;
+          std::string csHash = "null";
+          auto cs = m_state.cs.shader;
+          if (cs != nullptr && cs->GetCommonShader() != nullptr) {
+            auto& s = cs->GetCommonShader()->GetShader();
+            if (s != nullptr) csHash = s->getShaderKey().toString().substr(0, 19);
+          }
+          Logger::info(str::format(
+            "[Dispatch.diag] cs=", csHash,
+            " groups=(", ThreadGroupCountX, ",", ThreadGroupCountY, ",", ThreadGroupCountZ, ")",
+            " UAVs:", uavLine,
+            any393k ? " HIT_393K" : ""));
+        }
+      }
+    }
+
     EmitCs([=] (DxvkContext* ctx) {
       ctx->dispatch(
         ThreadGroupCountX,
@@ -2296,8 +2338,38 @@ namespace dxvk {
         BindUnorderedAccessView(
           uavSlotId + StartSlot + i, uav,
           ctrSlotId + StartSlot + i, ctr);
-        
+
         ResolveCsSrvHazards(uav);
+
+        // NV-DXVK [anyUAV]: catalog EVERY distinct (buffer_size, usage)
+        // pair bound as a compute UAV. Previous log targeted 393216
+        // specifically — 0 hits. Widening to ANY buffer UAV: reveals if
+        // the game uses a different-sized buffer for bone authoring
+        // (e.g. a staging/scratch buffer that gets copied to t30 via
+        // CopyResource later). Throttled to unique (size, usage) tuples.
+        if (uav != nullptr) {
+          Com<ID3D11Resource> res;
+          uav->GetResource(&res);
+          D3D11_RESOURCE_DIMENSION dim;
+          res->GetType(&dim);
+          if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            auto* b = static_cast<D3D11Buffer*>(res.ptr());
+            uint32_t sz = b->Desc()->ByteWidth;
+            uint32_t us = uint32_t(b->Desc()->Usage);
+            uint32_t bf = uint32_t(b->Desc()->BindFlags);
+            uint64_t key = (uint64_t(sz) << 32) | (uint64_t(us) << 16) | bf;
+            static std::set<uint64_t> sSeenUAV;
+            if (sSeenUAV.size() < 64 && sSeenUAV.insert(key).second) {
+              Logger::info(str::format(
+                "[anyUAV.cs] #", sSeenUAV.size(),
+                " size=", sz,
+                " usage=", us,
+                " bindFlags=", bf,
+                " slot=", (StartSlot + i),
+                " ptr=", reinterpret_cast<uintptr_t>(b)));
+            }
+          }
+        }
       }
     }
   }
@@ -2464,11 +2536,38 @@ namespace dxvk {
             BindUnorderedAccessView(
               uavSlotId + i, uav,
               ctrSlotId + i, ctr);
-            
+
             ResolveOmSrvHazards(uav);
 
             if (NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL)
               needsUpdate |= ResolveOmRtvHazards(uav);
+
+            // NV-DXVK [anyUAV.om]: graphics-pipeline UAV binding. Some
+            // engines use PS-stage UAVs for bone authoring via a
+            // rasterization-based skinner.
+            if (uav != nullptr) {
+              Com<ID3D11Resource> res;
+              uav->GetResource(&res);
+              D3D11_RESOURCE_DIMENSION dim;
+              res->GetType(&dim);
+              if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                auto* b = static_cast<D3D11Buffer*>(res.ptr());
+                uint32_t sz = b->Desc()->ByteWidth;
+                uint32_t us = uint32_t(b->Desc()->Usage);
+                uint32_t bf = uint32_t(b->Desc()->BindFlags);
+                uint64_t key = (uint64_t(sz) << 32) | (uint64_t(us) << 16) | bf;
+                static std::set<uint64_t> sSeenOmUAV;
+                if (sSeenOmUAV.size() < 64 && sSeenOmUAV.insert(key).second) {
+                  Logger::info(str::format(
+                    "[anyUAV.om] #", sSeenOmUAV.size(),
+                    " size=", sz,
+                    " usage=", us,
+                    " bindFlags=", bf,
+                    " slot=", i,
+                    " ptr=", reinterpret_cast<uintptr_t>(b)));
+                }
+              }
+            }
           }
         }
       }
@@ -2627,10 +2726,10 @@ namespace dxvk {
 
     if (unlikely(NumViewports > m_state.rs.viewports.size()))
       return;
-    
+
     bool dirty = m_state.rs.numViewports != NumViewports;
     m_state.rs.numViewports = NumViewports;
-    
+
     for (uint32_t i = 0; i < NumViewports; i++) {
       const D3D11_VIEWPORT& vp = m_state.rs.viewports[i];
 
@@ -2640,8 +2739,28 @@ namespace dxvk {
             || vp.Height   != pViewports[i].Height
             || vp.MinDepth != pViewports[i].MinDepth
             || vp.MaxDepth != pViewports[i].MaxDepth;
-      
+
       m_state.rs.viewports[i] = pViewports[i];
+    }
+
+    // NV-DXVK [ViewportDepth]: log every unique (MinDepth,MaxDepth) pair.
+    // In Source-engine games the viewmodel pass sets MaxDepth to ~0.1 to
+    // render in front of the world. If we never see a non-default range,
+    // the viewmodel pass is NOT executing in this build.
+    if (NumViewports > 0) {
+      static std::set<uint64_t> sSeen;
+      const float lo = pViewports[0].MinDepth;
+      const float hi = pViewports[0].MaxDepth;
+      uint32_t loBits, hiBits;
+      std::memcpy(&loBits, &lo, 4);
+      std::memcpy(&hiBits, &hi, 4);
+      uint64_t key = (uint64_t(loBits) << 32) | hiBits;
+      if (sSeen.size() < 32 && sSeen.insert(key).second) {
+        Logger::info(str::format(
+          "[ViewportDepth] unique range #", sSeen.size(),
+          ": min=", lo, " max=", hi,
+          " w=", pViewports[0].Width, " h=", pViewports[0].Height));
+      }
     }
     
     if (dirty)

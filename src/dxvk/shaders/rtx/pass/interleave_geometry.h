@@ -231,16 +231,55 @@ namespace interleaver {
     float  ty   = boneBuffer[base+7];
     float3 row2 = float3(boneBuffer[base+8], boneBuffer[base+9], boneBuffer[base+10]);
     float  tz   = boneBuffer[base+11];
-    // Zero-bone detection: all 12 floats exactly 0. TF2 uploads bones at
-    // stride-768 offsets (16-bone "slots") but only writes the first 8
-    // bones of each slot. Bones 8-15 of each slot are uninitialized (all
-    // zeros after buffer create). A vertex with BLENDINDICES referencing
-    // one of those gaps would otherwise get transform = 0*local + 0 =
-    // (0,0,0), producing a spike from the character to world origin.
-    outValid = (row0.x != 0.0f || row0.y != 0.0f || row0.z != 0.0f
-             || row1.x != 0.0f || row1.y != 0.0f || row1.z != 0.0f
-             || row2.x != 0.0f || row2.y != 0.0f || row2.z != 0.0f
-             || tx != 0.0f || ty != 0.0f || tz != 0.0f);
+    // Scale-tolerant rotation-matrix validity check. The game's upload
+    // pattern leaves gaps in the bone palette where GPU memory is
+    // uninitialized. TF2 characters use SCALED bones (non-uniform scale
+    // for animation deformation) so rows aren't exactly unit-length.
+    // But a valid scaled-rotation has:
+    //   • All 3 rows have SIMILAR length (same scale factor applied)
+    //   • Cross product of row0 and row1 is parallel to row2
+    //     (i.e., |dot(cross(row0, row1), row2) / (|r0|·|r1|·|r2|)| ≈ 1)
+    // Uninitialized / garbage bit patterns almost never satisfy both.
+    float row0LenSq = row0.x*row0.x + row0.y*row0.y + row0.z*row0.z;
+    float row1LenSq = row1.x*row1.x + row1.y*row1.y + row1.z*row1.z;
+    float row2LenSq = row2.x*row2.x + row2.y*row2.y + row2.z*row2.z;
+    float transMag  = (tx < 0.0f ? -tx : tx)
+                    + (ty < 0.0f ? -ty : ty)
+                    + (tz < 0.0f ? -tz : tz);
+    // Sane lengths: any scale in [0.1, 10] permitted.
+    bool lenOk = (row0LenSq > 0.01f && row0LenSq < 100.0f)
+              && (row1LenSq > 0.01f && row1LenSq < 100.0f)
+              && (row2LenSq > 0.01f && row2LenSq < 100.0f);
+    // All 3 rows share scale magnitude (consistency of rotation-scale).
+    // Check max_len / min_len < 3 — catches garbage where rows have wildly
+    // mismatched magnitudes.
+#ifdef __cplusplus
+    float maxL = (row0LenSq > row1LenSq ? row0LenSq : row1LenSq);
+    maxL = (maxL > row2LenSq ? maxL : row2LenSq);
+    float minL = (row0LenSq < row1LenSq ? row0LenSq : row1LenSq);
+    minL = (minL < row2LenSq ? minL : row2LenSq);
+#else
+    float maxL = max(max(row0LenSq, row1LenSq), row2LenSq);
+    float minL = min(min(row0LenSq, row1LenSq), row2LenSq);
+#endif
+    bool scaleOk = (minL > 0.0f) && (maxL / minL < 9.0f);
+    // Cross product alignment: for any valid (scaled) rotation matrix,
+    // cross(row0, row1) is parallel to row2. Compute normalized alignment.
+    float3 cx = float3(
+      row0.y * row1.z - row0.z * row1.y,
+      row0.z * row1.x - row0.x * row1.z,
+      row0.x * row1.y - row0.y * row1.x);
+    float cxLenSq = cx.x*cx.x + cx.y*cx.y + cx.z*cx.z;
+    float alignDot = cx.x * row2.x + cx.y * row2.y + cx.z * row2.z;
+    // |alignDot| / (|cx| * |row2|) == 1 for perfect rotation. Square to
+    // avoid sqrt: alignDot² / (cxLenSq * row2LenSq) ≈ 1.
+    bool alignOk = false;
+    if (cxLenSq > 1e-8f && row2LenSq > 1e-8f) {
+      float alignSq = (alignDot * alignDot) / (cxLenSq * row2LenSq);
+      alignOk = alignSq > 0.81f; // cos²(25°) ≈ 0.82 — permissive
+    }
+    outValid = lenOk && scaleOk && alignOk
+            && (transMag > 1.0f && transMag < 1.0e5f);
     float3 result;
 #ifdef __cplusplus
     result.x = row0.x*pos.x + row0.y*pos.y + row0.z*pos.z + tx;
@@ -326,6 +365,7 @@ namespace interleaver {
     float3 p0raw = applyBoneMatrix(boneBuffer, boneIdx0, matrixStrideFloats, pos, v0);
     float3 p1raw = applyBoneMatrix(boneBuffer, boneIdx1, matrixStrideFloats, pos, v1);
     float3 p2raw = applyBoneMatrix(boneBuffer, boneIdx2, matrixStrideFloats, pos, v2);
+
     const float wq = 1.0f / 32768.0f;
     const bool use0 = v0 && (w0 > wq);
     const bool use1 = v1 && (w1 > wq);
@@ -335,7 +375,13 @@ namespace interleaver {
     float3 p2 = use2 ? p2raw * w2 : float3(0.0f, 0.0f, 0.0f);
     const float wSum = (use0 ? w0 : 0.0f) + (use1 ? w1 : 0.0f) + (use2 ? w2 : 0.0f);
     if (wSum > 0.0f) return (p0 + p1 + p2) * (1.0f / wSum);
-    return pos; // no valid bones; fallback to local-space pos
+    // All 3 bones invalid — fall back to bone 0 of the slice (always
+    // populated: first bone of the first uploaded palette). Collapses
+    // invalid verts near the character root instead of at world origin.
+    bool vFallback = false;
+    float3 pFallback = applyBoneMatrix(boneBuffer, 0u, matrixStrideFloats, pos, vFallback);
+    if (vFallback) return pFallback;
+    return pos;
   }
 
   void interleave(const uint32_t idx, WriteBuffer(float) dst, ReadBuffer(float) srcPosition, ReadBuffer(float) srcNormal, ReadBuffer(float) srcTexcoord, ReadBuffer(uint32_t) srcColor0, ReadBuffer(float) srcBoneMatrix, ReadBuffer(uint32_t) srcBoneIndex, ReadBuffer(uint32_t) srcBoneWeight, const InterleaveGeometryArgs cb) {

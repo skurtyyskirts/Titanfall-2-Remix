@@ -587,7 +587,7 @@ namespace dxvk {
           }
 
           if (!m_instBufCache.empty() && t31Data) {
-            const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
+            const UINT maxInstances = instanceCount;
             constexpr uint32_t BYTES_PER_INSTANCE = 208;
 
             // NV-DXVK (TF2 BSP): t31 stores objectToCameraRelative transforms
@@ -1109,8 +1109,7 @@ namespace dxvk {
       return;
     }
 
-    // Cap to avoid excessive submission — configurable via rtx.maxInstanceSubmissions
-    const UINT maxInstances = std::min(instanceCount, RtxOptions::maxInstanceSubmissions());
+    const UINT maxInstances = instanceCount;
 
     static uint32_t sInstLog = 0;
     if (sInstLog < 3) {
@@ -4331,6 +4330,82 @@ namespace dxvk {
       auto& st = m_vsFrameStats[m_currentVsHashCache];
       ++st.rejects[ri];
     }
+    // NV-DXVK [VMHunt.result=reject]: if the rejected draw is a suspect
+    // viewmodel draw, log the reason. Otherwise we don't know if a suspect
+    // made it through or got filtered.
+    if (m_vmHuntIsSuspect) {
+      static const char* kReason[] = {
+        "Throttle","NonTri","NoPS","NoRTV","CountSmall","FsQuad","NoLayout",
+        "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail",
+        "UIFallback","UnsupPosFmt"
+      };
+      const char* reasonStr = (ri < std::size(kReason)) ? kReason[ri] : "?";
+      Logger::info(str::format(
+        "[VMHunt.result] count=", m_vmHuntIndexCount,
+        " vs=", m_currentVsHashCache.substr(0, 19),
+        " verdict=REJECT reason=", reasonStr));
+      m_vmHuntIsSuspect = false; // consumed
+    }
+    // NV-DXVK [Reject]: log every rejected draw with semantic fingerprint +
+    // VS + PS + reason + vert count + vpMaxZ + vpMinZ. Tagged `sk=1` if the
+    // draw is skinned (per-vertex BLENDINDICES). The viewmodel (gun + hands
+    // in first-person) is typically a small-mesh skinned draw (hands) +
+    // small rigid draw (weapon parts). It may use an unusual position or
+    // BLENDINDICES format that we currently don't recognise, so we log ALL
+    // rejects — not just skinned — to surface it. Throttled per frame.
+    {
+      const uint32_t fid = m_context->m_device->getCurrentFrameId();
+      static uint32_t sLastFrameRS = 0;
+      static uint32_t sCountThisFrameRS = 0;
+      if (fid != sLastFrameRS) { sLastFrameRS = fid; sCountThisFrameRS = 0; }
+      if (sCountThisFrameRS < 128) {
+        ++sCountThisFrameRS;
+        D3D11InputLayout* layout = m_context->m_state.ia.inputLayout.ptr();
+        bool isSkinned = false;
+        uint32_t posFmt = 0;
+        uint32_t biFmt = 0;
+        if (layout != nullptr) {
+          for (const auto& s : layout->GetRtxSemantics()) {
+            if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0 && s.index == 0) {
+              isSkinned = true;
+              biFmt = (uint32_t)s.format;
+            }
+            if (!s.perInstance && std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0) {
+              posFmt = (uint32_t)s.format;
+            }
+          }
+        }
+        // Viewport min/max depth (the ViewModel classifier uses maxZ).
+        float vpMaxZ = -1.0f, vpMinZ = -1.0f;
+        const auto& vps = m_context->m_state.rs.viewports;
+        if (m_context->m_state.rs.numViewports > 0) {
+          vpMaxZ = vps[0].MaxDepth;
+          vpMinZ = vps[0].MinDepth;
+        }
+        // PS hash (null if depth-only).
+        std::string psName = "null";
+        auto psPtr = m_context->m_state.ps.shader;
+        if (psPtr != nullptr && psPtr->GetCommonShader() != nullptr) {
+          auto& s = psPtr->GetCommonShader()->GetShader();
+          if (s != nullptr) psName = s->getShaderKey().toString().substr(0, 19);
+        }
+        static const char* kReasonShort[] = {
+          "Throttle","NonTri","NoPS","NoRTV","CountSmall","FsQuad","NoLayout",
+          "NoSem","NoPos","Pos2D","NoPosBuf","NoIdxBuf","HashFail",
+          "UIFallback","UnsupPosFmt"
+        };
+        const char* reasonStr = (ri < std::size(kReasonShort)) ? kReasonShort[ri] : "?";
+        Logger::info(str::format(
+          "[Reject] f=", fid,
+          " vs=", m_currentVsHashCache.substr(0, 19),
+          " ps=", psName,
+          " reason=", reasonStr,
+          " sk=", (isSkinned ? 1 : 0),
+          " posFmt=", posFmt,
+          " biFmt=", biFmt,
+          " vpZ=[", vpMinZ, ",", vpMaxZ, "]"));
+      }
+    }
   }
 
   Future<GeometryHashes> D3D11Rtx::ComputeGeometryHashes(
@@ -4678,6 +4753,222 @@ namespace dxvk {
     // attribute stats without re-fetching it at every reject site.
     m_currentVsHashCache.clear();
     m_skinnedCharNeedsCamOffset = false;
+    m_vmHuntIsSuspect = false;
+    m_vmHuntIndexCount = 0;
+
+    // NV-DXVK [CamCatalog]: per-frame catalog of every unique (camOrigin,
+    // viewport) pair we see. Distinct cameras → we'll see distinct
+    // (origin.x, origin.y, origin.z, maxZ, w, h) tuples. This tells us how
+    // many cameras TF2 actually uses in one frame (main world, viewmodel,
+    // shadow, etc.) and their exact parameters. Throttled to 16 unique
+    // tuples per session.
+    {
+      const auto& vsCb2 = m_context->m_state.vs.constantBuffers[2];
+      if (vsCb2.buffer != nullptr && vsCb2.buffer->Desc()->ByteWidth >= 96
+          && m_context->m_state.rs.numViewports > 0) {
+        const auto mapped = vsCb2.buffer->GetMappedSlice();
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (ptr) {
+          const size_t base = static_cast<size_t>(vsCb2.constantOffset) * 16;
+          const float* f = reinterpret_cast<const float*>(ptr + base);
+          const float ox = f[1], oy = f[2], oz = f[3];
+          const auto& vp = m_context->m_state.rs.viewports[0];
+          const float maxZ = vp.MaxDepth;
+          const float vpW = vp.Width, vpH = vp.Height;
+          // Integer key so we group very similar cams.
+          struct CamKey { int ox, oy, oz, mz10k, w, h; };
+          auto key = CamKey{
+            (int)ox, (int)oy, (int)oz,
+            (int)(maxZ * 10000.0f),
+            (int)vpW, (int)vpH
+          };
+          static std::vector<CamKey> sSeen;
+          bool seen = false;
+          for (const auto& k : sSeen) {
+            if (k.ox == key.ox && k.oy == key.oy && k.oz == key.oz
+             && k.mz10k == key.mz10k && k.w == key.w && k.h == key.h) {
+              seen = true; break;
+            }
+          }
+          if (!seen && sSeen.size() < 16) {
+            sSeen.push_back(key);
+            std::string vsN = "null";
+            auto vs = m_context->m_state.vs.shader;
+            if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+              auto& s = vs->GetCommonShader()->GetShader();
+              if (s != nullptr) vsN = s->getShaderKey().toString().substr(0, 19);
+            }
+            // Dump cb2[4] row3 (clip.w coefficients) to see each camera's
+            // forward axis in projection.
+            Logger::info(str::format(
+              "[CamCatalog] #", sSeen.size(),
+              " origin=(", ox, ",", oy, ",", oz, ")",
+              " maxZ=", maxZ,
+              " vp=(", (int)vpW, "x", (int)vpH, ")",
+              " row3=(", f[16], ",", f[17], ",", f[18], ",", f[19], ")",
+              " vs=", vsN));
+          }
+        }
+      }
+    }
+
+    // NV-DXVK [VMHunt]: targeted log for suspect viewmodel draws identified
+    // by index count in the game-side PIX capture. Dumps FULL per-draw
+    // state: shaders, cbuffers, viewport, input layout, bound VBs/SRVs.
+    // When user sees gun in game, one of these index counts is the gun.
+    {
+      const bool isSuspect =
+          count == 17070 || count == 13293 || count == 819
+       || count == 28089 || count == 22521 || count == 9306
+       || count == 2562  || count == 40224 || count == 1161;
+      m_vmHuntIsSuspect = isSuspect;
+      m_vmHuntIndexCount = count;
+      if (isSuspect) {
+        static uint32_t sVmHuntLog = 0;
+        if (sVmHuntLog < 40) {
+          ++sVmHuntLog;
+          const uint32_t fid = m_context->m_device->getCurrentFrameId();
+          // VS hash
+          std::string vsN = "null";
+          auto vs = m_context->m_state.vs.shader;
+          if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+            auto& s = vs->GetCommonShader()->GetShader();
+            if (s != nullptr) vsN = s->getShaderKey().toString();
+          }
+          // PS hash
+          std::string psN = "null";
+          auto ps = m_context->m_state.ps.shader;
+          if (ps != nullptr && ps->GetCommonShader() != nullptr) {
+            auto& s = ps->GetCommonShader()->GetShader();
+            if (s != nullptr) psN = s->getShaderKey().toString();
+          }
+          // Viewport
+          float vpMin = -1, vpMax = -1, vpW = -1, vpH = -1;
+          if (m_context->m_state.rs.numViewports > 0) {
+            const auto& vp = m_context->m_state.rs.viewports[0];
+            vpMin = vp.MinDepth; vpMax = vp.MaxDepth;
+            vpW = vp.Width; vpH = vp.Height;
+          }
+          // Semantics
+          std::string semLine;
+          bool hasBI = false, hasBW = false;
+          uint32_t posFmt = 0;
+          auto il = m_context->m_state.ia.inputLayout.ptr();
+          if (il != nullptr) {
+            for (const auto& s : il->GetRtxSemantics()) {
+              semLine += str::format(" ", s.name, s.index,
+                                     s.perInstance ? "/I" : "/V",
+                                     ":fmt", (uint32_t)s.format,
+                                     ":sl", (uint32_t)s.inputSlot,
+                                     ":off", (uint32_t)s.byteOffset);
+              if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0) hasBI = true;
+              if (!s.perInstance && std::strncmp(s.name, "BLENDWEIGHT", 11) == 0)  hasBW = true;
+              if (!s.perInstance && std::strncmp(s.name, "POSITION", 8) == 0 && s.index == 0)
+                posFmt = (uint32_t)s.format;
+            }
+          }
+          Logger::info(str::format(
+            "[VMHunt] f=", fid, " count=", count, " indexed=", (indexed ? 1 : 0),
+            " vs=", vsN, " ps=", psN,
+            " vp=(", vpW, "x", vpH, ",[", vpMin, "..", vpMax, "])",
+            " skin=", (hasBI && hasBW ? 1 : 0),
+            " posFmt=", posFmt,
+            " sem={", semLine, " }"));
+          // cb2 dump (first 96 bytes: c_zNear, c_cameraOrigin, c_cameraRelativeToClip)
+          const auto& vsCb2 = m_context->m_state.vs.constantBuffers[2];
+          if (vsCb2.buffer != nullptr) {
+            const auto mapped = vsCb2.buffer->GetMappedSlice();
+            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            if (ptr) {
+              const size_t base = static_cast<size_t>(vsCb2.constantOffset) * 16;
+              const float* f = reinterpret_cast<const float*>(ptr + base);
+              Logger::info(str::format(
+                "[VMHunt.cb2] zNear=", f[0],
+                " camOrigin=(", f[1], ",", f[2], ",", f[3], ")",
+                " c2c_row0=(", f[4], ",", f[5], ",", f[6], ",", f[7], ")",
+                " c2c_row1=(", f[8], ",", f[9], ",", f[10], ",", f[11], ")",
+                " c2c_row2=(", f[12], ",", f[13], ",", f[14], ",", f[15], ")",
+                " c2c_row3=(", f[16], ",", f[17], ",", f[18], ",", f[19], ")"));
+            }
+          }
+          // cb3 dump (first 48 bytes: CBufModelInstance objectToCameraRelative)
+          const auto& vsCb3 = m_context->m_state.vs.constantBuffers[3];
+          if (vsCb3.buffer != nullptr) {
+            const auto mapped = vsCb3.buffer->GetMappedSlice();
+            const uint8_t* ptr = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            if (ptr) {
+              const size_t base = static_cast<size_t>(vsCb3.constantOffset) * 16;
+              const float* f = reinterpret_cast<const float*>(ptr + base);
+              Logger::info(str::format(
+                "[VMHunt.cb3] o2cr_row0=(", f[0], ",", f[1], ",", f[2], ",", f[3], ")",
+                " row1=(", f[4], ",", f[5], ",", f[6], ",", f[7], ")",
+                " row2=(", f[8], ",", f[9], ",", f[10], ",", f[11], ")"));
+            }
+          }
+          // VS SRV slots: which are bound?
+          std::string srvLine;
+          for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+            auto srv = m_context->m_state.vs.shaderResources.views[slot].ptr();
+            if (srv != nullptr) {
+              Com<ID3D11Resource> res;
+              srv->GetResource(&res);
+              uint32_t sz = 0;
+              D3D11_RESOURCE_DIMENSION dim;
+              res->GetType(&dim);
+              if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                auto* b = static_cast<D3D11Buffer*>(res.ptr());
+                sz = b->Desc()->ByteWidth;
+              }
+              srvLine += str::format(" t", slot, "=", sz);
+            }
+          }
+          Logger::info(str::format("[VMHunt.srv]", srvLine));
+        }
+      }
+    }
+
+    // NV-DXVK [VMPass]: log EVERY draw (skinned or rigid) that happens
+    // during the viewmodel viewport (MaxDepth <= 0.08). Reveals what
+    // geometry the game actually submits for first-person rendering.
+    {
+      const float vpMaxZ = (m_context->m_state.rs.numViewports > 0)
+          ? m_context->m_state.rs.viewports[0].MaxDepth : 1.0f;
+      if (vpMaxZ <= 0.08f) {
+        const uint32_t fid = m_context->m_device->getCurrentFrameId();
+        static uint32_t sLastF = 0;
+        static uint32_t sCount = 0;
+        if (fid != sLastF) { sLastF = fid; sCount = 0; }
+        if (sCount < 32) {
+          ++sCount;
+          std::string vsN = "null", psN = "null";
+          auto vs = m_context->m_state.vs.shader;
+          if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+            auto& s = vs->GetCommonShader()->GetShader();
+            if (s != nullptr) vsN = s->getShaderKey().toString().substr(0, 19);
+          }
+          auto ps = m_context->m_state.ps.shader;
+          if (ps != nullptr && ps->GetCommonShader() != nullptr) {
+            auto& s = ps->GetCommonShader()->GetShader();
+            if (s != nullptr) psN = s->getShaderKey().toString().substr(0, 19);
+          }
+          // Probe semantic layout briefly.
+          bool hasBI = false, hasBW = false;
+          auto il = m_context->m_state.ia.inputLayout.ptr();
+          if (il != nullptr) {
+            for (const auto& s : il->GetRtxSemantics()) {
+              if (!s.perInstance && std::strncmp(s.name, "BLENDINDICES", 12) == 0) hasBI = true;
+              if (!s.perInstance && std::strncmp(s.name, "BLENDWEIGHT", 11) == 0)  hasBW = true;
+            }
+          }
+          Logger::info(str::format(
+            "[VMPass] f=", fid,
+            " vs=", vsN, " ps=", psN,
+            " verts=", count, " idx=", (indexed ? 1 : 0),
+            " skin=", (hasBI && hasBW ? 1 : 0),
+            " vpMaxZ=", vpMaxZ));
+        }
+      }
+    }
     const D3D11CommonShader* commonVsForLog = nullptr;
     {
       auto vsShader = m_context->m_state.vs.shader;
@@ -5446,9 +5737,31 @@ namespace dxvk {
         if (xformBuf) {
           m_lastBoneBuffer = xformBuf;
           const uint32_t matrixStride = 48u;
+          // NV-DXVK TF2 FIX (universal): respect the SRV's FirstElement for
+          // bone palette indexing. TF2 (and its NPC variants) bind t30 with
+          // a per-draw FirstElement window — applying it here fixes spike
+          // artifacts on NPC characters that use non-R8G8B8A8_UINT blend
+          // index formats and therefore don't enter the fmt=41 block below.
+          uint32_t firstElemBones = 0;
+          {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+            xformSrv->GetDesc(&sd);
+            if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+              firstElemBones = sd.Buffer.FirstElement;
+            else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX)
+              firstElemBones = sd.BufferEx.FirstElement;
+          }
+          const uint32_t byteOffset = firstElemBones * matrixStride;
           geo.boneMatrixBuffer = RasterBuffer(
-            xformBuf->GetBufferSlice(), 0, matrixStride, VK_FORMAT_UNDEFINED);
+            xformBuf->GetBufferSlice(byteOffset), 0, matrixStride, VK_FORMAT_UNDEFINED);
           geo.boneMatrixStrideBytes = matrixStride;
+          static uint32_t sLegacyFirstElemLog = 0;
+          if (firstElemBones != 0 && sLegacyFirstElemLog < 10) {
+            ++sLegacyFirstElemLog;
+            Logger::info(str::format(
+              "[D3D11Rtx.legacySkin.firstElem] applied byteOffset=", byteOffset,
+              " (firstElemBones=", firstElemBones, ")"));
+          }
         }
       } else if (xformSrv && isModelInst) {
         // BSP-path: log once per unique buffer so we know fanout activated.
@@ -5523,6 +5836,76 @@ namespace dxvk {
             geo.boneMatrixBuffer = RasterBuffer(
               boneBuf->GetBufferSlice(boneByteOffset), 0, 48u, VK_FORMAT_UNDEFINED);
             geo.boneMatrixStrideBytes = 48u;
+
+            // NV-DXVK [BoneSrvs]: log BOTH t30 (g_boneMatrix) AND t32
+            // (g_boneMatrixPrevFrame) SRV descriptors for this draw.
+            // Unthrottled — every skinned draw emits one line.
+            {
+              {
+                std::string vsN = "?";
+                auto vs = m_context->m_state.vs.shader;
+                if (vs != nullptr && vs->GetCommonShader() != nullptr) {
+                  auto& s = vs->GetCommonShader()->GetShader();
+                  if (s != nullptr) vsN = s->getShaderKey().toString().substr(0, 19);
+                }
+                auto srv30 = m_context->m_state.vs.shaderResources.views[30].ptr();
+                auto srv32 = m_context->m_state.vs.shaderResources.views[32].ptr();
+                auto describe = [](ID3D11ShaderResourceView* srv, uintptr_t& outBuf,
+                                   uint32_t& outFirst, uint32_t& outNum,
+                                   uint32_t& outSize) {
+                  outBuf = 0; outFirst = 0; outNum = 0; outSize = 0;
+                  if (!srv) return;
+                  D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                  srv->GetDesc(&sd);
+                  if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+                    outFirst = sd.Buffer.FirstElement;
+                    outNum   = sd.Buffer.NumElements;
+                  } else if (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+                    outFirst = sd.BufferEx.FirstElement;
+                    outNum   = sd.BufferEx.NumElements;
+                  }
+                  Com<ID3D11Resource> r;
+                  srv->GetResource(&r);
+                  D3D11_RESOURCE_DIMENSION dim;
+                  r->GetType(&dim);
+                  if (dim == D3D11_RESOURCE_DIMENSION_BUFFER) {
+                    auto* b = static_cast<D3D11Buffer*>(r.ptr());
+                    outBuf = reinterpret_cast<uintptr_t>(b);
+                    outSize = b->Desc()->ByteWidth;
+                  }
+                };
+                uintptr_t buf30 = 0, buf32 = 0;
+                uint32_t first30 = 0, first32 = 0, num30 = 0, num32 = 0;
+                uint32_t size30 = 0, size32 = 0;
+                describe(srv30, buf30, first30, num30, size30);
+                describe(srv32, buf32, first32, num32, size32);
+                Logger::info(str::format(
+                  "[BoneSrvs] vs=", vsN,
+                  " t30:buf=", buf30, " first=", first30, " num=", num30, " sz=", size30,
+                  " t32:buf=", buf32, " first=", first32, " num=", num32, " sz=", size32,
+                  " sameBuf=", (buf30 == buf32 && buf30 != 0 ? 1 : 0)));
+              }
+            }
+            // NV-DXVK TF2 VIEWMODEL: capture first-bone world translation
+            // from the full bone cache so the o2w handler downstream can
+            // shift view-model meshes (srvFirstElem >= 672) from their
+            // game-side junk world pos to in-front-of-camera.
+            m_vmFirstElem = srvFirstElemBones;
+            m_vmBoneRootValid = false;
+            if (m_hasFullBoneCache
+                && (boneByteOffset + 48u) <= m_fullBoneCache.size()) {
+              const float* bm = reinterpret_cast<const float*>(
+                  m_fullBoneCache.data() + boneByteOffset);
+              // Row-major float3x4: translation is at cols [3, 7, 11].
+              m_vmBoneRoot[0] = bm[3];
+              m_vmBoneRoot[1] = bm[7];
+              m_vmBoneRoot[2] = bm[11];
+              // Guard: only treat as valid if it's a finite, non-zero T.
+              const float mag = std::fabs(m_vmBoneRoot[0])
+                              + std::fabs(m_vmBoneRoot[1])
+                              + std::fabs(m_vmBoneRoot[2]);
+              m_vmBoneRootValid = std::isfinite(mag) && mag > 1e-3f;
+            }
             geo.boneIndexBuffer = biBuffer;
             geo.boneIndexStrideBytes = biBuffer.stride();
             geo.boneIndexMask = 0xFFu;  // per-byte index within packed RGBA8
@@ -5856,6 +6239,42 @@ namespace dxvk {
                     " firstSpikeBw=(", firstSpikeBw[0], ",", firstSpikeBw[1], ")",
                     " w0=", (float(firstSpikeBw[0]) + 1.0f) / 32768.0f,
                     " w1=", (float(firstSpikeBw[1]) + 1.0f) / 32768.0f));
+
+                  // NV-DXVK [skin.spike.bones]: for the FIRST spike
+                  // vertex, dump the ACTUAL matrices at its 3 referenced
+                  // bone slots, with FirstElement applied. This answers:
+                  // "is the slot that causes the spike actually zero in
+                  // our cache, actually zero on GPU, or actually valid?"
+                  if (firstSpikeV != UINT32_MAX && m_hasFullBoneCache) {
+                    const uint32_t base = srvFirstElemBones;
+                    auto dumpSlot = [&](const char* label, uint32_t bIdx) {
+                      const uint32_t absSlot = base + bIdx;
+                      const size_t byteOff = size_t(absSlot) * 48u;
+                      if (byteOff + 48u > m_fullBoneCache.size()) {
+                        Logger::info(str::format(
+                          "[skin.spike.bones] ", label,
+                          " idx=", bIdx, " absSlot=", absSlot,
+                          " OUT_OF_RANGE"));
+                        return;
+                      }
+                      const float* m = reinterpret_cast<const float*>(
+                          m_fullBoneCache.data() + byteOff);
+                      Logger::info(str::format(
+                        "[skin.spike.bones] ", label,
+                        " idx=", bIdx, " absSlot=", absSlot,
+                        " cachedT=(", m[3], ",", m[7], ",", m[11], ")",
+                        " cachedR0=(", m[0], ",", m[1], ",", m[2], ")",
+                        " cachedR1=(", m[4], ",", m[5], ",", m[6], ")",
+                        " cachedR2=(", m[8], ",", m[9], ",", m[10], ")",
+                        " mag(R0)=", std::sqrt(m[0]*m[0]+m[1]*m[1]+m[2]*m[2]),
+                        " mag(R1)=", std::sqrt(m[4]*m[4]+m[5]*m[5]+m[6]*m[6]),
+                        " mag(R2)=", std::sqrt(m[8]*m[8]+m[9]*m[9]+m[10]*m[10]),
+                        " |T|=", (std::fabs(m[3])+std::fabs(m[7])+std::fabs(m[11]))));
+                    };
+                    dumpSlot("bone0", (uint32_t)firstSpikeIdx[0]);
+                    dumpSlot("bone1", (uint32_t)firstSpikeIdx[1]);
+                    dumpSlot("bone2", (uint32_t)firstSpikeIdx[2]);
+                  }
                 }
                 // Dump first 5 bone matrices from t30. Prefer the cached
                 // copy populated in OnUpdateSubresource (m_fullBoneCache)
@@ -6062,23 +6481,78 @@ namespace dxvk {
     // already produces world-space positions, objectToWorld should be
     // identity — adding fanoutCam would double the camera offset.
     if (m_skinnedCharNeedsCamOffset) {
-      // NV-DXVK: skinned character path. Per the original comment on this
-      // block and DXBC disassembly of VS_ef94e6c7fcc3c144, t30 bone
-      // matrices hold ABSOLUTE WORLD transforms (not camera-relative).
-      // After the interleaver applies weighted skinning, BLAS vertices
-      // are in world space. objectToWorld must be IDENTITY — any added
-      // translation would double-shift the character off screen.
-      dcs.transformData.objectToWorld = Matrix4(); // identity
-      if (!isIdentityExact(dcs.transformData.worldToView))
-        dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
-      else
-        dcs.transformData.objectToView = dcs.transformData.objectToWorld;
-      m_lastO2wPathId = 11; // skinned char: identity (BLAS in world)
-      static std::unordered_set<std::string> sSkinPath11Logged;
-      const std::string vk = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
-      if (sSkinPath11Logged.insert(vk).second) {
-        Logger::info(str::format(
-          "[D3D11Rtx.o2w.skinnedChar] vs=", vk, " path=11 identity_o2w"));
+      // NV-DXVK: skinned character path. Per DXBC disassembly of
+      // VS_ef94e6c7fcc3c144, t30 bone matrices for the PLAYER CHARACTER
+      // hold ABSOLUTE WORLD transforms — interleaver output is world space,
+      // o2w = identity.
+      //
+      // NV-DXVK TF2 VIEWMODEL FIX: TF2 draws the first-person viewmodel
+      // (gun + hands) through the SAME VS_ef94e6c7 but with viewport
+      // MaxDepth <= 0.05 and c_cameraOrigin=(0,0,0) in cb2. Its bone
+      // matrices are VIEW-LOCAL, not world, so interleaver output is in
+      // view space. With identity o2w the BLAS sits at world origin —
+      // thousands of units from Main camera → invisible. Detect via
+      // viewport MaxDepth and apply o2w = inverse(worldToView) so the
+      // view-local geometry ends up at the camera in world space.
+      float vpMaxDepth = 1.0f;
+      if (m_context->m_state.rs.numViewports > 0)
+        vpMaxDepth = m_context->m_state.rs.viewports[0].MaxDepth;
+      // NV-DXVK: viewmodel detection — use viewport MaxDepth as the only
+      // reliable signal. w2v≈0 is NOT viewmodel-specific: it also fires
+      // when ExtractTransforms defaults to identity worldToView, which
+      // would misroute the PLAYER CHARACTER through the viewmodel o2w
+      // path and double-shift it off-screen.
+      const bool isViewModelDraw = (vpMaxDepth <= 0.08f);
+
+      if (isViewModelDraw) {
+        // Use the CACHED MAIN camera's worldToView (captured from the most
+        // recent valid world-space draw) instead of this draw's own
+        // worldToView. The viewmodel's cb2 view-to-clip has weird XY/Z
+        // scaling baked in (factor ~185 on Y/Z), so inverting it produces a
+        // matrix that crushes the viewmodel mesh to near-zero thickness.
+        // The main camera's worldToView is a proper orthonormal rotation +
+        // translation and inverts cleanly to a usable viewToWorld.
+        Matrix4 mainW2v;
+        bool haveMainW2v = false;
+        {
+          std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+          if (!isIdentityExact(m_lastGoodTransforms.worldToView)) {
+            mainW2v = m_lastGoodTransforms.worldToView;
+            haveMainW2v = true;
+          }
+        }
+        if (haveMainW2v) {
+          dcs.transformData.objectToWorld = inverse(mainW2v);
+        } else {
+          // Fallback: inverse of this draw's worldToView (bad scale but
+          // better than nothing).
+          dcs.transformData.objectToWorld = inverse(dcs.transformData.worldToView);
+        }
+        dcs.transformData.objectToView = Matrix4(); // identity (already view-space)
+        m_lastO2wPathId = 12; // viewmodel: o2w = mainViewToWorld (BLAS in view space)
+        static uint32_t sVmPathLog = 0;
+        if (sVmPathLog < 10) {
+          ++sVmPathLog;
+          const auto& o2w = dcs.transformData.objectToWorld;
+          Logger::info(str::format(
+            "[D3D11Rtx.o2w.viewmodel] path=12 vpMaxZ=", vpMaxDepth,
+            " usedMainW2v=", (haveMainW2v ? 1 : 0),
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")",
+            " o2wDiag=(", o2w[0][0], ",", o2w[1][1], ",", o2w[2][2], ")"));
+        }
+      } else {
+        dcs.transformData.objectToWorld = Matrix4(); // identity
+        if (!isIdentityExact(dcs.transformData.worldToView))
+          dcs.transformData.objectToView = dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+        else
+          dcs.transformData.objectToView = dcs.transformData.objectToWorld;
+        m_lastO2wPathId = 11; // skinned char: identity (BLAS in world)
+        static std::unordered_set<std::string> sSkinPath11Logged;
+        const std::string vk = m_currentVsHashCache.substr(0, std::min<size_t>(m_currentVsHashCache.size(), 19u));
+        if (sSkinPath11Logged.insert(vk).second) {
+          Logger::info(str::format(
+            "[D3D11Rtx.o2w.skinnedChar] vs=", vk, " path=11 identity_o2w"));
+        }
       }
       // Fall through to submit, NOT filter.
     }
@@ -6676,6 +7150,17 @@ namespace dxvk {
     // NV-DXVK: record the successful submit against the current VS hash.
     if (!m_currentVsHashCache.empty())
       ++m_vsFrameStats[m_currentVsHashCache].submitted;
+    // NV-DXVK [VMHunt.result=pass]: suspect draw reached COMMIT. Report
+    // the o2w path id so we know what transform treatment it got.
+    if (m_vmHuntIsSuspect) {
+      const auto& o2w = dcs.transformData.objectToWorld;
+      Logger::info(str::format(
+        "[VMHunt.result] count=", m_vmHuntIndexCount,
+        " vs=", m_currentVsHashCache.substr(0, 19),
+        " verdict=PASS o2wPathId=", m_lastO2wPathId,
+        " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
+      m_vmHuntIsSuspect = false; // consumed
+    }
 
     // NV-DXVK: orientation probe — log the world-space directions that each
     // object's LOCAL +X/+Y/+Z axes map to, plus translation. No identity
@@ -6711,6 +7196,26 @@ namespace dxvk {
       const auto& vp = m_context->m_state.rs.viewports[0];
       dcs.minZ = std::clamp(vp.MinDepth, 0.0f, 1.0f);
       dcs.maxZ = std::clamp(vp.MaxDepth, 0.0f, 1.0f);
+    }
+
+    // NV-DXVK TF2 VIEWMODEL: TF2 draws the first-person gun+hands through
+    // VS_ef94e6c7 (same shader as the player body) with MaxDepth=0.1 (same
+    // as the world pass). Remix's isViewModel() classifier can't tell them
+    // apart by depth range or FoV alone. But the gun+hands bind t30 with
+    // srvFirstElem >= 672 (weapon skeleton window, distinct from body's
+    // 608). Override dcs.maxZ to trick the classifier into routing these
+    // draws through the ViewModel pipeline — that pipeline owns
+    // perspective correction, so FoV + ADS zoom behave as the game does.
+    if (m_skinnedCharNeedsCamOffset && m_vmFirstElem >= 672u && m_vmBoneRootValid) {
+      dcs.maxZ = 0.05f; // ≤ rtx.viewModel.maxZThreshold (0.08) → ViewModel
+      static uint32_t sVmRouteLog = 0;
+      if (sVmRouteLog < 10) {
+        ++sVmRouteLog;
+        Logger::info(str::format(
+          "[D3D11Rtx.vmRoute] srvFirst=", m_vmFirstElem,
+          " boneRoot=(", m_vmBoneRoot[0], ",", m_vmBoneRoot[1], ",", m_vmBoneRoot[2], ")",
+          " forcing dcs.maxZ=0.05 → ViewModel classifier"));
+      }
     }
 
     // D3D11 has no legacy fog — engines bake fog into shaders.
@@ -7074,11 +7579,22 @@ namespace dxvk {
         ++sCountThisFrameBU;
         const uint32_t nBones = SrcDataSize / 48u;
         const float* fData = reinterpret_cast<const float*>(pSrcData);
-        // Collect Tx of up to first 4 bones for spot-check.
+        // For gun/hands diagnostics: at offsets 32256 (palette 42, srvFirstElem=672)
+        // and 33024 (palette 43, srvFirstElem=688), dump the FULL 3x4 matrix of
+        // the first bone so we can see if rotation is valid (orthonormal) or
+        // degenerate (zero/wrong).
         std::string allTx;
-        for (uint32_t b = 0; b < nBones && b < 4; ++b) {
-          const float* m = fData + b * 12;
-          allTx += str::format(" b", b, ".Tx=", m[3]);
+        if (DstOffset == 32256 || DstOffset == 33024) {
+          const float* m = fData;
+          allTx += str::format(
+            " FULL_BONE0: r0=(", m[0], ",", m[1], ",", m[2], ") T.x=", m[3],
+            " r1=(", m[4], ",", m[5], ",", m[6], ") T.y=", m[7],
+            " r2=(", m[8], ",", m[9], ",", m[10], ") T.z=", m[11]);
+        } else {
+          for (uint32_t b = 0; b < nBones && b < 4; ++b) {
+            const float* m = fData + b * 12;
+            allTx += str::format(" b", b, ".Tx=", m[3]);
+          }
         }
         Logger::info(str::format(
           "[BoneUpload] f=", fid,

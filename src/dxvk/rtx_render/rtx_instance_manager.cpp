@@ -1312,6 +1312,26 @@ namespace dxvk {
         m_viewModelCandidatesFrameId = currentFrameId;
       }
       m_viewModelCandidates.push_back(&currentInstance);
+      Logger::info(str::format(
+        "[VM.candidate] f=", currentFrameId,
+        " candidates=", m_viewModelCandidates.size()));
+    }
+    // NV-DXVK [VM.instance]: log every draw that reaches instance update so
+    // we can see whether ViewModel-classified draws arrive here (proves
+    // SceneManager → InstanceManager plumbing works).
+    if (drawCall.cameraType == CameraType::ViewModel) {
+      static uint32_t sLastF = 0;
+      static uint32_t sCount = 0;
+      const uint32_t fid = m_device->getCurrentFrameId();
+      if (fid != sLastF) { sLastF = fid; sCount = 0; }
+      if (sCount < 16) {
+        ++sCount;
+        Logger::info(str::format(
+          "[VM.instance] f=", fid,
+          " isHidden=", (currentInstance.m_isHidden ? 1 : 0),
+          " firstUpdate=", (isFirstUpdateThisFrame ? 1 : 0),
+          " mask=", currentInstance.getVkInstance().mask));
+      }
     }
 
     if (RtxOptions::enableSeparateUnorderedApproximations() &&
@@ -1417,6 +1437,19 @@ namespace dxvk {
     // It also results in this instance not being linked to reference instance BLAS and thus not considered in findSimilarInstances' lookups
     // This is desired as ViewModel instances are not to be linked frame to frame
 
+    // NV-DXVK [VM.final]: log the final viewmodel instance's transform +
+    // mask so we can see where it'd render and whether the BVH/TLAS upload
+    // will accept it.
+    {
+      const auto& t = viewModelInstance->getTransform();
+      Logger::info(str::format(
+        "[VM.final] f=", frameId,
+        " mask=0x", std::hex, (uint32_t)viewModelInstance->m_vkInstance.mask, std::dec,
+        " pc=", (RtxOptions::ViewModel::perspectiveCorrection() ? 1 : 0),
+        " T=(", t[3][0], ",", t[3][1], ",", t[3][2], ")",
+        " diag=(", t[0][0], ",", t[1][1], ",", t[2][2], ")"));
+    }
+
     return viewModelInstance;
   }
 
@@ -1425,10 +1458,19 @@ namespace dxvk {
                                                  const RayPortalManager& rayPortalManager) {
     ScopedGpuProfileZone(ctx, "ViewModel");
 
-    if (!RtxOptions::ViewModel::enable())
+    const uint32_t fid = m_device->getCurrentFrameId();
+    const bool vmEnable = RtxOptions::ViewModel::enable();
+    const bool vmCamValid = cameraManager.isCameraValid(CameraType::ViewModel);
+    Logger::info(str::format(
+      "[VM.create] f=", fid,
+      " enable=", (vmEnable ? 1 : 0),
+      " camValid=", (vmCamValid ? 1 : 0),
+      " candidates=", m_viewModelCandidates.size()));
+
+    if (!vmEnable)
       return;
 
-    if (!cameraManager.isCameraValid(CameraType::ViewModel))
+    if (!vmCamValid)
       return;
 
     // If the first person player model is enabled, hide the view model.
@@ -1473,22 +1515,30 @@ namespace dxvk {
 
     // Create any valid view model instances from the list of candidates
     std::vector<RtInstance*> viewModelInstances;
+    uint32_t vmSkippedMulticam = 0, vmSkippedNoCam = 0, vmCreated = 0;
     for (auto* candidateInstance : m_viewModelCandidates) {
 
       // Valid view model instances must be associated only with the view model camera
       // Check: exactly one bit set (power-of-two check via raw bitmask)
       const auto seenMask = candidateInstance->m_seenCameraTypes.raw();
-      if (seenMask == 0 || (seenMask & (seenMask - 1)) != 0)
-        continue;
+      if (seenMask == 0) { ++vmSkippedNoCam; continue; }
+      if ((seenMask & (seenMask - 1)) != 0) { ++vmSkippedMulticam; continue; }
 
-      // Hide the reference instance since we'll create a separate instance for the view model 
+      // Hide the reference instance since we'll create a separate instance for the view model
       candidateInstance->m_vkInstance.mask = 0;
 
       // Tag the instance as ViewModel so it can be checked for it being a reference view model instance
       candidateInstance->setCustomIndexBit(CUSTOM_INDEX_IS_VIEW_MODEL, true);
 
       viewModelInstances.push_back(createViewModelInstance(ctx, *candidateInstance, perspectiveCorrection, prevPerspectiveCorrection));
+      ++vmCreated;
     }
+    Logger::info(str::format(
+      "[VM.created] f=", fid,
+      " total=", m_viewModelCandidates.size(),
+      " created=", vmCreated,
+      " skipNoCam=", vmSkippedNoCam,
+      " skipMultiCam=", vmSkippedMulticam));
 
     // Create virtual instances for the view model instances
     createRayPortalVirtualViewModelInstances(viewModelInstances, cameraManager, rayPortalManager);

@@ -78,7 +78,17 @@ namespace dxvk {
       float fovRad       = 0.0f;
       float viewportW    = 0.0f;
       float viewportH    = 0.0f;
+      // NV-DXVK TF2: also snapshot maxZ so subsequent latches from a
+      // different render pass (same viewport+fov but different depth range,
+      // e.g. shadow/env/viewmodel) get HARD-rejected by hysteresis instead
+      // of stealing Main.
+      float maxZ         = 0.0f;
       Vector3 fwd        = Vector3(0.0f, 0.0f, 0.0f);
+      // NV-DXVK TF2: also snapshot the camera's right vector so the basis
+      // consistency check can detect roll around the forward axis. Without
+      // this, two candidate draws with identical forward but ~90° different
+      // roll both pass the check and Main can latch onto a sideways pose.
+      Vector3 right      = Vector3(0.0f, 0.0f, 0.0f);
       Vector3 pos        = Vector3(0.0f, 0.0f, 0.0f);
       bool   valid       = false;
       uint32_t frameId   = UINT32_MAX;

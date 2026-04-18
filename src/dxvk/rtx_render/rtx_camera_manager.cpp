@@ -29,6 +29,36 @@
 
 namespace {
   constexpr float kFovToleranceRadians = 0.001f;
+
+  // NV-DXVK TF2: per-frame histogram of Main-candidate reject reasons. Populated
+  // by processCameraData and dumped by CameraManager::onFrameEnd so we can see
+  // which specific gate blocks Main latches on frames where the camera fails
+  // to update. Counters are reset when the observed frameId advances.
+  struct MainRejectHistogram {
+    uint32_t frameId = UINT32_MAX;
+    uint32_t candidates = 0;
+    uint32_t accepted = 0;
+    // Physical gates.
+    uint32_t rejIsInWorld = 0;
+    uint32_t rejIsNonSquare = 0;
+    uint32_t rejIsReasonableDepth = 0;
+    uint32_t rejIsReasonableFov = 0;
+    uint32_t rejIsLargeEnough = 0;
+    // Hysteresis gates.
+    uint32_t rejVpMatches = 0;
+    uint32_t rejMaxZMatches = 0;
+    uint32_t rejFovClose = 0;
+    uint32_t rejBasisClose = 0;
+    uint32_t rejStreakNotMet = 0;
+  };
+  MainRejectHistogram g_mainHist;
+
+  inline void noteFrame(uint32_t frameId) {
+    if (g_mainHist.frameId != frameId) {
+      g_mainHist = MainRejectHistogram{};
+      g_mainHist.frameId = frameId;
+    }
+  }
 }
 
 namespace dxvk {
@@ -45,6 +75,26 @@ namespace dxvk {
   }
 
   void CameraManager::onFrameEnd() {
+    // NV-DXVK TF2: dump the Main-candidate reject histogram for the frame
+    // that just ended. One line per frame — makes it trivial to spot which
+    // gate is blocking Main updates when the camera lags the player.
+    if (g_mainHist.frameId != UINT32_MAX && g_mainHist.candidates > 0) {
+      Logger::info(str::format(
+        "[CamMgr.hist] frame=", g_mainHist.frameId,
+        " cand=", g_mainHist.candidates,
+        " accept=", g_mainHist.accepted,
+        " phys{inWorld=", g_mainHist.rejIsInWorld,
+        " nonSq=", g_mainHist.rejIsNonSquare,
+        " depth=", g_mainHist.rejIsReasonableDepth,
+        " fov=", g_mainHist.rejIsReasonableFov,
+        " large=", g_mainHist.rejIsLargeEnough,
+        "} hyst{vp=", g_mainHist.rejVpMatches,
+        " maxZ=", g_mainHist.rejMaxZMatches,
+        " fovClose=", g_mainHist.rejFovClose,
+        " basisClose=", g_mainHist.rejBasisClose,
+        " streak=", g_mainHist.rejStreakNotMet,
+        "}"));
+    }
     m_lastSetCameraType = CameraType::Unknown;
     m_decompositionCache.clear();
   }
@@ -95,9 +145,28 @@ namespace dxvk {
 
 
     auto isViewModel = [this](float fov, float maxZ, uint32_t frameId) {
-      if (RtxOptions::ViewModel::enable()) {
+      // NV-DXVK [VM.check]: trace every invocation so we can see why the
+      // viewmodel is / isn't being classified. Throttled per-frame.
+      const float vmThr = RtxOptions::ViewModel::maxZThreshold();
+      const bool vmEnable = RtxOptions::ViewModel::enable();
+      {
+        static uint32_t sLastVMFrame = 0;
+        static uint32_t sVMLogCount = 0;
+        if (frameId != sLastVMFrame) { sLastVMFrame = frameId; sVMLogCount = 0; }
+        if (sVMLogCount < 32) {
+          ++sVMLogCount;
+          Logger::info(str::format(
+            "[VM.check] f=", frameId,
+            " maxZ=", maxZ,
+            " fov=", fov,
+            " thr=", vmThr,
+            " enable=", (vmEnable ? 1 : 0),
+            " maxZHit=", (vmEnable && maxZ <= vmThr ? 1 : 0)));
+        }
+      }
+      if (vmEnable) {
         // Note: max Z check is the top-priority
-        if (maxZ <= RtxOptions::ViewModel::maxZThreshold()) {
+        if (maxZ <= vmThr) {
           return true;
         }
         // NV-DXVK: only trust Main's FoV for the "different-FoV → ViewModel"
@@ -135,6 +204,23 @@ namespace dxvk {
       cameraType = CameraType::Sky;
     } else if (isViewModel(decomposeProjectionParams.fov, input.maxZ, frameId)) {
       cameraType = CameraType::ViewModel;
+    }
+    // NV-DXVK [VM.class]: log every camera-type decision so we can see the
+    // post-isViewModel result. Throttled per frame.
+    {
+      static uint32_t sLastVMClassFrame = 0;
+      static uint32_t sVMClassLog = 0;
+      if (frameId != sLastVMClassFrame) { sLastVMClassFrame = frameId; sVMClassLog = 0; }
+      if (sVMClassLog < 32) {
+        ++sVMClassLog;
+        Logger::info(str::format(
+          "[VM.class] f=", frameId,
+          " maxZ=", input.maxZ,
+          " fov=", decomposeProjectionParams.fov,
+          " type=", static_cast<uint32_t>(cameraType),
+          " isRT=", (input.isDrawingToRaytracedRenderTarget ? 1 : 0),
+          " isSky=", (input.testCategoryFlags(InstanceCategories::Sky) ? 1 : 0)));
+      }
     }
 
     // NV-DXVK: Deterministic Main-camera classifier — game-native per-draw
@@ -184,8 +270,17 @@ namespace dxvk {
         std::abs(w2v[0][0] - 1.0f) < 0.01f && std::abs(w2v[0][1]) < 0.01f && std::abs(w2v[0][2]) < 0.01f &&
         std::abs(w2v[1][0]) < 0.01f && std::abs(w2v[1][1] - 1.0f) < 0.01f && std::abs(w2v[1][2]) < 0.01f &&
         std::abs(w2v[2][0]) < 0.01f && std::abs(w2v[2][1]) < 0.01f && std::abs(w2v[2][2] - 1.0f) < 0.01f;
-      // isInWorld is true unless this is the pure-identity (UI/composite) case.
-      const bool isInWorld = !(transNearZero && rotIsIdentity);
+      // NV-DXVK TF2: also reject any candidate whose world translation is
+      // near zero, regardless of rotation. ExtractTransforms path 1 always
+      // bakes the real camera world position into w2v[3] (= -dot(axis,camPos)),
+      // so a path-1 output with |w2v[3]| ≈ 0 means the per-draw cb2 RDEF read
+      // returned a stale/HUD/identity camera (e.g. (0.0004,0,0)). Without this
+      // gate, such a candidate could win Main's first latch and freeze the
+      // camera at origin while gameplay draws update body geometry → visible
+      // body-races-ahead-of-camera lag. Threshold 10 units handles spawn
+      // points near origin while reliably catching the (~0,~0,~0) garbage.
+      const bool transTooSmall = w2vMagSq < (10.0f * 10.0f);
+      const bool isInWorld = !(transNearZero && rotIsIdentity) && !transTooSmall;
       const float vw = td.viewportWidth;
       const float vh = td.viewportHeight;
       const float vpAspect = (vh > 0.0f) ? (vw / vh) : 0.0f;
@@ -210,6 +305,13 @@ namespace dxvk {
       const bool isLargeEnough = vw >= 1200.0f && vh >= 600.0f;
       const bool keepAsMain =
         isInWorld && isNonSquare && isReasonableDepth && isReasonableFov && isLargeEnough;
+      noteFrame(frameId);
+      ++g_mainHist.candidates;
+      if (!isInWorld) ++g_mainHist.rejIsInWorld;
+      if (!isNonSquare) ++g_mainHist.rejIsNonSquare;
+      if (!isReasonableDepth) ++g_mainHist.rejIsReasonableDepth;
+      if (!isReasonableFov) ++g_mainHist.rejIsReasonableFov;
+      if (!isLargeEnough) ++g_mainHist.rejIsLargeEnough;
       if (!keepAsMain) {
         static uint32_t sVpLog = 0;
         if (sVpLog < 40) {
@@ -263,7 +365,24 @@ namespace dxvk {
             (newFwdLen2 > 0.001f)
               ? (newFwd.x*snap.fwd.x + newFwd.y*snap.fwd.y + newFwd.z*snap.fwd.z)
               : 0.0f;
-          const bool basisClose = dot > 0.5f;
+          // NV-DXVK TF2: forward-vector check — same-hemisphere (~90° cap).
+          // Allows normal fast mouse look while rejecting 180° axis flips.
+          const bool fwdClose = dot > 0.0f;
+          // NV-DXVK TF2: also compare the right vector so roll around the
+          // forward axis is part of the basis check. Two candidate draws can
+          // share a forward direction yet differ by a 90° roll (TF2 produces
+          // both), and without this check either pose can win the Main latch
+          // — the camera then renders sideways. 0.7 ≈ cos(45°): tolerates
+          // moderate roll drift (camera tilt anims, lean), rejects 90°+ flips.
+          const Vector3 newRight(w2v[0][0], w2v[1][0], w2v[2][0]);
+          const float newRightLen2 =
+            newRight.x*newRight.x + newRight.y*newRight.y + newRight.z*newRight.z;
+          const float rightDot =
+            (newRightLen2 > 0.001f)
+              ? (newRight.x*snap.right.x + newRight.y*snap.right.y + newRight.z*snap.right.z)
+              : 0.0f;
+          const bool rightClose = rightDot > 0.7f;
+          const bool basisClose = fwdClose && rightClose;
           // NV-DXVK: differentiate hard and soft rejects. A viewport mismatch
           // is a DIFFERENT RENDER PASS (HUD compositing, scope zoom, minimap
           // preview, thumbnail) — not a camera cut. Accepting it as a "cut"
@@ -271,7 +390,34 @@ namespace dxvk {
           // viewport-wrong candidates are HARD-rejected and never contribute
           // to the cut streak. Only FoV-change + basis-change count, because
           // those are real camera cuts (level change, teleport, cinematic).
+          // NV-DXVK TF2 FIX: also HARD-reject maxZ mismatches. Each TF2
+          // render pass uses a distinct viewport depth range — main world
+          // is 0.1, viewmodel 0.05, shadow 1.0, probe/env 1.0 at different
+          // resolutions. A candidate with different maxZ is a DIFFERENT
+          // render pass, not a camera cut. Without this gate, every frame
+          // we alternate between passes and Main oscillates → visible flash
+          // on frame 1 + subsequent-frame geometry pops.
+          const bool maxZMatches = std::abs(input.maxZ - snap.maxZ) < 0.01f;
+          // NV-DXVK TF2: intra-frame position-magnitude check. With multi-latch
+          // enabled (last-wins per frame), a later draw whose worldToView
+          // carries a wildly different translation magnitude from the snapshot
+          // is almost certainly a different render pass that happens to share
+          // viewport/maxZ/basis (e.g. a camera-relative HUD overlay drawn at a
+          // small offset from origin). Rejecting these intra-frame protects
+          // Main from being yanked to a wrong pose by the last passing draw.
+          // Only enforced when the snapshot was set THIS frame (intra-frame
+          // refinement); cross-frame motion goes through the wider basis/fov
+          // path. Tolerance is loose (200 world units) — the player can move
+          // ~150 u/s, and we just need to filter the obvious order-of-magnitude
+          // mismatches like (5188 vs 50) without rejecting same-scene refinements.
+          const float newW2vTMag = std::sqrt(w2vMagSq);
+          const float snapPosMag = std::sqrt(
+            snap.pos.x*snap.pos.x + snap.pos.y*snap.pos.y + snap.pos.z*snap.pos.z);
+          const bool intraFrame = (snap.frameId == curFrameId);
+          const bool posMagOk = !intraFrame
+            || std::abs(newW2vTMag - snapPosMag) < 500.0f;
           if (!vpMatches) {
+            ++g_mainHist.rejVpMatches;
             static uint32_t sHystLog = 0;
             if (sHystLog < 40) {
               ++sHystLog;
@@ -281,18 +427,53 @@ namespace dxvk {
                 " snapVp=(", int(snap.viewportW), "x", int(snap.viewportH), ")"));
             }
             cameraType = CameraType::Unknown;
+          } else if (!maxZMatches) {
+            ++g_mainHist.rejMaxZMatches;
+            static uint32_t sHystLog2 = 0;
+            if (sHystLog2 < 40) {
+              ++sHystLog2;
+              Logger::info(str::format(
+                "[CamMgr.hyst] HARD reject (wrong maxZ)",
+                " maxZ=", input.maxZ,
+                " snapMaxZ=", snap.maxZ));
+            }
+            cameraType = CameraType::Unknown;
+          } else if (!posMagOk) {
+            // Same frame, vp/maxZ match, but eye-space translation magnitude
+            // is far from the in-frame latched pose. Different render pass.
+            static uint32_t sHystLog3 = 0;
+            if (sHystLog3 < 40) {
+              ++sHystLog3;
+              Logger::info(str::format(
+                "[CamMgr.hyst] HARD reject (intra-frame |w2vT| mismatch)",
+                " newMag=", newW2vTMag,
+                " snapMag=", snapPosMag));
+            }
+            cameraType = CameraType::Unknown;
           } else if (!fovClose || !basisClose) {
+            if (!fovClose) ++g_mainHist.rejFovClose;
+            if (!basisClose) ++g_mainHist.rejBasisClose;
             ++m_disagreeStreak;
-            constexpr uint32_t kCutStreakThreshold = 8;
+            // NV-DXVK TF2: reduced from 8 → 3. The streak exists to suppress
+            // intra-frame flicker between competing candidate draws, not to
+            // suppress legitimate frame-to-frame motion. Eight frames meant
+            // the camera could be 8 frames behind reality before accepting a
+            // re-latch, which was a major contributor to the main-camera lag
+            // observed while walking. Three is enough to filter same-frame
+            // multi-candidate noise while tracking real motion promptly.
+            constexpr uint32_t kCutStreakThreshold = 3;
             if (m_disagreeStreak < kCutStreakThreshold) {
+              ++g_mainHist.rejStreakNotMet;
               static uint32_t sHystLog = 0;
               if (sHystLog < 40) {
                 ++sHystLog;
                 Logger::info(str::format(
                   "[CamMgr.hyst] reject streak=", m_disagreeStreak,
                   " fovClose=", fovClose ? 1 : 0,
-                  " basisClose=", basisClose ? 1 : 0,
-                  " dot=", dot,
+                  " fwdClose=", fwdClose ? 1 : 0,
+                  " rightClose=", rightClose ? 1 : 0,
+                  " fwdDot=", dot,
+                  " rightDot=", rightDot,
                   " fovDelta=", fovDiff * (180.0f / 3.14159265f), "deg"));
               }
               cameraType = CameraType::Unknown;
@@ -317,7 +498,20 @@ namespace dxvk {
 
     auto& camera = getCamera(cameraType);
     auto cameraSequence = RtCameraSequence::getInstance();
-    bool shouldUpdateMainCamera = cameraType == CameraType::Main && camera.getLastUpdateFrame() != frameId;
+    // NV-DXVK TF2: previously this gated on `lastUpdateFrame != frameId`,
+    // making the FIRST passing draw per frame win Main and locking out
+    // every subsequent draw. That's the root cause of the "body races
+    // ahead of camera" lag: when the first-latched draw read a stale cb2
+    // (the game can submit multiple cbuffers per frame, and DX11's per-draw
+    // RDEF lookup can land on one whose CBufCommonPerCamera value is older
+    // than the gameplay one), Main froze on it for the whole frame even
+    // though later gameplay draws had fresher data. Now Main re-latches on
+    // every passing candidate within the frame; LAST-WINS semantics. The
+    // strengthened isInWorld gate (|w2vT|>10) plus existing hysteresis
+    // (vp/maxZ HARD reject + fwd/right basis check + position-proximity
+    // below) ensure only legitimate gameplay candidates can re-latch, so
+    // the last one carries the freshest pose.
+    bool shouldUpdateMainCamera = cameraType == CameraType::Main;
     bool isPlaying = RtCameraSequence::mode() == RtCameraSequence::Mode::Playback;
     bool isBrowsing = RtCameraSequence::mode() == RtCameraSequence::Mode::Browse;
     bool isCameraCut = false;
@@ -446,6 +640,8 @@ namespace dxvk {
     // this flag so it only rejects draws when Main's position is reliable.
     if (shouldUpdateMainCamera && cameraType == CameraType::Main) {
       noteMainSetByClassifier(frameId);
+      noteFrame(frameId);
+      ++g_mainHist.accepted;
       // NV-DXVK: record the snapshot used by the hysteresis gate on future
       // candidates. Must happen AFTER camera.update so getPosition/getForward
       // reflect the new latch.
@@ -454,14 +650,21 @@ namespace dxvk {
         snap.fovRad      = decomposeProjectionParams.fov;
         snap.viewportW   = input.getTransformData().viewportWidth;
         snap.viewportH   = input.getTransformData().viewportHeight;
-        // Forward from row-major worldToView col 2.
+        snap.maxZ        = input.maxZ;
+        // Forward from row-major worldToView col 2, right from col 0.
         const Matrix4& w = worldToView;
         snap.fwd         = Vector3(w[0][2], w[1][2], w[2][2]);
+        snap.right       = Vector3(w[0][0], w[1][0], w[2][0]);
         // Normalize (input may not be perfectly unit).
-        const float len2 = snap.fwd.x*snap.fwd.x + snap.fwd.y*snap.fwd.y + snap.fwd.z*snap.fwd.z;
-        if (len2 > 0.001f) {
-          const float invLen = 1.0f / std::sqrt(len2);
+        const float fwdLen2 = snap.fwd.x*snap.fwd.x + snap.fwd.y*snap.fwd.y + snap.fwd.z*snap.fwd.z;
+        if (fwdLen2 > 0.001f) {
+          const float invLen = 1.0f / std::sqrt(fwdLen2);
           snap.fwd = Vector3(snap.fwd.x * invLen, snap.fwd.y * invLen, snap.fwd.z * invLen);
+        }
+        const float rightLen2 = snap.right.x*snap.right.x + snap.right.y*snap.right.y + snap.right.z*snap.right.z;
+        if (rightLen2 > 0.001f) {
+          const float invLen = 1.0f / std::sqrt(rightLen2);
+          snap.right = Vector3(snap.right.x * invLen, snap.right.y * invLen, snap.right.z * invLen);
         }
         snap.pos         = camera.getPosition(/*freecam=*/false);
         snap.frameId     = frameId;

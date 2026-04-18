@@ -1,5 +1,20 @@
 // NV-DXVK: touched to force slang recompile after interleave_geometry.h
 // weight-clamp + zero-bone-gap-skip fix for TF2 skinned character spikes.
+// v2: tightened validity check (all 3 rows unit-len + translation bounds)
+//     and bone-0 fallback for vertices where all 3 weighted bones invalid.
+// v3: SENTINEL diagnostic — verts with any invalid bone output at (+1e6,0,0)
+//     so we can visually confirm the validity check is firing correctly.
+// v4: UNIVERSAL fix — cluster-distance check. Reject bones whose T is >400
+//     units from the centroid of the vertex's 3 bones. Catches foreign-
+//     character bones sharing the t30 buffer without per-character tuning.
+// v5: RIGOROUS rotation matrix check — reject bones whose 3 rows aren't
+//     unit-length AND mutually perpendicular. Catches uninitialized gap-
+//     slot garbage without heuristics, since random bit patterns almost
+//     never produce a valid orthonormal rotation.
+// v6: SCALE-TOLERANT rotation check — TF2 uses scaled bones for stretchy
+//     animations. Check cross(r0,r1) is parallel to r2 with consistent
+//     scale across rows (allows any S in [0.1, 10]). Plus bone-0 fallback
+//     so invalid-pose verts collapse to character root, not bind pose.
 /*
 * Copyright (c) 2021-2024, NVIDIA CORPORATION. All rights reserved.
 *
