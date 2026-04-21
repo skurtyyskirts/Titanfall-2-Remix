@@ -1203,6 +1203,36 @@ namespace dxvk {
   // view*projection matrices.  The caller should set this to true only when
   // the current frame has enough draws to be confident it's gameplay.
   static int classifyPerspective(const Matrix4& m, bool allowCombinedVP = true) {
+    // NV-DXVK Heavy Rain bring-up diagnostic: log the first N NON-ZERO
+    // matrices this classifier examines. Zero log lines means the scanner
+    // never calls this function (major plumbing failure); many lines with
+    // cls returned 0 every time means the scanner IS running but Heavy
+    // Rain's bound cbuffers contain no matrix passing any perspective
+    // signature (e.g. the game binds different slots). The non-zero gate
+    // was added on 2026-04-21 after a run where all 50 logged entries were
+    // all-zero matrices from splash/menu frames — which burned the cap
+    // before any real gameplay matrix was ever seen. Skipping zero
+    // matrices lets the first 50 entries cover actual candidate data.
+    // Accepts a slight data race on the counter in exchange for not
+    // needing a lock (lost increments are fine for diagnostics).
+    {
+      const bool allZero =
+           m[0][0] == 0.f && m[0][1] == 0.f && m[0][2] == 0.f && m[0][3] == 0.f
+        && m[1][0] == 0.f && m[1][1] == 0.f && m[1][2] == 0.f && m[1][3] == 0.f
+        && m[2][0] == 0.f && m[2][1] == 0.f && m[2][2] == 0.f && m[2][3] == 0.f
+        && m[3][0] == 0.f && m[3][1] == 0.f && m[3][2] == 0.f && m[3][3] == 0.f;
+      static uint32_t sClassifyLog = 0;
+      if (!allZero && sClassifyLog < 50) {
+        ++sClassifyLog;
+        Logger::info(str::format(
+          "[classifyPerspective] #", sClassifyLog,
+          " diag=(", m[0][0], ",", m[1][1], ",", m[2][2], ")",
+          " m23=", m[2][3], " m32=", m[3][2], " m33=", m[3][3],
+          " m03=", m[0][3], " m13=", m[1][3],
+          " allowVP=", allowCombinedVP ? 1 : 0));
+      }
+    }
+
     constexpr float kTol = 0.02f;
     constexpr float kJitterTol = 0.15f;
 
@@ -1216,22 +1246,39 @@ namespace dxvk {
         std::abs(m[0][0]) >= 0.1f && std::abs(m[1][1]) >= 0.1f;
 
     if (diag01) {
-      // Row-major check: m[2][3] ≈ ±1, m[3][3] ≈ 0.
-      const bool r23 = std::abs(std::abs(m[2][3]) - 1.0f) < kTol;
-      const bool r33z = std::abs(m[3][3]) < kTol;
-      if (r23 && r33z) {
-        if (std::abs(m[2][0]) <= kJitterTol && std::abs(m[2][1]) <= kJitterTol &&
-            std::abs(m[3][0]) <= kTol && std::abs(m[3][1]) <= kTol)
-          return 1;
-      }
+      // NV-DXVK Heavy Rain bring-up: reject near-identity rotation matrices
+      // that accidentally pass diag01 + r23/c32. A real pure perspective has
+      // m[0][0]=cot(fovX/2), m[1][1]=cot(fovY/2); for non-1:1 aspect ratios
+      // (16:9, 16:10, 4:3 — i.e. essentially every shipped game) these
+      // differ by the viewport aspect factor and at least one of them lies
+      // outside [0.95, 1.05]. Rotation-like matrices (common in skinning /
+      // camera-relative cbuffers, observed in Heavy Rain's cb0 at offset
+      // 912 as diag=(0.99995,0.999941,0.999997) with m[3][2]≈1, m[3][3]≈0)
+      // have m[0][0]≈m[1][1]≈1 and would otherwise false-positive as cls 2.
+      // The only pathological case this also rejects is an exact 90° FOV
+      // 1:1-aspect projection, which doesn't occur in real D3D11 titles.
+      const bool nearSquareNearUnit =
+           std::abs(m[0][0]) > 0.95f && std::abs(m[0][0]) < 1.05f
+        && std::abs(m[1][1]) > 0.95f && std::abs(m[1][1]) < 1.05f
+        && std::abs(std::abs(m[0][0]) - std::abs(m[1][1])) < 0.02f;
+      if (!nearSquareNearUnit) {
+        // Row-major check: m[2][3] ≈ ±1, m[3][3] ≈ 0.
+        const bool r23 = std::abs(std::abs(m[2][3]) - 1.0f) < kTol;
+        const bool r33z = std::abs(m[3][3]) < kTol;
+        if (r23 && r33z) {
+          if (std::abs(m[2][0]) <= kJitterTol && std::abs(m[2][1]) <= kJitterTol &&
+              std::abs(m[3][0]) <= kTol && std::abs(m[3][1]) <= kTol)
+            return 1;
+        }
 
-      // Column-major-as-row check: m[3][2] ≈ ±1, m[3][3] ≈ 0.
-      const bool c32 = std::abs(std::abs(m[3][2]) - 1.0f) < kTol;
-      const bool c33z = std::abs(m[3][3]) < kTol;
-      if (c32 && c33z) {
-        if (std::abs(m[2][0]) <= kJitterTol && std::abs(m[2][1]) <= kJitterTol &&
-            std::abs(m[3][0]) <= kTol && std::abs(m[3][1]) <= kTol)
-          return 2;
+        // Column-major-as-row check: m[3][2] ≈ ±1, m[3][3] ≈ 0.
+        const bool c32 = std::abs(std::abs(m[3][2]) - 1.0f) < kTol;
+        const bool c33z = std::abs(m[3][3]) < kTol;
+        if (c32 && c33z) {
+          if (std::abs(m[2][0]) <= kJitterTol && std::abs(m[2][1]) <= kJitterTol &&
+              std::abs(m[3][0]) <= kTol && std::abs(m[3][1]) <= kTol)
+            return 2;
+        }
       }
     }
 
@@ -2138,10 +2185,18 @@ namespace dxvk {
         // causing all gameplay BSP VSes to be filtered even with the
         // mutex fix and static sharing in place.
         const auto& saveW = transforms.worldToView;
-        const bool saveW2vValid =
-             std::abs(saveW[3][0]) > 0.01f
-          || std::abs(saveW[3][1]) > 0.01f
-          || std::abs(saveW[3][2]) > 0.01f;
+        // NV-DXVK: "Valid for caching" means worldToView carries real
+        // orientation information — i.e. it is not literally identity.
+        // The prior check required a non-zero translation component, which
+        // falsely rejects camera-relative rendering engines (Heavy Rain,
+        // many modern AAA titles) where the view matrix is (R | 0): a real
+        // rotation basis with zero translation because the world data is
+        // already pre-offset by the camera position in the VS cbuffer.
+        // isIdentityExact still catches the true default-identity case the
+        // original guard was protecting against (pure cls 1/2 path where
+        // path-1 VP-decomposition never ran and w2v stayed at default
+        // identity — saving THAT would clobber a previously-cached real w2v).
+        const bool saveW2vValid = !isIdentityExact(saveW);
         if (saveW2vValid) {
           std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
           m_foundRealProjThisFrame = true;
@@ -4106,6 +4161,113 @@ namespace dxvk {
         " proj diag=(", p[0][0], ",", p[1][1], ",", p[2][2], ")",
         " m[2][3]=", p[2][3],
         m_columnMajor ? " [column-major]" : " [row-major]"));
+
+      // NV-DXVK Heavy Rain bring-up: camera-position candidate scanner.
+      //
+      // Heavy Rain is camera-relative: the view matrix the game uploads is
+      // (R | 0) — real rotation basis, zero translation — because world
+      // vertices are pre-offset by the camera on the CPU/VS side before
+      // reaching the view*proj stage. For RTX the rays then originate from
+      // world-origin instead of the player, so world geometry is never hit
+      // and the screen comes out black/flickering. To restore a correct
+      // absolute-world camera we need to know the cameraPos that the game
+      // subtracts — and that position almost always lives in the same
+      // cbuffer block that holds the view/projection. This block runs
+      // exactly once per session, on the very first draw where the real
+      // projection matrix was latched (so we know we're in a gameplay VS
+      // with real camera data bound). It dumps a wide slice of every VS
+      // cbuffer and, critically, annotates which float4 rows look like
+      // plausible world-space camera-position candidates (xyz magnitude
+      // roughly in [5, 100000] — rules out colors/UVs/unit directions /
+      // padding). Grep the log for "[HRCamScan] CANDIDATE" after reaching
+      // gameplay in 3–4 different scenes to find the offset that stays at
+      // a world-scale vec3 across scenes — that's cameraPos.
+      Logger::info(str::format(
+        "[HRCamScan] === VS cbuffer dump @ first camera-latch (projSlot=",
+        projSlot, " projOff=", projOffset, " projStage=",
+        kStageNames[projStage], ") ==="));
+      const auto& vsCbsScan = m_context->m_state.vs.constantBuffers;
+      for (uint32_t s = 0; s < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++s) {
+        const auto& cb = vsCbsScan[s];
+        if (cb.buffer == nullptr) continue;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* p8 = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!p8) continue;
+        const size_t bufSz = cb.buffer->Desc()->ByteWidth;
+        const size_t base  = static_cast<size_t>(cb.constantOffset) * 16;
+        if (base >= bufSz) continue;
+        // Dump cb0 wider (1024 B = 64 float4 rows) since the per-frame
+        // camera block typically lives in cb0 between offsets 64 and 512.
+        // Other slots get 256 B (16 rows) which is enough to spot a
+        // cameraPos vec4 if it's there.
+        const size_t dumpCap = (s == 0) ? 1024u : 256u;
+        const size_t dumpBytes = std::min<size_t>(dumpCap, bufSz - base);
+        const float* f = reinterpret_cast<const float*>(p8 + base);
+        Logger::info(str::format(
+          "[HRCamScan] VS s", s, " bufSize=", bufSz, " constOff=",
+          base, " dumping=", dumpBytes, " bytes"));
+        for (size_t r = 0; r * 16 + 16 <= dumpBytes; ++r) {
+          const float x = f[r*4+0], y = f[r*4+1], z = f[r*4+2], w = f[r*4+3];
+          Logger::info(str::format(
+            "[HRCamScan]   VS s", s, " +", r * 16, " = (",
+            x, ", ", y, ", ", z, ", ", w, ")"));
+          // Candidate heuristic: world-space camera position is a float3
+          // with finite components, not a unit direction, not near zero,
+          // and well within sane world extents.
+          if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+            const float mag = std::sqrt(x*x + y*y + z*z);
+            if (mag >= 5.0f && mag < 100000.0f) {
+              // Reject near-unit vectors (direction vectors) and tight
+              // basis rows (rotation matrix rows the view scan already
+              // found — those are length 1).
+              const bool nearUnit = std::abs(mag - 1.0f) < 0.05f;
+              if (!nearUnit) {
+                Logger::info(str::format(
+                  "[HRCamScan] CANDIDATE VS s", s, " +", r * 16,
+                  " xyz=(", x, ",", y, ",", z, ")  |xyz|=", mag,
+                  "  w=", w));
+              }
+            }
+          }
+        }
+      }
+      // Also dump PS cb0..cb3 — deferred-lighting passes often stash
+      // cameraPos there for view-space reconstruction.
+      const auto& psCbsScan = m_context->m_state.ps.constantBuffers;
+      for (uint32_t s = 0; s < 4; ++s) {
+        const auto& cb = psCbsScan[s];
+        if (cb.buffer == nullptr) continue;
+        const auto mapped = cb.buffer->GetMappedSlice();
+        const uint8_t* p8 = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+        if (!p8) continue;
+        const size_t bufSz = cb.buffer->Desc()->ByteWidth;
+        const size_t base  = static_cast<size_t>(cb.constantOffset) * 16;
+        if (base >= bufSz) continue;
+        const size_t dumpBytes = std::min<size_t>(512u, bufSz - base);
+        const float* f = reinterpret_cast<const float*>(p8 + base);
+        Logger::info(str::format(
+          "[HRCamScan] PS s", s, " bufSize=", bufSz, " constOff=",
+          base, " dumping=", dumpBytes, " bytes"));
+        for (size_t r = 0; r * 16 + 16 <= dumpBytes; ++r) {
+          const float x = f[r*4+0], y = f[r*4+1], z = f[r*4+2], w = f[r*4+3];
+          Logger::info(str::format(
+            "[HRCamScan]   PS s", s, " +", r * 16, " = (",
+            x, ", ", y, ", ", z, ", ", w, ")"));
+          if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) {
+            const float mag = std::sqrt(x*x + y*y + z*z);
+            if (mag >= 5.0f && mag < 100000.0f) {
+              const bool nearUnit = std::abs(mag - 1.0f) < 0.05f;
+              if (!nearUnit) {
+                Logger::info(str::format(
+                  "[HRCamScan] CANDIDATE PS s", s, " +", r * 16,
+                  " xyz=(", x, ",", y, ",", z, ")  |xyz|=", mag,
+                  "  w=", w));
+              }
+            }
+          }
+        }
+      }
+      Logger::info("[HRCamScan] === end dump ===");
     }
 
     // DEBUG: dump info for non-bone draws returning identity o2w.
@@ -4322,16 +4484,59 @@ namespace dxvk {
           break;
         }
         case D3D11VsClassification::Kind::UI:
-        case D3D11VsClassification::Kind::Unknown:
-          // No recognized transform signals. Force UIFallback so the native
-          // raster path handles the draw and RTX skips it. Setting
-          // m_lastClassifierSaidUi = true forces SubmitDraw into the TRUE
-          // UI branch (line ~5880) regardless of m_foundRealProjThisFrame,
-          // which is what makes the menu buttons/HUD reach native raster
-          // after any gameplay draw has latched a real projection.
-          m_lastExtractUsedFallback = true;
-          m_lastClassifierSaidUi    = true;
+        case D3D11VsClassification::Kind::Unknown: {
+          // NV-DXVK Heavy Rain bring-up: the classifier's signals are all
+          // Source-engine specific (cb3 CBufModelInstance, t31 per-instance
+          // UINT4 at COLOR1/I, t30 BLENDINDICES). Non-Source titles
+          // (Heavy Rain, UE4, Unity, custom engines) never produce any of
+          // those and the classifier falls through to UI for every VS
+          // including real world geometry. Forcibly flagging those as UI
+          // here would reject 100% of the game's draws from RTX.
+          //
+          // Split the verdict:
+          //   - If a real projection matrix was found for this frame (or
+          //     session), treat the classifier's "UI" as low-confidence
+          //     ("I don't recognize the engine") and let the draw flow
+          //     through to SubmitDraw's cached-VP reuse path. The
+          //     per-draw o2v finiteness/magnitude guard there still
+          //     rejects actual shadow/depth/garbage draws.
+          //   - If no projection has been found this frame AND none has
+          //     ever been found this session, the draw truly is either a
+          //     splash-screen UI or runs before any gameplay camera was
+          //     established. Force UIFallback so native raster handles it
+          //     (menus, loading screens on Source OR foreign engines).
+          //
+          // This preserves Titanfall 2 menu/HUD semantics: those draws
+          // run AFTER gameplay has latched a projection — but the TF2
+          // classifier returns StaticWorld/InstancedBsp/SkinnedChar for
+          // actual gameplay geometry, so this UI/Unknown branch in TF2
+          // only fires for shaders that have no signals at all, which
+          // are in practice screenspace-2D fullscreen-quad post-process
+          // passes. Those don't have their own projection bound in the
+          // world VP cbuffer for the frame — the frame-scoped flag stays
+          // set from earlier gameplay draws, so they still "succeed"
+          // this check. That is not a regression because the downstream
+          // per-draw o2v magnitude/finiteness guards in SubmitDraw still
+          // reject NDC-space fullscreen quads on magnitude grounds.
+          if (m_foundRealProjThisFrame || m_hasEverFoundProj) {
+            m_lastExtractUsedFallback = false;
+            // DO NOT set m_lastClassifierSaidUi — fall through to cache
+            // reuse in SubmitDraw.
+            static std::unordered_set<std::string> sV2LogForeignWorld;
+            const std::string vk = getVsHashShort();
+            if (sV2LogForeignWorld.insert(vk).second) {
+              Logger::info(str::format(
+                "[VsClass.v2.ForeignWorld] vs=", vk,
+                " reason=classifier_no_signals_but_real_proj_latched",
+                " foundRealProjThisFrame=", m_foundRealProjThisFrame ? 1 : 0,
+                " hasEverFoundProj=", m_hasEverFoundProj ? 1 : 0));
+            }
+          } else {
+            m_lastExtractUsedFallback = true;
+            m_lastClassifierSaidUi    = true;
+          }
           break;
+        }
         default:
           // Skybox/Viewmodel/Particle/Sprite2D — not produced by the
           // classifier yet. Fall through silently.
@@ -7064,7 +7269,14 @@ namespace dxvk {
           cachedSnap = m_lastGoodTransforms;
         }
         const auto& cached = cachedSnap.worldToView;
-        if (cached[3][0] == 0.0f && cached[3][1] == 0.0f && cached[3][2] == 0.0f) {
+        // NV-DXVK: "Degenerate" == never populated with a real w2v. Prior
+        // check used translation==(0,0,0) which fires on camera-relative
+        // rendering engines (Heavy Rain etc.) where w2v legitimately has
+        // zero translation. isIdentityExact rejects only the literal
+        // default-identity case (rotation rows == identity rows AND
+        // translation == 0), which is the real sentinel for "cache never
+        // got a real value written to it".
+        if (isIdentityExact(cached)) {
           BumpFilter(FilterReason::UIFallback);
           m_lastDrawFilteredAsUI = true;
           {

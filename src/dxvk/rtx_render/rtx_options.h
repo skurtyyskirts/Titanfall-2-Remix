@@ -541,7 +541,12 @@ namespace dxvk {
                     "This should fix the issue where the game camera suddenly turns when closing the UI.\n",
                     args.flags = RtxOptionFlags::UserSetting);
 
-    inline static const VirtualKeys kDefaultRemixMenuKeyBinds{ VirtualKey{VK_MENU},VirtualKey{'X'} };
+    // NV-DXVK Heavy Rain bring-up (2026-04-21): default bind switched from
+    // ALT+X to middle mouse button. rtx.conf overrides of this option have
+    // been observed to not take effect (see HANDOFF.md), so setting the
+    // default directly is the only reliable way to change the hotkey.
+    // MBUTTON is defined in util_keybind.h (line 95) as VK_MBUTTON.
+    inline static const VirtualKeys kDefaultRemixMenuKeyBinds{ VirtualKey{VK_MBUTTON} };
     RTX_OPTION("rtx", VirtualKeys, remixMenuKeyBinds, kDefaultRemixMenuKeyBinds,
                "Hotkey to open the Remix menu.\n"
                "example override: 'rtx.remixMenuKeyBinds = CTRL, SHIFT, Z'.\n"

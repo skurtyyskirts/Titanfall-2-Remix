@@ -864,6 +864,21 @@ namespace dxvk {
   void ImGUI::processHotkeys() {
     auto& io = ImGui::GetIO();
 
+    // NV-DXVK Heavy Rain bring-up: emit the effective remixMenuKeyBinds string
+    // once at first invocation, so the log unambiguously shows what bind the
+    // process actually parsed from rtx.conf / user.conf. The prior log line
+    // "Alt+X hotkey detected" was a hardcoded string, which was misleading
+    // when the bind had been overridden.
+    {
+      static bool loggedBind = false;
+      if (!loggedBind) {
+        loggedBind = true;
+        const auto bindStr = buildKeyBindDescriptorString(RtxOptions::remixMenuKeyBinds());
+        Logger::info(str::format(
+          "[ImGUI] processHotkeys: effective remixMenuKeyBinds = '", bindStr, "'"));
+      }
+    }
+
     // Diagnostic: log when Alt key state is first seen, confirming WndProc delivers keys.
     {
       static bool loggedAltSeen = false;
@@ -874,7 +889,11 @@ namespace dxvk {
     }
 
     if (checkHotkeyState(RtxOptions::remixMenuKeyBinds())) {
-      Logger::info("[ImGUI] Alt+X hotkey detected — toggling Remix menu");
+      const auto bindStr = buildKeyBindDescriptorString(RtxOptions::remixMenuKeyBinds());
+      const bool wasOpen = (RtxOptions::showUI() != UIType::None);
+      Logger::info(str::format(
+        "[ImGUI] Remix menu hotkey '", bindStr,
+        "' detected — toggling (was ", wasOpen ? "OPEN" : "CLOSED", ")"));
       if(RtxOptions::defaultToAdvancedUI()) {
         switchMenu(RtxOptions::showUI() != UIType::None ? UIType::None : UIType::Advanced);
       } else {
@@ -4449,6 +4468,32 @@ namespace dxvk {
           result = result && io.KeyCtrl;
         } else if(vk.val == VK_MENU) {
           result = result && io.KeyAlt;
+        } else if(vk.val == VK_LBUTTON || vk.val == VK_RBUTTON ||
+                  vk.val == VK_MBUTTON || vk.val == VK_XBUTTON1 ||
+                  vk.val == VK_XBUTTON2) {
+          // NV-DXVK Heavy Rain bring-up (2026-04-21): route mouse buttons
+          // through ImGui's mouse API instead of the keyboard path.
+          // ImGui_ImplWin32_VirtualKeyToImGuiKey has no case for mouse VKs
+          // (they aren't keys in ImGui — they're mouse buttons), so the
+          // pre-existing fall-through to IsKeyDown(ImGuiKey_None) was
+          // always returning false, making mouse-button hotkey chords
+          // silently inert. ImGui's mouse-button index convention is
+          // 0=Left, 1=Right, 2=Middle, 3=XB1, 4=XB2 — same order win32
+          // uses for VK_LBUTTON..VK_XBUTTON2 but not the same values, so
+          // this explicit mapping is required.
+          int mb = -1;
+          switch (vk.val) {
+            case VK_LBUTTON:  mb = 0; break;
+            case VK_RBUTTON:  mb = 1; break;
+            case VK_MBUTTON:  mb = 2; break;
+            case VK_XBUTTON1: mb = 3; break;
+            case VK_XBUTTON2: mb = 4; break;
+          }
+          if (allowContinuousPress) {
+            result = result && ImGui::IsMouseDown(mb);
+          } else {
+            result = result && ImGui::IsMouseClicked(mb, false);
+          }
         } else {
           ImGuiKey key = ImGui::GetKeyIndex(ImGui_ImplWin32_VirtualKeyToImGuiKey(vk.val));
           if (allowContinuousPress) {

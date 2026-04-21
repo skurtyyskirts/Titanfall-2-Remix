@@ -267,7 +267,34 @@ namespace ImGui_ImplDxvk {
                              uint32_t framebuffer_width,
                              uint32_t framebuffer_height) {
     IM_ASSERT(g && draw_data);
-    if (framebuffer_width <= 0 || framebuffer_height <= 0) return;
+    // NV-DXVK Heavy Rain bring-up: throttled diagnostic for the menu-
+    // invisibility investigation. Logs framebuffer extents, draw_data extents,
+    // and command-list count every 60th call (~1× per second at 60 FPS) so we
+    // can tell whether the overlay is being asked to render with valid inputs
+    // (or returning early here silently). Also emits a one-shot warn if the
+    // early-return fires so it's grep-able.
+    {
+      static uint32_t sCallCount = 0;
+      if ((sCallCount++ % 60u) == 0u) {
+        Logger::info(str::format(
+          "[ImGuiRender] fb=", framebuffer_width, "x", framebuffer_height,
+          " disp=", draw_data->DisplaySize.x, "x", draw_data->DisplaySize.y,
+          " cmdLists=", draw_data->CmdListsCount,
+          " totalVtx=", draw_data->TotalVtxCount,
+          " totalIdx=", draw_data->TotalIdxCount));
+      }
+    }
+    if (framebuffer_width <= 0 || framebuffer_height <= 0) {
+      static bool sWarned = false;
+      if (!sWarned) {
+        sWarned = true;
+        Logger::warn(str::format(
+          "[ImGuiRender] EARLY-RETURN: framebuffer is ",
+          framebuffer_width, "x", framebuffer_height,
+          " — overlay will not draw this frame"));
+      }
+      return;
+    }
 
     // Build combined vertex/index data sizes
     size_t totalVtx = 0, totalIdx = 0;

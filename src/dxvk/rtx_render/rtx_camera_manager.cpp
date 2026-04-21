@@ -313,14 +313,23 @@ namespace dxvk {
       if (!isReasonableFov) ++g_mainHist.rejIsReasonableFov;
       if (!isLargeEnough) ++g_mainHist.rejIsLargeEnough;
       if (!keepAsMain) {
-        static uint32_t sVpLog = 0;
-        if (sVpLog < 40) {
-          ++sVpLog;
+        // NV-DXVK Heavy Rain bring-up: per-frame throttle (was a process-wide
+        // cap of 40 — exhausted within the first second on shadow-map probes,
+        // hiding every gameplay-viewport demotion afterward). Log up to 6 per
+        // frame so we see ongoing rejections including real-viewport draws.
+        static uint32_t sLastFrame = UINT32_MAX;
+        static uint32_t sPerFrame  = 0;
+        static uint64_t sTotal     = 0;
+        if (frameId != sLastFrame) { sLastFrame = frameId; sPerFrame = 0; }
+        if (sPerFrame < 6) {
+          ++sPerFrame;
+          ++sTotal;
           char vsHex[32];
           std::snprintf(vsHex, sizeof(vsHex), "0x%016llx",
                         static_cast<unsigned long long>(td.vertexShaderHash));
           Logger::info(str::format(
-            "[CamMgr] Demoted-from-Main #", sVpLog,
+            "[CamMgr] Demoted-from-Main #", sTotal,
+            " f=", frameId,
             " vsHash=", vsHex,
             " viewport=", int(vw), "x", int(vh),
             " maxZ=", input.maxZ,
