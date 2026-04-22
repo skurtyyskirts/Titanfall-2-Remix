@@ -3375,15 +3375,17 @@ namespace dxvk {
             const float Tx = -(R0x*cx + R0y*cy + R0z*cz);
             const float Ty = -(R1x*cx + R1y*cy + R1z*cz);
             const float Tz = -(R2x*cx + R2y*cy + R2z*cz);
-            // HR patch: camera-relative origin fix — Heavy Rain's TLAS geometry is in
-            // camera-relative space (world - camPos), so the Remix camera must sit at (0,0,0).
-            // Applying -R*camPos as translation displaced the camera 130+ units from geometry,
-            // producing a bird's-eye view. Tx/Ty/Tz kept for diagnostic log only. — see CHANGELOG.md 2026-04-21
+            // HR patch: restore full worldToView = (R | -R*camPos). Zeroing the translation
+            // (ac203dd, 2026-04-22) broke isInWorld: with |w2vT|=0 and a near-axis-aligned
+            // rotation, both transTooSmall and !isRealRotation are true → camValid=0 all session.
+            // Session 4 (2a3219f) confirmed camValid=1 for 4600+ frames WITH full translation.
+            // The "bird's-eye view" concern needs a matching instance-transform offset (+camPos)
+            // if it reappears; fix there, not here. — see CHANGELOG.md 2026-04-22
             transforms.worldToView = Matrix4(
               Vector4(R0x, R1x, R2x, 0),
               Vector4(R0y, R1y, R2y, 0),
               Vector4(R0z, R1z, R2z, 0),
-              Vector4(0,   0,   0,   1));
+              Vector4(Tx,  Ty,  Tz,  1));
             {
               std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
               m_lastGoodTransforms.worldToView = transforms.worldToView;
