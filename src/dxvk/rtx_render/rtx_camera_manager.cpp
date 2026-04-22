@@ -280,7 +280,18 @@ namespace dxvk {
       // body-races-ahead-of-camera lag. Threshold 10 units handles spawn
       // points near origin while reliably catching the (~0,~0,~0) garbage.
       const bool transTooSmall = w2vMagSq < (10.0f * 10.0f);
-      const bool isInWorld = !(transNearZero && rotIsIdentity) && !transTooSmall;
+      // HR patch: camera-relative engines (Heavy Rain) bind w2v=(R|0) — real
+      // rotation, zero translation. Without this bypass, transTooSmall rejects
+      // every gameplay draw. Accept when the off-diagonal rotation elements are
+      // large (genuine camera orientation) while still rejecting HUD/identity
+      // passes where both R≈I and T≈0. TF2 origin-draws that slip through
+      // transTooSmall also have R≈I, so isRealRotation stays false for them.
+      // — see CHANGELOG.md 2026-04-21
+      const float rotOffDiag = std::abs(w2v[0][1]) + std::abs(w2v[0][2])
+                             + std::abs(w2v[1][0]) + std::abs(w2v[1][2])
+                             + std::abs(w2v[2][0]) + std::abs(w2v[2][1]);
+      const bool isRealRotation = rotOffDiag > 0.05f && !rotIsIdentity;
+      const bool isInWorld = !(transNearZero && rotIsIdentity) && (!transTooSmall || isRealRotation);
       const float vw = td.viewportWidth;
       const float vh = td.viewportHeight;
       const float vpAspect = (vh > 0.0f) ? (vw / vh) : 0.0f;

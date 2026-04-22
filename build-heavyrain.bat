@@ -92,7 +92,7 @@ rem enable_dxgi=true is REQUIRED: Heavy Rain (like most DX11 games) calls
 rem IDXGIFactory::CreateSwapChain directly, which only works if Remix ships
 rem its own dxgi.dll wrapper.  Without it, the game lands on Microsoft's
 rem real DXGI with a Vulkan-backed device it can't handle and crashes.
-call meson setup --buildtype=debug --backend=ninja -Denable_dxgi=true _Comp64Debug
+call meson setup --buildtype=debugoptimized --reconfigure --backend=ninja -Denable_dxgi=true _Comp64Debug
 if errorlevel 1 (
     echo ERROR: Meson setup failed.
     goto :error_build

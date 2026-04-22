@@ -3327,6 +3327,69 @@ namespace dxvk {
       }
     }
 
+    // HR patch: camera-relative view reconstruction — scan VS cb0 for rotation+cameraPos block.
+    // Heavy Rain pre-offsets world geometry by cameraPos in the VS cbuffer, so the view
+    // matrix uploaded to the GPU is (R|0) — real rotation, zero translation. The block's
+    // position within the constant region shifts with the binding offset, so we scan
+    // rather than using a fixed offset. Pattern: 3 consecutive unit float4 rows (w≈0)
+    // followed by a float4 with w=1 (camera world-pos). — see CHANGELOG.md 2026-04-21
+    if (m_hasEverFoundProj) {
+      const auto& hrVsCbs = m_context->m_state.vs.constantBuffers;
+      const auto& hrCb    = hrVsCbs[0];
+      if (hrCb.buffer != nullptr) {
+        const auto hrSlice = hrCb.buffer->GetMappedSlice();
+        const uint8_t* hp  = reinterpret_cast<const uint8_t*>(hrSlice.mapPtr);
+        if (hp) {
+          const size_t hrBase = static_cast<size_t>(hrCb.constantOffset) * 16;
+          const size_t hrBsz  = hrCb.buffer->Desc()->ByteWidth;
+          const size_t scanEnd = std::min(hrBase + size_t(2048), hrBsz);
+          auto isRotRow = [](const float* r) {
+            const float len2 = r[0]*r[0] + r[1]*r[1] + r[2]*r[2];
+            return std::abs(len2 - 1.0f) < 0.15f && std::abs(r[3]) < 0.01f
+                && std::isfinite(r[0]) && std::isfinite(r[1]) && std::isfinite(r[2]);
+          };
+          for (size_t off = hrBase; off + 64 <= scanEnd; off += 16) {
+            const float* f = reinterpret_cast<const float*>(hp + off);
+            if (!isRotRow(f) || !isRotRow(f+4) || !isRotRow(f+8)) continue;
+            const float cx=f[12], cy=f[13], cz=f[14], cw=f[15];
+            if (std::abs(cw - 1.0f) > 0.01f) continue;
+            if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(cz)) continue;
+            const float camMag = std::sqrt(cx*cx + cy*cy + cz*cz);
+            if (camMag < 0.01f || camMag > 1e6f) continue;
+            // Verify mutual orthogonality to filter coincidental unit vectors.
+            const float d01 = f[0]*f[4] + f[1]*f[5] + f[2]*f[6];
+            const float d02 = f[0]*f[8] + f[1]*f[9] + f[2]*f[10];
+            const float d12 = f[4]*f[8] + f[5]*f[9] + f[6]*f[10];
+            if (std::abs(d01) > 0.1f || std::abs(d02) > 0.1f || std::abs(d12) > 0.1f) continue;
+            // worldToView: rotation rows stored as matrix columns, translation in m[3][0..2].
+            const float R0x=f[0], R0y=f[1], R0z=f[2];
+            const float R1x=f[4], R1y=f[5], R1z=f[6];
+            const float R2x=f[8], R2y=f[9], R2z=f[10];
+            const float Tx = -(R0x*cx + R0y*cy + R0z*cz);
+            const float Ty = -(R1x*cx + R1y*cy + R1z*cz);
+            const float Tz = -(R2x*cx + R2y*cy + R2z*cz);
+            transforms.worldToView = Matrix4(
+              Vector4(R0x, R1x, R2x, 0),
+              Vector4(R0y, R1y, R2y, 0),
+              Vector4(R0z, R1z, R2z, 0),
+              Vector4(Tx,  Ty,  Tz,  1));
+            {
+              std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+              m_lastGoodTransforms.worldToView = transforms.worldToView;
+            }
+            static uint32_t sHRLog = 0;
+            if (sHRLog < 5) {
+              ++sHRLog;
+              Logger::info(str::format(
+                "[HRViewCache] cam=(", cx, ",", cy, ",", cz,
+                ") T=(", Tx, ",", Ty, ",", Tz, ") off=", off - hrBase));
+            }
+            break;
+          }
+        }
+      }
+    }
+
     skipViewScan:
     // --- Z-UP / Y-UP AUTO-DETECTION (view-matrix-derived) ---
     // In a Y-up world, the view matrix "up" column (col 1) has its largest
