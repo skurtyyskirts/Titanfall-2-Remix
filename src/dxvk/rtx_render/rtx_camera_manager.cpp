@@ -266,10 +266,14 @@ namespace dxvk {
       // composite passes where worldToView is the FULL identity matrix
       // (rotation = I AND translation = 0). Detect that specifically.
       const bool transNearZero = w2vMagSq < (1.0f * 1.0f);
+      // HR patch: tightened tolerance — 0.001 instead of 0.01 so that near-identity
+      // rotations (off-diagonal ~0.006, seen when camera looks nearly straight ahead)
+      // are NOT classified as identity. Truly exact-identity UI passes have off-diagonals
+      // of 0 and still satisfy rotIsIdentity=true. — see CHANGELOG.md 2026-04-22
       const bool rotIsIdentity =
-        std::abs(w2v[0][0] - 1.0f) < 0.01f && std::abs(w2v[0][1]) < 0.01f && std::abs(w2v[0][2]) < 0.01f &&
-        std::abs(w2v[1][0]) < 0.01f && std::abs(w2v[1][1] - 1.0f) < 0.01f && std::abs(w2v[1][2]) < 0.01f &&
-        std::abs(w2v[2][0]) < 0.01f && std::abs(w2v[2][1]) < 0.01f && std::abs(w2v[2][2] - 1.0f) < 0.01f;
+        std::abs(w2v[0][0] - 1.0f) < 0.001f && std::abs(w2v[0][1]) < 0.001f && std::abs(w2v[0][2]) < 0.001f &&
+        std::abs(w2v[1][0]) < 0.001f && std::abs(w2v[1][1] - 1.0f) < 0.001f && std::abs(w2v[1][2]) < 0.001f &&
+        std::abs(w2v[2][0]) < 0.001f && std::abs(w2v[2][1]) < 0.001f && std::abs(w2v[2][2] - 1.0f) < 0.001f;
       // NV-DXVK TF2: also reject any candidate whose world translation is
       // near zero, regardless of rotation. ExtractTransforms path 1 always
       // bakes the real camera world position into w2v[3] (= -dot(axis,camPos)),
@@ -283,14 +287,15 @@ namespace dxvk {
       // HR patch: camera-relative engines (Heavy Rain) bind w2v=(R|0) — real
       // rotation, zero translation. Without this bypass, transTooSmall rejects
       // every gameplay draw. Accept when the off-diagonal rotation elements are
-      // large (genuine camera orientation) while still rejecting HUD/identity
-      // passes where both R≈I and T≈0. TF2 origin-draws that slip through
-      // transTooSmall also have R≈I, so isRealRotation stays false for them.
-      // — see CHANGELOG.md 2026-04-21
+      // non-trivial (genuine camera orientation) while still rejecting HUD/identity
+      // passes where both R≈I and T≈0. Threshold lowered from 0.05 to 0.01 to
+      // also accept near-identity rotations (off-diagonal sum ~0.02) seen when
+      // the camera is almost straight ahead. TF2 origin-draws have R=exact-I,
+      // so isRealRotation stays false for them. — see CHANGELOG.md 2026-04-22
       const float rotOffDiag = std::abs(w2v[0][1]) + std::abs(w2v[0][2])
                              + std::abs(w2v[1][0]) + std::abs(w2v[1][2])
                              + std::abs(w2v[2][0]) + std::abs(w2v[2][1]);
-      const bool isRealRotation = rotOffDiag > 0.05f && !rotIsIdentity;
+      const bool isRealRotation = rotOffDiag > 0.01f && !rotIsIdentity;
       const bool isInWorld = !(transNearZero && rotIsIdentity) && (!transTooSmall || isRealRotation);
       const float vw = td.viewportWidth;
       const float vh = td.viewportHeight;

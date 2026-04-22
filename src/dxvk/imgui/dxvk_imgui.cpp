@@ -552,7 +552,15 @@ namespace dxvk {
                                 | VK_COLOR_COMPONENT_G_BIT
                                 | VK_COLOR_COMPONENT_B_BIT
                                 | VK_COLOR_COMPONENT_A_BIT;
-    
+
+    // HR patch: ensure RtxOptions are initialized in this module — see CHANGELOG.md 2026-04-21.
+    // RtxOptions::Create() calls initializeSystemLayers() + setInitialized(true). In the normal
+    // Titanfall-2-Remix path, Create() is only called from dxgi.dll's device init, so d3d11.dll's
+    // copy of RtxOptionImpl::s_isInitialized stays false, and every setDeferred() call in
+    // switchMenu() (including the MBUTTON toggle) silently no-ops. Calling Create() here mirrors
+    // dxgi.dll's init, enabling the menu toggle and applying RTX_GUI_DISPLAY_UI env var.
+    RtxOptions::Create();
+
     // the size of the pool is oversized, but it's copied from imgui demo itself.
     VkDescriptorPoolSize pool_sizes[] =
     {
@@ -910,6 +918,20 @@ namespace dxvk {
     // Toggle input blocking. Alt-Backspace
     if (io.KeyAlt && ImGui::IsKeyPressed(ImGui::GetKeyIndex(ImGuiKey_Backspace))) {
       RtxOptions::blockInputToGameInUI.setDeferred(!RtxOptions::blockInputToGameInUI());
+    }
+
+    // HR patch: O toggles Geometry Hash debug view (DEBUG_VIEW_GEOMETRY_HASH=277)
+    // for frame-to-frame hash stability checks. Only fires when the Remix UI is
+    // closed so it doesn't conflict with text input in the overlay.
+    // — see CHANGELOG.md 2026-04-22
+    if (RtxOptions::showUI() == UIType::None && ImGui::IsKeyPressed(ImGuiKey_O)) {
+      auto& dbv = m_device->getCommon()->metaDebugView();
+      const uint32_t next = (dbv.debugViewIdx() == DEBUG_VIEW_DISABLED)
+                            ? DEBUG_VIEW_GEOMETRY_HASH
+                            : DEBUG_VIEW_DISABLED;
+      dbv.setDebugViewIndex(next);
+      Logger::info(str::format("[HRPresent] O-key: debugViewIdx -> ", next,
+                               " (", next == DEBUG_VIEW_DISABLED ? "off" : "GeomHash", ")"));
     }
   }
 

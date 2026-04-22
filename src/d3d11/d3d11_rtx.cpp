@@ -1240,10 +1240,17 @@ namespace dxvk {
     // These match a standalone projection matrix that the engine stores
     // separately from the view transform.  Rows 0-1 must be diagonal
     // (no off-axis terms), which is true for standard D3D perspective.
+    // HR patch: require non-zero depth coefficient — a valid perspective matrix
+    // always has |m[2][2]| > 0 (the depth mapping term). m[2][2]==0 indicates
+    // an infinite/degenerate projection or a non-perspective matrix. Without
+    // this check, a spurious UI/bone matrix with diag=(0.49,-0.63,0) was
+    // latching before the real HR reverse-Z proj diag=(1.94,3.46,-1.00),
+    // causing camValid=0 for the entire session. — see CHANGELOG.md 2026-04-22
     const bool diag01 =
         std::abs(m[0][1]) <= kTol && std::abs(m[0][2]) <= kTol && std::abs(m[0][3]) <= kTol &&
         std::abs(m[1][0]) <= kTol && std::abs(m[1][2]) <= kTol && std::abs(m[1][3]) <= kTol &&
-        std::abs(m[0][0]) >= 0.1f && std::abs(m[1][1]) >= 0.1f;
+        std::abs(m[0][0]) >= 0.1f && std::abs(m[1][1]) >= 0.1f &&
+        std::abs(m[2][2]) >= 0.1f;
 
     if (diag01) {
       // NV-DXVK Heavy Rain bring-up: reject near-identity rotation matrices
@@ -3368,11 +3375,15 @@ namespace dxvk {
             const float Tx = -(R0x*cx + R0y*cy + R0z*cz);
             const float Ty = -(R1x*cx + R1y*cy + R1z*cz);
             const float Tz = -(R2x*cx + R2y*cy + R2z*cz);
+            // HR patch: camera-relative origin fix — Heavy Rain's TLAS geometry is in
+            // camera-relative space (world - camPos), so the Remix camera must sit at (0,0,0).
+            // Applying -R*camPos as translation displaced the camera 130+ units from geometry,
+            // producing a bird's-eye view. Tx/Ty/Tz kept for diagnostic log only. — see CHANGELOG.md 2026-04-21
             transforms.worldToView = Matrix4(
               Vector4(R0x, R1x, R2x, 0),
               Vector4(R0y, R1y, R2y, 0),
               Vector4(R0z, R1z, R2z, 0),
-              Vector4(Tx,  Ty,  Tz,  1));
+              Vector4(0,   0,   0,   1));
             {
               std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
               m_lastGoodTransforms.worldToView = transforms.worldToView;
@@ -7879,8 +7890,7 @@ namespace dxvk {
 
     // (stale transform filter removed — worldToView now set by cross-frame VP)
 
-    // NV-DXVK: Log every submitted draw with key info for TDR diagnosis.
-    // Logger flushes to disk so the last entry before a TDR is visible.
+    // NV-DXVK: per-draw diagnostic block (histogram + gated non-inst bone log).
     {
       const auto& T = dcs.transformData;
       const auto& G = dcs.geometryData;
@@ -7913,34 +7923,9 @@ namespace dxvk {
           ++arr[pid];
         }
       }
-      Logger::info(str::format(
-        "[D3D11Rtx] COMMIT vs=", m_currentVsHashCache.substr(0, 19),
-        " id=", dcs.drawCallID,
-        " verts=", G.vertexCount,
-        " fmt=", uint32_t(G.positionBuffer.vertexFormat()),
-        " stride=", G.positionBuffer.stride(),
-        " bone=", G.boneMatrixBuffer.defined() ? 1 : 0,
-        " inst=", G.boneInstanceIndex,
-        " o2wPath=", m_lastO2wPathId,
-        " o2wT=(", T.objectToWorld[3][0], ",", T.objectToWorld[3][1], ",", T.objectToWorld[3][2], ")",
-        " w2vT=(", T.worldToView[3][0], ",", T.worldToView[3][1], ",", T.worldToView[3][2], ")",
-        " o2vT=(", T.objectToView[3][0], ",", T.objectToView[3][1], ",", T.objectToView[3][2], ")",
-        " raw=", m_rawDrawCount));
-      // Extra: log the o2w rotation too (identity vs rotated detection).
-      {
-        const auto& M = T.objectToWorld;
-        const bool identRot =
-          std::abs(M[0][0] - 1.f) < 1e-4f && std::abs(M[1][1] - 1.f) < 1e-4f && std::abs(M[2][2] - 1.f) < 1e-4f &&
-          std::abs(M[0][1]) < 1e-4f && std::abs(M[0][2]) < 1e-4f &&
-          std::abs(M[1][0]) < 1e-4f && std::abs(M[1][2]) < 1e-4f &&
-          std::abs(M[2][0]) < 1e-4f && std::abs(M[2][1]) < 1e-4f;
-        Logger::info(str::format(
-          "[D3D11Rtx.o2wRot] id=", dcs.drawCallID,
-          " identityRot=", identRot ? 1 : 0,
-          " col0=(", M[0][0], ",", M[0][1], ",", M[0][2], ")",
-          " col1=(", M[1][0], ",", M[1][1], ",", M[1][2], ")",
-          " col2=(", M[2][0], ",", M[2][1], ",", M[2][2], ")"));
-      }
+      // HR patch: per-draw COMMIT + o2wRot loggers removed — they fired
+      // unconditionally (860 draws/frame × 2 lines) and caused I/O stall → TDR.
+      // — see CHANGELOG.md 2026-04-22
     }
 
     m_context->EmitCs([params, dcs](DxvkContext* ctx) mutable {
