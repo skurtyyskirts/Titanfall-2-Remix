@@ -847,7 +847,28 @@ namespace dxvk
       jitterSequenceLength = xessLength;
     }
     
-    return calculateHaltonJitter(jitterFrameIdx, jitterSequenceLength);
+    const Vector2 hrJitterResult = calculateHaltonJitter(jitterFrameIdx, jitterSequenceLength);
+    // HR patch: Patch 9 diagnostic — log jitter + upscaler state for first 30 invocations.
+    // DLSS requires non-zero jitter + non-zero motion vectors to produce a non-black output.
+    // If jitter is (0,0) when DLSS is enabled, the upscaler can alias to black on a static shot.
+    // Capped hard — this runs once per main-camera compute per frame, so 30 calls ≈ 30 frames.
+    // — see CHANGELOG.md 2026-04-22
+    {
+      static uint32_t sHRJitLog = 0;
+      if (sHRJitLog < 30) {
+        Logger::info(str::format(
+          "[HR-Jitter] tick=", sHRJitLog,
+          " frameIdx=", jitterFrameIdx,
+          " seqLen=", jitterSequenceLength,
+          " jx=", hrJitterResult.x,
+          " jy=", hrJitterResult.y,
+          " dlss=", RtxOptions::isDLSSOrRayReconstructionEnabled() ? 1 : 0,
+          " xess=", RtxOptions::isXeSSEnabled() ? 1 : 0,
+          " taa=", RtxOptions::isTAAEnabled() ? 1 : 0));
+        ++sHRJitLog;
+      }
+    }
+    return hrJitterResult;
 #else
     return m_halton.next();
 #endif

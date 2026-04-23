@@ -246,6 +246,26 @@ namespace dxvk {
 
     const bool noLightsPresent = m_lights.empty() && m_externallyTrackedLights.empty() && m_externalActiveLightList.empty();
 
+    // HR patch: Patch 9 diagnostic — every 120 frames for 10 bursts, dump light-count buckets.
+    // Heavy Rain may bind zero analytic lights (engine relies on emissive materials); the path
+    // tracer then emits zero radiance → black screen even with camValid=1 and TLAS populated.
+    // Capped hard to avoid per-draw log saturation (see 2026-04-22 00:49 session TDR).
+    // — see CHANGELOG.md 2026-04-22
+    {
+      static uint32_t sHRLMLog = 0;
+      if (sHRLMLog < 1200 && (sHRLMLog % 120) == 0) {
+        Logger::info(str::format(
+          "[HR-LightMgr] tick=", sHRLMLog,
+          " lights=", m_lights.size(),
+          " extTracked=", m_externallyTrackedLights.size(),
+          " extActive=", m_externalActiveLightList.size(),
+          " noLightsPresent=", noLightsPresent ? 1 : 0,
+          " fallbackMode=", static_cast<int>(mode),
+          " fallbackPresent=", m_fallbackLight.has_value() ? 1 : 0));
+      }
+      ++sHRLMLog;
+    }
+
     if (
       mode == FallbackLightMode::Always ||
       (mode == FallbackLightMode::NoLightsPresent && noLightsPresent)

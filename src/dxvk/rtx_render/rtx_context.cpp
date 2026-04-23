@@ -1164,6 +1164,28 @@ namespace dxvk {
     constants.frameIdx = RtxOptions::rngSeedWithFrameIndex() ? m_device->getCurrentFrameId() : 0;
     constants.lightCount = static_cast<uint16_t>(getSceneManager().getLightManager().getActiveCount());
 
+    // HR patch: Patch 9 diagnostic — log RT-frame constants once per 300 frames for 15 bursts.
+    // Covers the TLAS-ready-to-integrate signal surface: active light count, render-target-gate
+    // state, frame index, selected upscaler. If lightCount=0 and renderTargetValid=0, the path
+    // tracer will emit zero radiance regardless of how many TLAS instances exist — that's the
+    // dominant hypothesis for a black-screen-with-camValid=1 outcome. Capped to avoid TDR.
+    // — see CHANGELOG.md 2026-04-22
+    {
+      static uint32_t sHRArgsLog = 0;
+      if (sHRArgsLog < 4500 && (sHRArgsLog % 300) == 0) {
+        const bool rtCamValid = renderTargetCamera.isValid(frameIdx);
+        Logger::info(str::format(
+          "[HR-RTArgs] tick=", sHRArgsLog,
+          " frameIdx=", frameIdx,
+          " lightCount=", static_cast<uint32_t>(constants.lightCount),
+          " rtCamValid=", rtCamValid ? 1 : 0,
+          " enableRaytracedRenderTarget=", constants.enableRaytracedRenderTarget ? 1 : 0,
+          " upscaler=", static_cast<int>(m_currentUpscaler),
+          " portalVolumes=", enablePortalVolumes ? 1 : 0));
+      }
+      ++sHRArgsLog;
+    }
+
     constants.fireflyFilteringLuminanceThreshold = RtxOptions::fireflyFilteringLuminanceThreshold();
     constants.secondarySpecularFireflyFilteringThreshold = RtxOptions::secondarySpecularFireflyFilteringThreshold();
     constants.primaryRayMaxInteractions = RtxOptions::primaryRayMaxInteractions();
@@ -1868,10 +1890,29 @@ namespace dxvk {
     this->spillRenderPass(false);
     this->unbindComputePipeline();
 
-    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();    
-    autoExposure.dispatch(this, 
+    DxvkAutoExposure& autoExposure = m_common->metaAutoExposure();
+    autoExposure.dispatch(this,
       getResourceManager().getSampler(VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_NEAREST, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER),
       rtOutput, GlobalTime::get().deltaTimeMs(), performSRGBConversion);
+
+    // HR patch: Patch 9 diagnostic — log auto-exposure + tonemapping mode every 300 frames for 15 bursts.
+    // If the path tracer feeds near-zero radiance into the tone mapper, auto-exposure can collapse
+    // to an extreme value and produce a black (or white) final image even when upstream math is fine.
+    // Knowing `enabled`, tonemapping mode, and local-tonemapper activity narrows the diagnosis.
+    // — see CHANGELOG.md 2026-04-22
+    {
+      static uint32_t sHRExpLog = 0;
+      if (sHRExpLog < 4500 && (sHRExpLog % 300) == 0) {
+        DxvkLocalToneMapping& lt = m_common->metaLocalToneMapping();
+        Logger::info(str::format(
+          "[HR-Exposure] tick=", sHRExpLog,
+          " autoExposureEnabled=", autoExposure.enabled() ? 1 : 0,
+          " tonemappingMode=", static_cast<int>(RtxOptions::tonemappingMode()),
+          " localTonemappingActive=", lt.isActive() ? 1 : 0,
+          " srgbConv=", performSRGBConversion ? 1 : 0));
+      }
+      ++sHRExpLog;
+    }
 
     // We don't reset history for tonemapper on m_resetHistory for easier comparison when toggling raytracing modes.
     // The tone curve shouldn't be too different between raytracing modes, 
