@@ -302,7 +302,17 @@ namespace dxvk {
       const float vpAspect = (vh > 0.0f) ? (vw / vh) : 0.0f;
       const bool isNonSquare = (vw > 0.0f && vh > 0.0f) &&
                                std::abs(vpAspect - 1.0f) >= 0.02f;
-      const bool isReasonableDepth = input.maxZ > 0.0f && input.maxZ <= 1.5f;
+      // HR patch: accept HR's reverse-Z perspective shape (|m[2][2]|>=0.1 AND
+      // m[2][3]≈-1) in addition to TF2's forward-Z range check. maxZ comes from
+      // the D3D11 viewport, not the decomposed matrix, so HR's legitimate
+      // reverse-Z matrix can fail the forward-Z-biased decomposition that
+      // populates maxZ. Shape check matches Patch 7 in classifyPerspective.
+      // — see CHANGELOG.md 2026-04-22
+      const Matrix4& proj = td.viewToProjection;
+      const bool isReverseZPerspective =
+        std::abs(proj[2][2]) >= 0.1f && std::abs(proj[2][3] + 1.0f) < 0.1f;
+      const bool isReasonableDepth =
+        (input.maxZ > 0.0f && input.maxZ <= 1.5f) || isReverseZPerspective;
       // FoV sanity. Standard game cameras (gameplay, cinematic, mech cockpit)
       // are 30°–120°. TF2 also issues:
       //   • ~140°/160°/147°: cubemap / reflection / fog volume cameras (wide).

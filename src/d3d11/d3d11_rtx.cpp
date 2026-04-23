@@ -6802,6 +6802,43 @@ namespace dxvk {
     dcs.geometryData     = geo;
     dcs.transformData    = ExtractTransforms();
 
+    // HR patch: generalize the path-11 w2v rescue to every draw once HR's real
+    // projection has been latched. Patches 5b/8 periodically cache a reconstructed
+    // worldToView = (R | -R*camPos) into m_lastGoodTransforms on draws that bind
+    // the matching cb0 pattern, but the majority of draws extract (R|0) or
+    // identity. CameraManager reads DrawCallState.transformData.worldToView, so
+    // without this restore the translation never reaches the camera manager and
+    // camValid=0 every frame. Gate note: the plan specified the signature
+    // `m_hasEverFoundProj && !m_hasSourceCbufModelInstance` but the latter
+    // member does not exist yet in this tree. The effective HR-ness is still
+    // captured because `m_lastGoodTransforms.worldToView` is only populated
+    // with non-zero translation on HR's cb0-scan reconstruction path (Patch
+    // 5b/8); on TF2/Source titles the cache either stays zero or already
+    // contains TF2's own valid translation, so the restore becomes a no-op
+    // there. The `cachedTMag2 >= 1.0f` guard below preserves the upstream
+    // behavior. — see CHANGELOG.md 2026-04-22
+    if (m_hasEverFoundProj) {
+      const auto& w2v0 = dcs.transformData.worldToView;
+      const float w2vTMag2 =
+        w2v0[3][0]*w2v0[3][0] + w2v0[3][1]*w2v0[3][1] + w2v0[3][2]*w2v0[3][2];
+      if (w2vTMag2 < 1.0f) {
+        std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+        const auto& cached = m_lastGoodTransforms.worldToView;
+        const float cachedTMag2 =
+          cached[3][0]*cached[3][0] + cached[3][1]*cached[3][1] + cached[3][2]*cached[3][2];
+        if (cachedTMag2 >= 1.0f) {
+          dcs.transformData.worldToView = cached;
+          static uint32_t sHRRestore = 0;
+          if (sHRRestore < 20) {
+            ++sHRRestore;
+            Logger::info(str::format(
+              "[HRViewCache] restore drawID=", m_drawCallID,
+              " cachedT=(", cached[3][0], ",", cached[3][1], ",", cached[3][2], ")"));
+          }
+        }
+      }
+    }
+
     // NV-DXVK (TF2 skinned chars): if the earlier RasterGeometry setup flagged
     // this draw as a skinned character (BLENDINDICES+BLENDWEIGHT+t30), set
     // objectToWorld = identity. Verified via DXBC disassembly of
