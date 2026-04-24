@@ -259,6 +259,42 @@ if exist "%OUTPUT_DIR%\rtx_shaders" (
     )
 )
 
+rem HR patch: Patch 14 — overwrite HR's bundled MSVC runtime (VCRUNTIME140 /
+rem MSVCP140 at 14.16 from VS 2017 Update 9, 2018) with the modern system copy
+rem (14.40+) and drop in VCRUNTIME140_1.dll (which HR does not ship at all).
+rem Our d3d11.dll imports all three; when HR ships 14.16 VCRUNTIME140 next to
+rem its exe, Windows resolves that via exe-dir-first search rule, but resolves
+rem VCRUNTIME140_1.dll from System32 at 14.50 -- the cross-version mix is
+rem ABI-incompatible and access-violates at VCRUNTIME140+0x122e during C++
+rem exception unwind or dispatched helpers.  Copying all three from System32
+rem forces a consistent 14.50 runtime.  Originals are preserved under
+rem _crt_14_16_backup\ before the first overwrite.  Idempotent: already-14.50
+rem copies are left alone.
+rem See CHANGELOG.md 2026-04-24.
+echo.
+echo #############################################################
+echo # Patch 14: sync MSVC CRT to System32 (fix VCRUNTIME mix)...#
+echo #############################################################
+set "CRT_BACKUP_DIR=%GAME_RUNTIME_DIR%\_crt_14_16_backup"
+if not exist "%CRT_BACKUP_DIR%" mkdir "%CRT_BACKUP_DIR%" >nul 2>&1
+for %%F in (VCRUNTIME140.dll MSVCP140.dll) do (
+    if exist "%GAME_RUNTIME_DIR%\%%F" (
+        if not exist "%CRT_BACKUP_DIR%\%%F" (
+            copy /Y "%GAME_RUNTIME_DIR%\%%F" "%CRT_BACKUP_DIR%\%%F" >nul
+            echo Backed up %%F ^(pre-patch original^) to _crt_14_16_backup
+        )
+    )
+)
+for %%F in (VCRUNTIME140.dll VCRUNTIME140_1.dll MSVCP140.dll) do (
+    if exist "C:\Windows\System32\%%F" (
+        copy /Y "C:\Windows\System32\%%F" "%GAME_RUNTIME_DIR%\%%F" >nul
+        echo Synced %%F from System32
+    ) else (
+        echo WARNING: C:\Windows\System32\%%F not present -- CRT sync skipped for this file
+    )
+)
+echo.
+
 rem Always (re)point DXVK_LOG_PATH at THIS game's log directory, regardless of
 rem whether it already exists.  Without this, a persistent DXVK_LOG_PATH left
 rem over from a previous game (e.g. Titanfall 2) will silently redirect

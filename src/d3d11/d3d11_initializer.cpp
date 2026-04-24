@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include <cstring>
 
 #include "d3d11_device.h"
@@ -9,6 +10,149 @@
 #include "../util/xxHash/xxhash.h"
 
 namespace dxvk {
+
+  // HR patch: Patch 13 — classify sampled textures that are non-albedo PBR inputs
+  // (normal maps, AO, roughness, metal masks). Heavy Rain's baked-in PBR data fights
+  // Remix's path-traced shading — duplicated normal perturbation and occlusion on top
+  // of ray-traced normals/AO produces the washed-out, overly-smooth look seen in
+  // session 2026-04-24. Classifier runs once per device-local texture init; when it
+  // returns true the Edit B1 hash assignment is skipped, Edit B2 sees hash==0 and
+  // never calls ImGUI::AddTexture, and the Remix material slot for that draw falls
+  // through to its albedo-only default (flat normals, no pre-baked AO).
+  //
+  // Controlled by env HR_SKIP_NON_ALBEDO (default "1" = enabled; set to "0" to disable
+  // without rebuilding). Reason is surfaced in the [HR-TexSkip] log for post-mortem.
+  // See CHANGELOG.md 2026-04-24.
+  namespace {
+    enum class NonAlbedoReason : uint8_t {
+      None = 0,
+      FormatBC5,   // 2-channel compressed: standard normal-map encoding.
+      FormatBC4,   // 1-channel compressed: AO / roughness / height.
+      FormatR,     // 1-channel uncompressed: mask / height / AO.
+      FormatRG,    // 2-channel uncompressed: often normal XY.
+      ContentNormal,    // avg ≈ (128, 128, 255) in UNORM space.
+      ContentGrayscale, // R == G == B across sampled pixels.
+    };
+
+    const char* NonAlbedoReasonStr(NonAlbedoReason r) {
+      switch (r) {
+        case NonAlbedoReason::FormatBC5:        return "fmt_bc5";
+        case NonAlbedoReason::FormatBC4:        return "fmt_bc4";
+        case NonAlbedoReason::FormatR:          return "fmt_r";
+        case NonAlbedoReason::FormatRG:         return "fmt_rg";
+        case NonAlbedoReason::ContentNormal:    return "content_normal";
+        case NonAlbedoReason::ContentGrayscale: return "content_grayscale";
+        default:                                return "none";
+      }
+    }
+
+    bool IsHrSkipNonAlbedoEnabled() {
+      // Resolved once at first call, cached for the rest of the session.
+      static const bool enabled = []() {
+        const char* v = std::getenv("HR_SKIP_NON_ALBEDO");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+      }();
+      return enabled;
+    }
+
+    NonAlbedoReason ClassifyNonAlbedo(
+        VkFormat                         format,
+        const VkExtent3D&                extent,
+        const D3D11_SUBRESOURCE_DATA&    data) {
+      // Format-based shortcuts. Compressed formats are not decoded — decoding BC/ETC
+      // would need a decompressor here; the format alone is high-confidence.
+      switch (format) {
+        case VK_FORMAT_BC5_UNORM_BLOCK:
+        case VK_FORMAT_BC5_SNORM_BLOCK:
+          return NonAlbedoReason::FormatBC5;
+        case VK_FORMAT_BC4_UNORM_BLOCK:
+        case VK_FORMAT_BC4_SNORM_BLOCK:
+          return NonAlbedoReason::FormatBC4;
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8_SNORM:
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_SFLOAT:
+          return NonAlbedoReason::FormatR;
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8_SNORM:
+        case VK_FORMAT_R16G16_UNORM:
+        case VK_FORMAT_R16G16_SNORM:
+        case VK_FORMAT_R16G16_SFLOAT:
+          return NonAlbedoReason::FormatRG;
+        default:
+          break;
+      }
+
+      // Content classification only for uncompressed RGBA8 layouts where we can
+      // read pixels safely. BC3/BC7/other compressed 4-channel formats fall through
+      // as "not non-albedo" — treat as albedo by default so we don't over-skip.
+      int bpp = 0;
+      int rIdx = 0, gIdx = 1, bIdx = 2;
+      switch (format) {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+          bpp = 4; rIdx = 0; gIdx = 1; bIdx = 2;
+          break;
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+          bpp = 4; rIdx = 2; gIdx = 1; bIdx = 0;
+          break;
+        default:
+          return NonAlbedoReason::None;
+      }
+
+      const uint32_t pitch = data.SysMemPitch;
+      const auto* bytes = static_cast<const uint8_t*>(data.pSysMem);
+      if (bytes == nullptr || pitch < uint32_t(bpp)) return NonAlbedoReason::None;
+
+      const uint32_t w = std::max(1u, extent.width);
+      const uint32_t h = std::max(1u, extent.height);
+      const uint32_t stepX = std::max(1u, w / 8u);
+      const uint32_t stepY = std::max(1u, h / 8u);
+
+      uint64_t sumR = 0, sumG = 0, sumB = 0;
+      uint32_t count = 0;
+      uint32_t grayscaleCount = 0;
+
+      for (uint32_t y = 0; y < h && count < 64; y += stepY) {
+        const uint8_t* row = bytes + y * pitch;
+        for (uint32_t x = 0; x < w && count < 64; x += stepX) {
+          const uint8_t* pix = row + x * bpp;
+          const int r = pix[rIdx], g = pix[gIdx], b = pix[bIdx];
+          sumR += r; sumG += g; sumB += b;
+          if (std::abs(r - g) <= 4 && std::abs(g - b) <= 4) {
+            ++grayscaleCount;
+          }
+          ++count;
+        }
+      }
+      if (count == 0) return NonAlbedoReason::None;
+
+      // All-grayscale: AO / roughness / specular mask stored in RGBA.
+      if (grayscaleCount == count) {
+        return NonAlbedoReason::ContentGrayscale;
+      }
+
+      // Normal map in tangent space: avg very close to (128, 128, 255).
+      // Tight bounds avoid false-positives on legitimate blue-dominant albedo
+      // (night sky, blue fabric) — real normals cluster tightly here because
+      // tangent-space Z is usually near 1.
+      const uint32_t avgR = uint32_t(sumR / count);
+      const uint32_t avgG = uint32_t(sumG / count);
+      const uint32_t avgB = uint32_t(sumB / count);
+      if (avgR >= 110 && avgR <= 150
+       && avgG >= 110 && avgG <= 150
+       && avgB >= 220) {
+        return NonAlbedoReason::ContentNormal;
+      }
+
+      return NonAlbedoReason::None;
+    }
+  } // namespace
 
   D3D11Initializer::D3D11Initializer(
           D3D11Device*                pParent)
@@ -142,22 +286,44 @@ namespace dxvk {
       if (image->getHash() == 0
           && !(desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
         const VkExtent3D ext0 = pTexture->MipLevelExtent(0);
-        // Source-data byte size: prefer the slice pitch (game-supplied 2D-slice byte count);
-        // fall back to row pitch × height for legacy callers that leave slice pitch zero.
-        const uint64_t srcSize = uint64_t(pInitialData[0].SysMemSlicePitch != 0
-          ? pInitialData[0].SysMemSlicePitch
-          : uint64_t(pInitialData[0].SysMemPitch) * std::max(1u, ext0.height));
-        if (srcSize > 0) {
-          XXH64_hash_t hash = XXH3_64bits(pInitialData[0].pSysMem, srcSize);
-          image->setHash(hash);
-          static uint32_t s_logCount = 0;
-          if (s_logCount < 50) {
-            ++s_logCount;
+
+        // HR patch: Patch 13 — classify non-albedo PBR inputs and skip hashing them.
+        // Leaving hash=0 makes the SRV ctor (Edit B2) skip ImGUI::AddTexture, so these
+        // textures never enter the Remix asset catalogue and the material slots fall
+        // through to albedo-only path-traced shading. — see CHANGELOG.md 2026-04-24
+        NonAlbedoReason skipReason = NonAlbedoReason::None;
+        if (IsHrSkipNonAlbedoEnabled()) {
+          skipReason = ClassifyNonAlbedo(image->info().format, ext0, pInitialData[0]);
+        }
+
+        if (skipReason != NonAlbedoReason::None) {
+          static uint32_t s_skipLogCount = 0;
+          if (s_skipLogCount < 50) {
+            ++s_skipLogCount;
             Logger::info(str::format(
-              "[HR-TexHash] kind=Sampled hash=0x", std::hex, hash, std::dec,
-              " size=", srcSize,
-              " extent=", ext0.width, "x", ext0.height, "x", ext0.depth,
-              " format=", image->info().format));
+              "[HR-TexSkip] reason=", NonAlbedoReasonStr(skipReason),
+              " fmt=", uint32_t(image->info().format),
+              " extent=", ext0.width, "x", ext0.height, "x", ext0.depth));
+          }
+          // Intentionally leave hash at 0 — Edit B2 sees this and skips AddTexture.
+        } else {
+          // Source-data byte size: prefer the slice pitch (game-supplied 2D-slice byte count);
+          // fall back to row pitch × height for legacy callers that leave slice pitch zero.
+          const uint64_t srcSize = uint64_t(pInitialData[0].SysMemSlicePitch != 0
+            ? pInitialData[0].SysMemSlicePitch
+            : uint64_t(pInitialData[0].SysMemPitch) * std::max(1u, ext0.height));
+          if (srcSize > 0) {
+            XXH64_hash_t hash = XXH3_64bits(pInitialData[0].pSysMem, srcSize);
+            image->setHash(hash);
+            static uint32_t s_logCount = 0;
+            if (s_logCount < 50) {
+              ++s_logCount;
+              Logger::info(str::format(
+                "[HR-TexHash] kind=Sampled hash=0x", std::hex, hash, std::dec,
+                " size=", srcSize,
+                " extent=", ext0.width, "x", ext0.height, "x", ext0.depth,
+                " format=", image->info().format));
+            }
           }
         }
       }
