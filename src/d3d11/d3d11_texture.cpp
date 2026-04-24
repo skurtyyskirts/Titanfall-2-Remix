@@ -2,8 +2,15 @@
 #include "d3d11_gdi.h"
 #include "d3d11_texture.h"
 
+// HR patch: Patch 11 — port D3D9's texture-hash + ImGUI register/release pipeline
+// to the DX11 frontend so the Remix asset catalogue ("Categorize Textures") is
+// populated. Without this, every texture's hash is 0 and the catalogue is empty
+// regardless of how many draws reach the RT path. — see CHANGELOG.md 2026-04-22
+#include "../util/xxHash/xxhash.h"
+#include "../dxvk/imgui/dxvk_imgui.h"
+
 namespace dxvk {
-  
+
   D3D11CommonTexture::D3D11CommonTexture(
           ID3D11Resource*             pInterface,
           D3D11Device*                pDevice,
@@ -213,11 +220,53 @@ namespace dxvk {
       m_image = m_device->GetDXVKDevice()->createImage(imageInfo, memoryProperties, DxvkMemoryStats::Category::AppTexture, "d3d11 texture");
     else
       m_image = m_device->GetDXVKDevice()->createImageFromVkImage(imageInfo, vkImage);
+
+    // HR patch: Patch 11 Edit A — set deterministic hash for render targets at create time.
+    // Mirrors D3D9CommonTexture::CreatePrimaryImage tail. RT content is GPU-only so we
+    // can't hash data; use extent+monotonic counter for stable identity across the session.
+    // Sampled textures get their hash later in D3D11Initializer (post-CPU-upload).
+    if (m_image != nullptr && m_image->getHash() == 0
+        && (m_desc.BindFlags & D3D11_BIND_RENDER_TARGET)) {
+      static uint32_t s_renderTargetHashCounter = 0;
+      XXH64_hash_t hash = XXH3_64bits(&m_image->info().extent, sizeof(m_image->info().extent));
+      hash = XXH3_64bits_withSeed(&s_renderTargetHashCounter, sizeof(uint32_t), hash);
+      ++s_renderTargetHashCounter;
+      m_image->setHash(hash);
+
+      // Descriptor hash distinguishes RTs whose content differs but share extent.
+      const DxvkImageCreateInfo& ii = m_image->info();
+      XXH64_hash_t descHash = XXH3_64bits(&ii.format, sizeof(ii.format));
+      descHash = XXH3_64bits_withSeed(&ii.extent, sizeof(ii.extent), descHash);
+      descHash = XXH3_64bits_withSeed(&ii.mipLevels, sizeof(ii.mipLevels), descHash);
+      descHash = XXH3_64bits_withSeed(&ii.numLayers, sizeof(ii.numLayers), descHash);
+      m_image->setDescriptorHash(descHash);
+
+      static uint32_t s_logCount = 0;
+      if (s_logCount < 50) {
+        ++s_logCount;
+        Logger::info(str::format(
+          "[HR-TexHash] kind=RT hash=0x", std::hex, hash, std::dec,
+          " descHash=0x", std::hex, descHash, std::dec,
+          " extent=", ii.extent.width, "x", ii.extent.height, "x", ii.extent.depth,
+          " format=", ii.format));
+      }
+    }
   }
-  
-  
+
+
   D3D11CommonTexture::~D3D11CommonTexture() {
-    
+    // HR patch: Patch 11 Edit C — release texture from ImGui catalogue on destruction.
+    // Mirrors D3D9CommonTexture::~D3D9CommonTexture. ReleaseTexture is a no-op for
+    // hashes not present in the map, so this is safe even for textures we never
+    // registered (e.g. the RT-only path that has hash but no SRV ever created).
+    if (m_image != nullptr) {
+      if (m_image->getHash() != 0) {
+        ImGUI::ReleaseTexture(m_image->getHash());
+      }
+      if (m_image->getDescriptorHash() != 0) {
+        ImGUI::ReleaseTexture(m_image->getDescriptorHash());
+      }
+    }
   }
   
   

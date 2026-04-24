@@ -3,6 +3,11 @@
 #include "d3d11_device.h"
 #include "d3d11_initializer.h"
 
+// HR patch: Patch 11 Edit B1 — hash CPU upload data so sampled textures get a
+// deterministic content-hash for the Remix asset catalogue. Mirrors
+// D3D9CommonTexture::SetupForRtxFrom. — see CHANGELOG.md 2026-04-22
+#include "../util/xxHash/xxhash.h"
+
 namespace dxvk {
 
   D3D11Initializer::D3D11Initializer(
@@ -129,6 +134,34 @@ namespace dxvk {
     auto formatInfo = imageFormatInfo(packedFormat);
 
     if (pInitialData != nullptr && pInitialData->pSysMem != nullptr) {
+      // HR patch: Patch 11 Edit B1 — hash subresource 0 (top mip, layer 0) CPU data and
+      // store it on the underlying DxvkImage. This is the content hash that the SRV path
+      // (Edit B2) will pass to ImGUI::AddTexture, populating the Remix asset catalogue.
+      // Skipped if the image already has a hash (RT/DSV/UAV are tagged elsewhere or
+      // intentionally excluded — they don't represent replaceable game-asset textures).
+      if (image->getHash() == 0
+          && !(desc->BindFlags & (D3D11_BIND_RENDER_TARGET | D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_UNORDERED_ACCESS))) {
+        const VkExtent3D ext0 = pTexture->MipLevelExtent(0);
+        // Source-data byte size: prefer the slice pitch (game-supplied 2D-slice byte count);
+        // fall back to row pitch × height for legacy callers that leave slice pitch zero.
+        const uint64_t srcSize = uint64_t(pInitialData[0].SysMemSlicePitch != 0
+          ? pInitialData[0].SysMemSlicePitch
+          : uint64_t(pInitialData[0].SysMemPitch) * std::max(1u, ext0.height));
+        if (srcSize > 0) {
+          XXH64_hash_t hash = XXH3_64bits(pInitialData[0].pSysMem, srcSize);
+          image->setHash(hash);
+          static uint32_t s_logCount = 0;
+          if (s_logCount < 50) {
+            ++s_logCount;
+            Logger::info(str::format(
+              "[HR-TexHash] kind=Sampled hash=0x", std::hex, hash, std::dec,
+              " size=", srcSize,
+              " extent=", ext0.width, "x", ext0.height, "x", ext0.depth,
+              " format=", image->info().format));
+          }
+        }
+      }
+
       // pInitialData is an array that stores an entry for
       // every single subresource. Since we will define all
       // subresources, this counts as initialization.

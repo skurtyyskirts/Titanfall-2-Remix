@@ -4,6 +4,13 @@
 #include "d3d11_texture.h"
 #include "d3d11_view_srv.h"
 
+// HR patch: Patch 11 Edit B2 — register the SRV's image view with the Remix ImGui
+// asset catalogue so the "Categorize Textures" panel can display and categorize
+// game textures. Mirrors D3D9CommonTexture::CreateSampleView. Image hash must
+// already be set by Edit A (ctor, for RTs) or Edit B1 (initializer, for sampled
+// textures with CPU upload data). — see CHANGELOG.md 2026-04-22
+#include "../dxvk/imgui/dxvk_imgui.h"
+
 namespace dxvk {
   
   D3D11ShaderResourceView::D3D11ShaderResourceView(
@@ -177,6 +184,32 @@ namespace dxvk {
 
       // Create the underlying image view object
       m_imageView = pDevice->GetDXVKDevice()->createImageView(texture->GetImage(), viewInfo);
+
+      // HR patch: Patch 11 Edit B2 — register this SRV's image view with the Remix
+      // asset catalogue, keyed on the image's hash. Hash is set by Edit A (RTs at
+      // ctor time) or Edit B1 (sampled textures at upload time). If hash is still
+      // 0 here the texture is either RT-content-without-source-data, UAV-only, or
+      // some other non-replaceable category — skip silently.
+      const Rc<DxvkImage>& image = texture->GetImage();
+      if (image != nullptr && m_imageView != nullptr) {
+        const XXH64_hash_t imgHash = image->getHash();
+        if (imgHash != 0) {
+          const uint32_t flags = (texture->Desc()->BindFlags & D3D11_BIND_RENDER_TARGET)
+            ? ImGUI::kTextureFlagsRenderTarget
+            : ImGUI::kTextureFlagsDefault;
+          ImGUI::AddTexture(imgHash, m_imageView, flags);
+
+          static uint32_t s_logCount = 0;
+          if (s_logCount < 50) {
+            ++s_logCount;
+            const VkExtent3D ext = image->info().extent;
+            Logger::info(str::format(
+              "[HR-TexHash] SRV.register hash=0x", std::hex, imgHash, std::dec,
+              " flags=", flags,
+              " extent=", ext.width, "x", ext.height, "x", ext.depth));
+          }
+        }
+      }
     }
   }
   
