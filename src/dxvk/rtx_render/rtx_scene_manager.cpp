@@ -1294,25 +1294,26 @@ namespace dxvk {
         }
 
         trackTexture(opaqueMaterialData.getAlbedoOpacityTexture(), albedoOpacityTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-        trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-        trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-        trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        // HEAVY RAIN RTX: Strip out PBR, only want diffuse and albedo
+        // trackTexture(opaqueMaterialData.getRoughnessTexture(), roughnessTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        // trackTexture(opaqueMaterialData.getMetallicTexture(), metallicTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+        // trackTexture(opaqueMaterialData.getSecondaryTexture(), secondaryTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
 
         albedoOpacityConstant.xyz() = opaqueMaterialData.getAlbedoConstant();
         albedoOpacityConstant.w = opaqueMaterialData.getOpacityConstant();
-        metallicConstant = opaqueMaterialData.getMetallicConstant();
-        roughnessConstant = opaqueMaterialData.getRoughnessConstant();
+        metallicConstant = 0.0f;
+        roughnessConstant = 1.0f;
       }
 
-      trackTexture(opaqueMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getTangentTexture(), tangentTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getHeightTexture(), heightTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
-      trackTexture(opaqueMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      // trackTexture(opaqueMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      // trackTexture(opaqueMaterialData.getTangentTexture(), tangentTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      // trackTexture(opaqueMaterialData.getHeightTexture(), heightTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
+      // trackTexture(opaqueMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords, true, samplerFeedbackStamp);
 
-      emissiveIntensity = opaqueMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
-      emissiveColorConstant = opaqueMaterialData.getEmissiveColorConstant();
-      enableEmissive = opaqueMaterialData.getEnableEmission();
-      anisotropy = opaqueMaterialData.getAnisotropyConstant();
+      emissiveIntensity = 0.0f;
+      emissiveColorConstant = Vector3(0.0f, 0.0f, 0.0f);
+      enableEmissive = false;
+      anisotropy = 0.0f;
         
       thinFilmEnable = opaqueMaterialData.getEnableThinFilm();
       alphaIsThinFilmThickness = opaqueMaterialData.getAlphaIsThinFilmThickness();
@@ -1406,16 +1407,16 @@ namespace dxvk {
       uint32_t transmittanceTextureIndex = kSurfaceMaterialInvalidTextureIndex;
       uint32_t emissiveColorTextureIndex = kSurfaceMaterialInvalidTextureIndex;
 
-      trackTexture(translucentMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords);
+      // trackTexture(translucentMaterialData.getNormalTexture(), normalTextureIndex, hasTexcoords);
       trackTexture(translucentMaterialData.getTransmittanceTexture(), transmittanceTextureIndex, hasTexcoords);
-      trackTexture(translucentMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords);
+      // trackTexture(translucentMaterialData.getEmissiveColorTexture(), emissiveColorTextureIndex, hasTexcoords);
 
       float refractiveIndex = translucentMaterialData.getRefractiveIndex() * std::clamp(TranslucentMaterialOptions::refractiveIndexScale(), 0.0f, 3.0f);
       Vector3 transmittanceColor = translucentMaterialData.getTransmittanceColor();
       float transmittanceMeasureDistance = translucentMaterialData.getTransmittanceMeasurementDistance();
-      Vector3 emissiveColorConstant = translucentMaterialData.getEmissiveColorConstant();
-      bool enableEmissive = translucentMaterialData.getEnableEmission();
-      float emissiveIntensity = translucentMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
+      Vector3 emissiveColorConstant = Vector3(0.0f, 0.0f, 0.0f); // translucentMaterialData.getEmissiveColorConstant();
+      bool enableEmissive = false; // translucentMaterialData.getEnableEmission();
+      float emissiveIntensity = 0.0f; // translucentMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
       bool isThinWalled = translucentMaterialData.getEnableThinWalled();
       float thinWallThickness = translucentMaterialData.getThinWallThickness();
       bool useDiffuseLayer = translucentMaterialData.getEnableDiffuseLayer();
@@ -1439,8 +1440,8 @@ namespace dxvk {
 
       uint8_t rayPortalIndex = rayPortalMaterialData.getRayPortalIndex();
       float rotationSpeed = rayPortalMaterialData.getRotationSpeed();
-      bool enableEmissive = rayPortalMaterialData.getEnableEmission();
-      float emissiveIntensity = rayPortalMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
+      bool enableEmissive = false; // rayPortalMaterialData.getEnableEmission();
+      float emissiveIntensity = 0.0f; // rayPortalMaterialData.getEmissiveIntensity() * RtxOptions::emissiveIntensity();
 
       const RtRayPortalSurfaceMaterial rayPortalSurfaceMaterial{
         maskTextureIndex, maskTextureIndex2, rayPortalIndex,

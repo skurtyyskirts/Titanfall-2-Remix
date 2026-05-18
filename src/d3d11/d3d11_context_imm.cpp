@@ -3,6 +3,11 @@
 #include "d3d11_device.h"
 #include "d3d11_texture.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
 constexpr static uint32_t MinFlushIntervalUs = 750;
 constexpr static uint32_t IncFlushIntervalUs = 250;
 constexpr static uint32_t MaxPendingSubmits  = 6;
@@ -10,6 +15,36 @@ constexpr static uint32_t MaxPendingSubmits  = 6;
 constexpr static VkDeviceSize MaxImplicitDiscardSize = 256ull << 10;
 
 namespace dxvk {
+
+  // HR patch: Patch 19a — env-var kill-switch + shape predicate for the
+  // [HR-LightMap] Map-time CB scanner. Mirrors Patch 13's
+  // IsHrSkipNonAlbedoEnabled (d3d11_initializer.cpp:49) and Patch 17's
+  // IsHrLightPassScanEnabled (d3d11_rtx.cpp:122). Default enabled (=1);
+  // set HR_LIGHT_MAP_DUMP=0 to disable without a rebuild. Resolved once
+  // at first call, cached for the rest of the session.
+  // — see CHANGELOG.md 2026-04-30
+  namespace {
+    bool IsHrLightMapDumpEnabled() {
+      static const bool enabled = []() {
+        const char* v = std::getenv("HR_LIGHT_MAP_DUMP");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+      }();
+      return enabled;
+    }
+
+    // Identifies dynamic constant-buffer-shaped Map targets that could
+    // plausibly hold a per-draw analytic-light array. Excludes:
+    //   - the bone pool (393216 B; covered by [BoneMap.diag] above)
+    //   - vertex/index streams (no D3D11_BIND_CONSTANT_BUFFER bit)
+    //   - the DXVK 1 MB sliding ring (>4096 B)
+    // Range chosen to cover the union of HR cb shapes observed in
+    // Patch 16/17 dumps (scene-globals, light arrays, material params).
+    bool IsHrCbufShape(uint32_t byteWidth, UINT bindFlags) {
+      return byteWidth >= 256u
+          && byteWidth <= 4096u
+          && (bindFlags & D3D11_BIND_CONSTANT_BUFFER) != 0u;
+    }
+  }
   
   D3D11ImmediateContext::D3D11ImmediateContext(
           D3D11Device*    pParent,
@@ -372,6 +407,75 @@ namespace dxvk {
             " usage=", uint32_t(b->Desc()->Usage),
             " bindFlags=", uint32_t(b->Desc()->BindFlags),
             " mapPtrResult=", reinterpret_cast<uintptr_t>(pMappedResource ? pMappedResource->pData : nullptr)));
+        }
+      }
+
+      // HR patch: Patch 19a — Map-time CB scanner. Patches 16/17 read PS
+      // cbuffer slices at RTX-dispatch time; PS s0 reads all-zero across
+      // 5,166 dumps (session 15). Two hypotheses remain: (1) HR uploads
+      // zero/fixed-zero global constants and the analytic-light array
+      // lives elsewhere (different slot, VS-side, or not a flat array);
+      // (2) DXVK's 1 MB ring has recycled the slice between Map and our
+      // read. This diag observes at Map time — before either scenario
+      // matters — and dumps any CB-shaped (256–4096 B) dynamic upload's
+      // first 8 float4 rows, annotated with posRad?/colInt? predicates.
+      // Mirrors the [BoneMap.diag] precedent above. Settles whether HR
+      // ever uploads analytic lights to any cbuffer slot in any frame.
+      // — see CHANGELOG.md 2026-04-30
+      if (IsHrLightMapDumpEnabled()
+          && SUCCEEDED(hr)
+          && pMappedResource != nullptr
+          && pMappedResource->pData != nullptr
+          && (MapType == D3D11_MAP_WRITE_DISCARD
+              || MapType == D3D11_MAP_WRITE_NO_OVERWRITE)
+          && IsHrCbufShape(sz, b->Desc()->BindFlags)) {
+        // HR patch: Patch 19a-1 — dedup by buffer pointer. Session 16 round 1
+        // burned all 25 emits on a single per-frame globals CB (ptr=...984,
+        // 4096 B) re-Mapped with WRITE_DISCARD every draw. Fix: log each
+        // unique ptr once so up to 25 distinct CB shapes surface instead of
+        // one CB × 25. Lock-context above serializes access to the static.
+        // — see CHANGELOG.md 2026-04-30
+        constexpr size_t kMaxLightMapPtrs = 25;
+        static uintptr_t sLightMapPtrs[kMaxLightMapPtrs] = {};
+        static uint32_t  sLightMapPtrCount = 0;
+        const uintptr_t bufKey = reinterpret_cast<uintptr_t>(b);
+        bool alreadyLogged = false;
+        for (uint32_t i = 0; i < sLightMapPtrCount; ++i) {
+          if (sLightMapPtrs[i] == bufKey) { alreadyLogged = true; break; }
+        }
+        if (!alreadyLogged && sLightMapPtrCount < kMaxLightMapPtrs) {
+          sLightMapPtrs[sLightMapPtrCount++] = bufKey;
+          const float* fdata = reinterpret_cast<const float*>(pMappedResource->pData);
+          const size_t maxRows = std::min<size_t>(8u, size_t(sz) / 16u);
+          Logger::info(str::format(
+              "[HR-LightMap] Map cbuf",
+              " ptr=", reinterpret_cast<uintptr_t>(b),
+              " bufSize=", sz,
+              " mapType=", uint32_t(MapType),
+              " usage=", uint32_t(b->Desc()->Usage),
+              " bindFlags=", uint32_t(b->Desc()->BindFlags),
+              " rows=", maxRows,
+              " uniq=", sLightMapPtrCount, "/", uint32_t(kMaxLightMapPtrs)));
+          for (size_t r = 0; r < maxRows; ++r) {
+            const float x = fdata[r * 4 + 0];
+            const float y = fdata[r * 4 + 1];
+            const float z = fdata[r * 4 + 2];
+            const float w = fdata[r * 4 + 3];
+            const bool finiteAll = std::isfinite(x) && std::isfinite(y)
+                                && std::isfinite(z) && std::isfinite(w);
+            // posRad?: finite xyz, |w|=radius ∈ [0.01, 50]
+            const bool posRad = finiteAll
+                             && std::abs(w) >= 0.01f && std::abs(w) <= 50.0f;
+            // colInt?: non-negative xyz (color), w=intensity ∈ [0.01, 50]
+            const bool colInt = finiteAll
+                             && x >= 0.0f && y >= 0.0f && z >= 0.0f
+                             && w >= 0.01f && w <= 50.0f;
+            Logger::info(str::format(
+                "[HR-LightMap]   +", uint32_t(r * 16u),
+                " = (", x, ", ", y, ", ", z, ", ", w, ")",
+                posRad ? " posRad?=Y" : "",
+                colInt ? " colInt?=Y" : ""));
+          }
         }
       }
     } else {

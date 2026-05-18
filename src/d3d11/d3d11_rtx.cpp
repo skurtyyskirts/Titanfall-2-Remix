@@ -113,6 +113,22 @@ namespace SceneDump {
 
 namespace dxvk {
 
+  // HR patch: Patch 17 — env-var kill-switch for the [HR-LightPass] scanner.
+  // Replaces Patch 16's IsHrLightCBScanEnabled. Mirrors Patch 13's
+  // IsHrSkipNonAlbedoEnabled pattern at d3d11_initializer.cpp:49. Default
+  // enabled (=1); set HR_LIGHT_PASS_SCAN=0 to disable the scanner without a
+  // rebuild. Resolved once at first call and cached for the rest of the
+  // session. — see CHANGELOG.md 2026-04-24
+  namespace {
+    bool IsHrLightPassScanEnabled() {
+      static const bool enabled = []() {
+        const char* v = std::getenv("HR_LIGHT_PASS_SCAN");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+      }();
+      return enabled;
+    }
+  }
+
   // Map D3D11_BLEND → VkBlendFactor.  Mirrors D3D11BlendState::DecodeBlendFactor
   // but kept local to avoid exposing internal statics.
   static VkBlendFactor mapD3D11Blend(D3D11_BLEND b, bool isAlpha) {
@@ -154,6 +170,9 @@ namespace dxvk {
   bool D3D11Rtx::m_foundRealProjThisFrame = false;
   bool D3D11Rtx::m_hasEverFoundProj       = false;
   DrawCallTransforms D3D11Rtx::m_lastGoodTransforms = {};
+  // HR patch (Patch 18): see d3d11_rtx.h for rationale. — CHANGELOG.md 2026-04-24
+  Vector3 D3D11Rtx::m_lastGoodCamPos       = Vector3(0.0f, 0.0f, 0.0f);
+  bool    D3D11Rtx::m_lastGoodCamPosValid  = false;
   std::mutex D3D11Rtx::m_lastGoodTransformsMutex;
 
   D3D11Rtx::D3D11Rtx(D3D11DeviceContext* pContext)
@@ -3363,6 +3382,16 @@ namespace dxvk {
             if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(cz)) continue;
             const float camMag = std::sqrt(cx*cx + cy*cy + cz*cz);
             if (camMag < 0.01f || camMag > 1e6f) continue;
+            // HR patch: Patch 19a-1 — reject synthetic identity-like positions
+            // (1,1,1), (0.26,~0,0.37), etc. The Patch 19a L1 floor (1.0f) was
+            // too lenient: session 16 round 1 caught (1,1,1) (L1=3.0) polluting
+            // m_lastGoodCamPos between real-camera draws. Replaced with a
+            // per-axis maximum: real HR world cameras always have at least one
+            // axis well past 3 m from world origin (session evidence: max=45.6,
+            // 44.3, 130.5, 6.03). UI/HUD identity blocks stay <=1 on every axis.
+            // — see CHANGELOG.md 2026-04-30
+            const float camMaxAbs = std::max({std::abs(cx), std::abs(cy), std::abs(cz)});
+            if (camMaxAbs <= 3.0f) continue;
             // Verify mutual orthogonality to filter coincidental unit vectors.
             const float d01 = f[0]*f[4] + f[1]*f[5] + f[2]*f[6];
             const float d02 = f[0]*f[8] + f[1]*f[9] + f[2]*f[10];
@@ -3389,6 +3418,11 @@ namespace dxvk {
             {
               std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
               m_lastGoodTransforms.worldToView = transforms.worldToView;
+              // HR patch: persist recovered camPos so the general-path o2w can be
+              // shifted from camera-relative to absolute world space. — see
+              // CHANGELOG.md 2026-04-24 (Patch 18).
+              m_lastGoodCamPos      = Vector3(cx, cy, cz);
+              m_lastGoodCamPosValid = true;
             }
             static uint32_t sHRLog = 0;
             if (sHRLog < 5) {
@@ -5434,6 +5468,299 @@ namespace dxvk {
       }
     }
 
+    // HR patch: Patch 17 — replaces Patch 16. Signature-gated scanner that
+    // fires on draws matching the deferred-lighting / clustered-forward shape
+    // (full-screen quad with many SRVs, OR many SRVs + large PS cbuffer slice).
+    // Reads the actual bound slice (constOff..constOff+constCount*16) inside
+    // DXVK's 1MB constant ring rather than rejecting buffers by underlying
+    // size. Detects repeated 32B/48B light-struct strides. — see CHANGELOG.md
+    // 2026-04-24
+    //
+    // Patch 16 (replaced) had two structural defects:
+    //   (1) rejected any PS cbuffer with underlying VkBuffer ByteWidth > 64KB,
+    //       but every D3D11 dynamic cbuffer in DXVK is a 1MB ring — every
+    //       slot is "too big" by that test. Real per-draw data lives in the
+    //       slice [constOff, constOff + constCount*16).
+    //   (2) fired one-shot on the first late draw, which on Heavy Rain's
+    //       deferred renderer is a G-buffer fill pass. The lighting pass
+    //       (where the analytic-light array is bound) hasn't been issued yet.
+    //
+    // This patch:
+    //   - reads the slice correctly via cb.constantOffset / cb.constantCount,
+    //   - gates on a draw-shape signature (fullscreen quad + ≥3 SRVs + depth-
+    //     write off, OR ≥4 SRVs + a PS cbuffer slice ≥1024 B),
+    //   - allows up to 5 matches per instance to sample multiple distinct
+    //     lighting-pass draws,
+    //   - looks for repeated 32B / 48B light-struct strides and emits a
+    //     compact match summary when found.
+    //
+    // Env kill-switch: HR_LIGHT_PASS_SCAN=0 disables without rebuild.
+    if (m_hasEverFoundProj
+        && m_lightPassScanCount < 5
+        && IsHrLightPassScanEnabled()) {
+      // Lighting-pass signature detection.
+      uint32_t psSrvCount = 0;
+      for (uint32_t s = 0; s < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++s) {
+        if (m_context->m_state.ps.shaderResources.views[s].ptr() != nullptr)
+          ++psSrvCount;
+      }
+      // Read DepthWriteMask from the current OM state.
+      bool depthWriteOff = false;
+      if (m_context->m_state.om.dsState != nullptr) {
+        D3D11_DEPTH_STENCIL_DESC dsDescLP = {};
+        m_context->m_state.om.dsState->GetDesc(&dsDescLP);
+        depthWriteOff = (dsDescLP.DepthWriteMask == D3D11_DEPTH_WRITE_MASK_ZERO);
+      }
+      // Find the largest bound PS cbuffer slice (in bytes).
+      uint32_t maxPsCbSliceBytes = 0;
+      uint32_t maxPsCbSlot = UINT32_MAX;
+      for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
+        const auto& cb = m_context->m_state.ps.constantBuffers[slot];
+        if (cb.buffer == nullptr) continue;
+        const uint32_t sliceBytes = cb.constantCount * 16u;
+        if (sliceBytes > maxPsCbSliceBytes) {
+          maxPsCbSliceBytes = sliceBytes;
+          maxPsCbSlot = slot;
+        }
+      }
+      const bool isFullscreenLighting = (count >= 3 && count <= 6)
+                                     && depthWriteOff
+                                     && psSrvCount >= 3;
+      const bool isClusteredForward  = psSrvCount >= 4
+                                    && maxPsCbSliceBytes >= 1024;
+      if (isFullscreenLighting || isClusteredForward) {
+        ++m_lightPassScanCount;
+        Logger::info(str::format(
+            "[HR-LightPass.shape] match #", static_cast<int>(m_lightPassScanCount),
+            " class=", (isFullscreenLighting ? "fullscreen_lighting" : "clustered_forward"),
+            " count=", count,
+            " psSrv=", psSrvCount,
+            " depthWriteOff=", static_cast<int>(depthWriteOff),
+            " maxPsCb={slot=", static_cast<int>(maxPsCbSlot),
+            " sliceBytes=", maxPsCbSliceBytes, "}"));
+
+        // Stride-detection predicates as local lambdas.
+        auto isFinite4 = [](float a, float b, float c, float d) {
+          return (a == a) && (b == b) && (c == c) && (d == d)
+              && a > -1e30f && a < 1e30f
+              && b > -1e30f && b < 1e30f
+              && c > -1e30f && c < 1e30f
+              && d > -1e30f && d < 1e30f;
+        };
+        auto posRad = [&](float x, float y, float z, float w) {
+          if (!isFinite4(x, y, z, w)) return false;
+          return std::abs(x) < 10000.0f && std::abs(y) < 10000.0f
+              && std::abs(z) < 10000.0f
+              && w >= 0.01f && w <= 100.0f;
+        };
+        auto colInt = [&](float x, float y, float z, float w) {
+          if (!isFinite4(x, y, z, w)) return false;
+          return x >= 0.0f && y >= 0.0f && z >= 0.0f
+              && w > 0.001f && w < 10000.0f;
+        };
+        auto dirCone = [&](float x, float y, float z, float w) {
+          if (!isFinite4(x, y, z, w)) return false;
+          const float n = x * x + y * y + z * z;
+          return std::abs(n - 1.0f) < 0.1f && w >= 0.0f && w < 4.0f;
+        };
+
+        // Slice-correct PS cbuffer dump for ALL non-null PS slots.
+        auto scanStage = [&](const char* stageTag,
+                             const auto& cbArray) {
+          for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT; ++slot) {
+            const auto& cb = cbArray[slot];
+            if (cb.buffer == nullptr) continue;
+            const uint32_t bufSize = static_cast<uint32_t>(cb.buffer->Desc()->ByteWidth);
+            const uint32_t base = cb.constantOffset * 16u;
+            uint32_t sliceBytes = cb.constantCount * 16u;
+            if (sliceBytes == 0 && base < bufSize) {
+              sliceBytes = bufSize - base;
+            }
+            const uint32_t roomBytes = base < bufSize ? (bufSize - base) : 0u;
+            const uint32_t dumpBytes = std::min<uint32_t>(2048u,
+                                          std::min<uint32_t>(sliceBytes, roomBytes));
+            if (dumpBytes < 16) continue;
+            const auto mapped = cb.buffer->GetMappedSlice();
+            const uint8_t* p8 = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+            if (!p8) {
+              Logger::info(str::format(
+                  "[HR-LightPass.cb] ", stageTag, " s", slot,
+                  " bufSize=", bufSize, " base=", base,
+                  " sliceBytes=", sliceBytes, " mapPtr=NULL"));
+              continue;
+            }
+            Logger::info(str::format(
+                "[HR-LightPass.cb] ", stageTag, " s", slot,
+                " bufSize=", bufSize,
+                " base=", base,
+                " sliceBytes=", sliceBytes,
+                " dumpBytes=", dumpBytes));
+            const float* f = reinterpret_cast<const float*>(p8 + base);
+            const uint32_t rowCount = dumpBytes / 16u;
+            for (uint32_t row = 0; row < rowCount; ++row) {
+              const float x = f[row * 4 + 0];
+              const float y = f[row * 4 + 1];
+              const float z = f[row * 4 + 2];
+              const float w = f[row * 4 + 3];
+              Logger::info(str::format(
+                  "[HR-LightPass.cb]   ", stageTag, " s", slot,
+                  " +", row * 16u,
+                  " = (", x, ", ", y, ", ", z, ", ", w, ")"));
+            }
+            // Stride detection — 32B (point/sphere light: pos+rad, col+int).
+            if (rowCount >= 4) {
+              uint32_t hits32 = 0;
+              uint32_t firstHitRow32 = UINT32_MAX;
+              for (uint32_t row = 0; row + 1 < rowCount; row += 2) {
+                const float* a = f + row * 4;
+                const float* b = f + (row + 1) * 4;
+                if (posRad(a[0], a[1], a[2], a[3])
+                    && colInt(b[0], b[1], b[2], b[3])) {
+                  if (firstHitRow32 == UINT32_MAX) firstHitRow32 = row;
+                  ++hits32;
+                } else if (hits32 >= 2) {
+                  break;
+                } else {
+                  hits32 = 0;
+                  firstHitRow32 = UINT32_MAX;
+                }
+              }
+              if (hits32 >= 2 && firstHitRow32 != UINT32_MAX) {
+                const float* a = f + firstHitRow32 * 4;
+                const float* b = f + (firstHitRow32 + 1) * 4;
+                Logger::info(str::format(
+                    "[HR-LightPass.struct] ", stageTag, " s", slot,
+                    " stride=32 count=", hits32,
+                    " firstPos=(", a[0], ",", a[1], ",", a[2], ")",
+                    " firstRad=", a[3],
+                    " firstCol=(", b[0], ",", b[1], ",", b[2], ")",
+                    " firstInt=", b[3]));
+              }
+            }
+            // Stride detection — 48B (spot light: pos+rad, col+int, dir+cone).
+            if (rowCount >= 6) {
+              uint32_t hits48 = 0;
+              uint32_t firstHitRow48 = UINT32_MAX;
+              for (uint32_t row = 0; row + 2 < rowCount; row += 3) {
+                const float* a = f + row * 4;
+                const float* b = f + (row + 1) * 4;
+                const float* c = f + (row + 2) * 4;
+                if (posRad(a[0], a[1], a[2], a[3])
+                    && colInt(b[0], b[1], b[2], b[3])
+                    && dirCone(c[0], c[1], c[2], c[3])) {
+                  if (firstHitRow48 == UINT32_MAX) firstHitRow48 = row;
+                  ++hits48;
+                } else if (hits48 >= 2) {
+                  break;
+                } else {
+                  hits48 = 0;
+                  firstHitRow48 = UINT32_MAX;
+                }
+              }
+              if (hits48 >= 2 && firstHitRow48 != UINT32_MAX) {
+                const float* a = f + firstHitRow48 * 4;
+                const float* b = f + (firstHitRow48 + 1) * 4;
+                const float* c = f + (firstHitRow48 + 2) * 4;
+                Logger::info(str::format(
+                    "[HR-LightPass.struct] ", stageTag, " s", slot,
+                    " stride=48 count=", hits48,
+                    " firstPos=(", a[0], ",", a[1], ",", a[2], ")",
+                    " firstRad=", a[3],
+                    " firstCol=(", b[0], ",", b[1], ",", b[2], ")",
+                    " firstInt=", b[3],
+                    " firstDir=(", c[0], ",", c[1], ",", c[2], ")",
+                    " firstCone=", c[3]));
+              }
+            }
+          }
+        };
+        scanStage("PS", m_context->m_state.ps.constantBuffers);
+        scanStage("VS", m_context->m_state.vs.constantBuffers);
+
+        // StructuredBuffer / typed-Buffer SRV scan (PS only). HR may upload
+        // its analytic-light array as an SRV-bound structured buffer instead
+        // of a cbuffer; cluster grid + light-list buffers are also common.
+        for (uint32_t slot = 0; slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; ++slot) {
+          auto* srv = m_context->m_state.ps.shaderResources.views[slot].ptr();
+          if (!srv) continue;
+          D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+          srv->GetDesc(&sd);
+          if (sd.ViewDimension != D3D11_SRV_DIMENSION_BUFFER
+              && sd.ViewDimension != D3D11_SRV_DIMENSION_BUFFEREX) {
+            continue;
+          }
+          Com<ID3D11Resource> res;
+          srv->GetResource(&res);
+          D3D11_RESOURCE_DIMENSION dim;
+          res->GetType(&dim);
+          if (dim != D3D11_RESOURCE_DIMENSION_BUFFER) continue;
+          auto* buf = static_cast<D3D11Buffer*>(res.ptr());
+          if (!buf) continue;
+          const auto* bd = buf->Desc();
+          const bool isStructured = (bd->MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) != 0;
+          const uint32_t stride = bd->StructureByteStride;
+          const uint32_t firstElem = (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+                                   ? sd.Buffer.FirstElement
+                                   : sd.BufferEx.FirstElement;
+          const uint32_t numElem = (sd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+                                 ? sd.Buffer.NumElements
+                                 : sd.BufferEx.NumElements;
+          if (!isStructured) continue;
+          if (stride != 16 && stride != 32 && stride != 48 && stride != 64) continue;
+          if (numElem < 1 || numElem > 256) continue;
+
+          const auto mapped = buf->GetMappedSlice();
+          const uint8_t* p8 = reinterpret_cast<const uint8_t*>(mapped.mapPtr);
+          const uint32_t bufSize = static_cast<uint32_t>(bd->ByteWidth);
+          const uint32_t baseSrv = firstElem * stride;
+          const uint32_t roomSrv = baseSrv < bufSize ? (bufSize - baseSrv) : 0u;
+          const uint32_t wantSrv = numElem * stride;
+          const uint32_t dumpSrv = std::min<uint32_t>(1024u,
+                                      std::min<uint32_t>(wantSrv, roomSrv));
+          Logger::info(str::format(
+              "[HR-LightPass.srv] PS t", slot,
+              " stride=", stride,
+              " elements=", numElem,
+              " bufSize=", bufSize,
+              " base=", baseSrv,
+              " dumpBytes=", dumpSrv,
+              " mapPtr=", (p8 ? 1 : 0)));
+          if (!p8 || dumpSrv < stride) continue;
+          const uint32_t elemsToDump = std::min<uint32_t>(16u, dumpSrv / stride);
+          const float* fSrv = reinterpret_cast<const float*>(p8 + baseSrv);
+          const uint32_t fStride = stride / 4u;
+          for (uint32_t e = 0; e < elemsToDump; ++e) {
+            const float* p = fSrv + e * fStride;
+            if (stride == 16) {
+              Logger::info(str::format(
+                  "[HR-LightPass.srv]   PS t", slot, " [", e, "] = (",
+                  p[0], ", ", p[1], ", ", p[2], ", ", p[3], ")"));
+            } else if (stride == 32) {
+              Logger::info(str::format(
+                  "[HR-LightPass.srv]   PS t", slot, " [", e, "] posRad=(",
+                  p[0], ",", p[1], ",", p[2], ",", p[3], ") colInt=(",
+                  p[4], ",", p[5], ",", p[6], ",", p[7], ")"));
+            } else if (stride == 48) {
+              Logger::info(str::format(
+                  "[HR-LightPass.srv]   PS t", slot, " [", e, "] posRad=(",
+                  p[0], ",", p[1], ",", p[2], ",", p[3], ") colInt=(",
+                  p[4], ",", p[5], ",", p[6], ",", p[7], ") dirCone=(",
+                  p[8], ",", p[9], ",", p[10], ",", p[11], ")"));
+            } else { // stride == 64
+              Logger::info(str::format(
+                  "[HR-LightPass.srv]   PS t", slot, " [", e, "] r0=(",
+                  p[0], ",", p[1], ",", p[2], ",", p[3], ") r1=(",
+                  p[4], ",", p[5], ",", p[6], ",", p[7], ") r2=(",
+                  p[8], ",", p[9], ",", p[10], ",", p[11], ") r3=(",
+                  p[12], ",", p[13], ",", p[14], ",", p[15], ")"));
+            }
+          }
+        }
+
+        Logger::info("[HR-LightPass] === scan end ===");
+      }
+    }
+
     // Throttle: don't exceed the worker ring buffer capacity.
     // Beyond this point new futures would overwrite in-flight ones → corrupt hashes.
     if (m_drawCallID >= kMaxConcurrentDraws) {
@@ -6835,6 +7162,54 @@ namespace dxvk {
               "[HRViewCache] restore drawID=", m_drawCallID,
               " cachedT=(", cached[3][0], ",", cached[3][1], ",", cached[3][2], ")"));
           }
+        }
+      }
+    }
+
+    // HR patch (Patch 18): HR's VS receives camera-relative vertices because the
+    // engine pre-offsets world coords by camPos on the CPU. Patch 5b/10a restore
+    // the real (R | -R*camPos) worldToView [column-major], but objectToWorld is
+    // still in camera-relative space — the TLAS sits around the origin while
+    // RtCamera is at the true world position, producing a per-frame motion-
+    // vector smear of magnitude R*Δcamera that DLSS amplifies into full-screen
+    // "textures sliding" artefacts. Add +camPos to objectToWorld and recompute
+    // objectToView so the TLAS instance lands at its real world location.
+    // m_lastGoodCamPosValid is the de facto HR signature: only Patch 5b's cb0
+    // scan sets it, so TF2 / Source paths (which never match the rotation+camPos
+    // pattern) leave it false and this branch is a no-op there. Viewmodel
+    // (below, line ~7202: o2w = inverse(mainW2v)) and skinned-char (below,
+    // line ~7221: o2w = identity) paths later overwrite objectToWorld, so this
+    // offset is naturally discarded for those branches — no skip-list needed.
+    // — see CHANGELOG.md 2026-04-24
+    if (m_hasEverFoundProj) {
+      bool applyCamPosOffset = false;
+      Vector3 camPos;
+      {
+        std::lock_guard<std::mutex> lk(m_lastGoodTransformsMutex);
+        if (m_lastGoodCamPosValid) {
+          camPos = m_lastGoodCamPos;
+          applyCamPosOffset = true;
+        }
+      }
+      if (applyCamPosOffset) {
+        auto& o2w = dcs.transformData.objectToWorld;
+        o2w[3][0] += camPos.x;
+        o2w[3][1] += camPos.y;
+        o2w[3][2] += camPos.z;
+        // Recompute objectToView since both worldToView (Patch 10a above) and
+        // objectToWorld (just now) may have changed since ExtractTransforms.
+        // column-major: result = worldToView * objectToWorld.
+        if (!isIdentityExact(dcs.transformData.worldToView)) {
+          dcs.transformData.objectToView =
+            dcs.transformData.worldToView * dcs.transformData.objectToWorld;
+        }
+        static uint32_t sHRO2WLog = 0;
+        if (sHRO2WLog < 20) {
+          ++sHRO2WLog;
+          Logger::info(str::format(
+            "[HR-O2W] drawID=", m_drawCallID,
+            " camPos=(", camPos.x, ",", camPos.y, ",", camPos.z, ")",
+            " o2wT=(", o2w[3][0], ",", o2w[3][1], ",", o2w[3][2], ")"));
         }
       }
     }

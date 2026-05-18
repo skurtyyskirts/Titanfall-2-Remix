@@ -193,7 +193,7 @@ namespace dxvk {
       const Rc<DxvkImage>& image = texture->GetImage();
       if (image != nullptr && m_imageView != nullptr) {
         const XXH64_hash_t imgHash = image->getHash();
-        if (imgHash != 0) {
+        if (imgHash != 0 && (imgHash & 0xFFFFFFFF00000000ULL) != 0xBAADF00D00000000ULL) {
           const uint32_t flags = (texture->Desc()->BindFlags & D3D11_BIND_RENDER_TARGET)
             ? ImGUI::kTextureFlagsRenderTarget
             : ImGUI::kTextureFlagsDefault;
@@ -615,3 +615,4 @@ namespace dxvk {
   }
 
 }
+

@@ -4083,6 +4083,14 @@ namespace dxvk {
     for (uint32_t i = 0; i < NumResources; i++) {
       auto resView = static_cast<D3D11ShaderResourceView*>(ppResources[i]);
       
+      // HR patch: Patch 13b - physically unbind non-albedo textures
+      if (unlikely(resView)) {
+        auto imageView = resView->GetImageView();
+        if (imageView != nullptr && imageView->image() != nullptr && (imageView->image()->getHash() & 0xFFFFFFFF00000000ULL) == 0xBAADF00D00000000ULL) {
+          resView = nullptr;
+        }
+      }
+      
       if (Bindings.views[StartSlot + i] != resView) {
         if (unlikely(resView && resView->TestHazards())) {
           if (TestSrvHazards<ShaderStage>(resView))
@@ -4707,3 +4715,4 @@ namespace dxvk {
   }
 
 }
+

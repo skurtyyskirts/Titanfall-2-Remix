@@ -1175,7 +1175,34 @@ namespace dxvk {
     m_texture (this, pDevice, pDesc, D3D11_RESOURCE_DIMENSION_TEXTURE3D, 0, VK_NULL_HANDLE),
     m_interop (this, &m_texture),
     m_resource(this) {
-    
+
+    // HR patch: Patch 15 — identify Diesel Spherical Harmonic GI volumes.
+    // GDC 2018 "Detroit: Become Human" (Caurant/Lambert) describes 2nd-order SH
+    // irradiance stored in three RGBA16F volume textures (R/G/B color-channel
+    // split). Heavy Rain is an older Diesel iteration; confirm the layout
+    // applies before Patch 16 implements the SH→RtLight conversion.
+    // This is identification + logging only — no behavior change. Cold path
+    // (texture allocation), capped at 50 emits/session. HR gate via module-
+    // handle check is acceptable here per coding-conventions.md (cold path,
+    // not per-draw). — see CHANGELOG.md 2026-04-24
+    if (pDesc->Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+      static const bool s_isHR = (GetModuleHandleW(L"HeavyRain.exe") != nullptr);
+      if (s_isHR) {
+        static uint32_t s_shVolLogCount = 0;
+        if (s_shVolLogCount < 50) {
+          ++s_shVolLogCount;
+          Logger::info(str::format(
+            "[HR-SHVol] D3D11Texture3D ctor extent=",
+            pDesc->Width, "x", pDesc->Height, "x", pDesc->Depth,
+            " mips=", pDesc->MipLevels,
+            " bind=0x", std::hex, pDesc->BindFlags, std::dec,
+            " usage=", pDesc->Usage,
+            " cpuAccess=0x", std::hex, pDesc->CPUAccessFlags, std::dec,
+            " miscFlags=0x", std::hex, pDesc->MiscFlags, std::dec,
+            " (count=", s_shVolLogCount, "/50)"));
+        }
+      }
+    }
   }
   
   

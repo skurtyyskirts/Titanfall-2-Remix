@@ -258,6 +258,15 @@ namespace dxvk {
     static bool                          m_foundRealProjThisFrame;
     static bool                          m_hasEverFoundProj;
     static DrawCallTransforms            m_lastGoodTransforms;
+    // HR patch (Patch 18): recovered world-space camera position from the
+    // Patch 5b cb0 scan. Used by the general-path objectToWorld restore in
+    // SubmitDraw to shift HR's camera-relative objectToWorld into absolute
+    // world space so the TLAS lands at the camera's real world location and
+    // motion-vector reproject stops smearing. Guarded by the same
+    // m_lastGoodTransformsMutex as m_lastGoodTransforms. — see CHANGELOG.md
+    // 2026-04-24
+    static Vector3                       m_lastGoodCamPos;
+    static bool                          m_lastGoodCamPosValid;
     // Mutex for the three static members above. Deferred-context threads
     // (materialsystem_dx11 records most BSP/prop draws on secondary
     // threads) read m_lastGoodTransforms every draw; the immediate
@@ -345,6 +354,12 @@ namespace dxvk {
     // us actual evidence of what Source's cbuffer layout looks like so we
     // can extend classifyPerspective to match it.
     bool                                 m_gameplayCBuffersDumped = false;
+
+    // HR patch: Patch 17 — signature-gated counter for [HR-LightPass] scanner.
+    // Caps emits at 5/instance to avoid log saturation while allowing multiple
+    // distinct lighting-pass draws to be sampled across a session. Replaces
+    // Patch 16's one-shot bool gate. — see CHANGELOG.md 2026-04-24
+    uint8_t                              m_lightPassScanCount = 0;
 
     // Cached projection cbuffer location — found on first draw with a perspective
     // matrix and reused for the rest of the frame. Reset to invalid in EndFrame.
